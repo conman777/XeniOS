@@ -2,7 +2,9 @@ include("tools/build")
 if _ACTION == "export-compile-commands" then
   require("third_party/premake-export-compile-commands/export-compile-commands")
 end
-if os.istarget("android") then
+local wants_android = _ACTION == "androidndk" or os.istarget("android") or
+    _OPTIONS["os"] == "android"
+if wants_android then
   require("third_party/premake-androidndk/androidndk")
 end
 if _ACTION == "cmake" then
@@ -574,6 +576,10 @@ if os.istarget("android") then
     systemversion("24")
     cppstl("c++")
     staticruntime("On")
+    -- Premake emits clang's warning-as-error flag as -Werror=All for
+    -- Android, which clang treats as an unknown option. Android builds already
+    -- were not enforcing fatal warnings, so remove the invalid generated flag.
+    removefatalwarnings("All")
     -- Hidden visibility is needed to prevent dynamic relocations in FFmpeg
     -- AArch64 Neon libavcodec assembly with PIC (accesses extern lookup tables
     -- using `adrp` and `add`, without the Global Object Table, expecting that all
@@ -900,10 +906,10 @@ workspace("xenia")
   include("src/xenia/apu/nop")
   include("src/xenia/base")
   include("src/xenia/cpu")
-  if TARGET_ARCH == "ARM64" then
+  if TARGET_ARCH == "ARM64" or os.istarget("android") then
     include("src/xenia/cpu/backend/a64")
   end
-  if TARGET_ARCH == "x86_64" then
+  if TARGET_ARCH == "x86_64" or os.istarget("android") then
     include("src/xenia/cpu/backend/x64")
   end
   include("src/xenia/debug/ui")

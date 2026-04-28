@@ -8,13 +8,20 @@
  */
 
 #include <atomic>
+#include <array>
+#include <cerrno>
+#include <cctype>
+#include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
 #include <thread>
 
+#if !XE_PLATFORM_ANDROID
 #include "xenia/app/discord/discord_presence.h"
+#endif
 #include "xenia/app/emulator_window.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -27,7 +34,9 @@
 #include "xenia/debug/gdb/gdbstub.h"
 #include "xenia/debug/ui/debug_window.h"
 #include "xenia/emulator.h"
+#include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/ui/file_picker.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/window_listener.h"
@@ -37,9 +46,9 @@
 
 // Available audio systems:
 #include "xenia/apu/nop/nop_audio_system.h"
-#if XE_PLATFORM_LINUX
+#if XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
 #include "xenia/apu/alsa/alsa_audio_system.h"
-#endif  // XE_PLATFORM_LINUX
+#endif  // XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
 #if !XE_PLATFORM_ANDROID
 #include "xenia/apu/sdl/sdl_audio_system.h"
 #endif  // !XE_PLATFORM_ANDROID
@@ -76,6 +85,13 @@
 DEFINE_string(apu, "xaudio2", "Audio system. Use: " APU_OPTIONS, "APU");
 DEFINE_string(gpu, "d3d12", "Graphics system. Use: " GPU_OPTIONS, "GPU");
 DEFINE_string(hid, "sdl", "Input system. Use: " HID_OPTIONS, "HID");
+#elif XE_PLATFORM_ANDROID
+#define APU_OPTIONS "[nop]"
+#define GPU_OPTIONS "[vulkan, null]"
+#define HID_OPTIONS "[nop]"
+DEFINE_string(apu, "nop", "Audio system. Use: " APU_OPTIONS, "APU");
+DEFINE_string(gpu, "vulkan", "Graphics system. Use: " GPU_OPTIONS, "GPU");
+DEFINE_string(hid, "nop", "Input system. Use: " HID_OPTIONS, "HID");
 #elif XE_PLATFORM_LINUX
 #define APU_OPTIONS "[alsa, sdl, nop]"
 #define GPU_OPTIONS "[vulkan, null]"
@@ -145,12 +161,34 @@ DEFINE_int32(
     "Port for GDBStub debugger to listen on, requires --debug (0 = disable)",
     "General");
 
+#if XE_PLATFORM_ANDROID
+DEFINE_bool(discord, false, "Enable Discord rich presence", "General");
+#else
 DEFINE_bool(discord, true, "Enable Discord rich presence", "General");
+#endif
 
 DECLARE_bool(widescreen);
 
 DECLARE_uint32(launch_flags);
 DECLARE_string(launch_data);
+#if XE_PLATFORM_ANDROID
+DECLARE_bool(async_shader_compilation);
+DECLARE_int32(vulkan_pipeline_creation_threads);
+DECLARE_string(xma_decoder);
+DECLARE_uint64(framerate_limit);
+DECLARE_string(render_target_path);
+DECLARE_string(readback_resolve);
+DECLARE_bool(readback_memexport);
+DECLARE_bool(readback_memexport_fast);
+DECLARE_bool(mrt_edram_used_range_clamp_to_min);
+DECLARE_bool(native_2x_msaa);
+DECLARE_bool(vulkan_dynamic_rendering);
+DECLARE_bool(vulkan_sparse_shared_memory);
+DECLARE_bool(tiled_shared_memory);
+DECLARE_string(postprocess_antialiasing);
+DECLARE_string(postprocess_scaling_and_sharpening);
+DECLARE_bool(postprocess_dither);
+#endif
 
 #if XE_PLATFORM_WIN32 && XE_ARCH_AMD64 == 1
 DEFINE_bool(enable_rdrand_ntdll_patch, false,
@@ -372,6 +410,299 @@ EmulatorApp::EmulatorApp(xe::ui::WindowedAppContext& app_context)
   AddPositionalOption("target");
 }
 
+#if XE_PLATFORM_ANDROID
+namespace {
+
+template <typename T>
+void OverrideAndroidConfigVar(const char* name, T value) {
+  if (!cvar::ConfigVars) {
+    return;
+  }
+  auto it = cvar::ConfigVars->find(name);
+  if (it == cvar::ConfigVars->end()) {
+    return;
+  }
+  auto* config_var = dynamic_cast<cvar::ConfigVar<T>*>(it->second);
+  if (config_var) {
+    config_var->OverrideConfigValue(std::move(value));
+  }
+}
+
+std::string TrimAndroidProfileToken(const std::string& token) {
+  size_t first = 0;
+  while (first < token.size() &&
+         std::isspace(static_cast<unsigned char>(token[first]))) {
+    ++first;
+  }
+  size_t last = token.size();
+  while (last > first &&
+         std::isspace(static_cast<unsigned char>(token[last - 1]))) {
+    --last;
+  }
+  return token.substr(first, last - first);
+}
+
+std::string UnquoteAndroidProfileValue(std::string value) {
+  value = TrimAndroidProfileToken(value);
+  if (value.size() >= 2 &&
+      ((value.front() == '"' && value.back() == '"') ||
+       (value.front() == '\'' && value.back() == '\''))) {
+    return value.substr(1, value.size() - 2);
+  }
+  return value;
+}
+
+bool ParseAndroidProfileBool(std::string value, bool& parsed_value) {
+  value = UnquoteAndroidProfileValue(value);
+  for (char& c : value) {
+    c = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(c)));
+  }
+  if (value == "1" || value == "true" || value == "yes" || value == "on") {
+    parsed_value = true;
+    return true;
+  }
+  if (value == "0" || value == "false" || value == "no" || value == "off") {
+    parsed_value = false;
+    return true;
+  }
+  return false;
+}
+
+bool ParseAndroidProfileInt32(std::string value, int32_t& parsed_value) {
+  value = UnquoteAndroidProfileValue(value);
+  char* end = nullptr;
+  errno = 0;
+  long parsed_long = std::strtol(value.c_str(), &end, 0);
+  if (errno || end == value.c_str() || *end) {
+    return false;
+  }
+  parsed_value = static_cast<int32_t>(parsed_long);
+  return true;
+}
+
+bool ParseAndroidProfileUint32(std::string value, uint32_t& parsed_value) {
+  value = UnquoteAndroidProfileValue(value);
+  char* end = nullptr;
+  errno = 0;
+  unsigned long parsed_long = std::strtoul(value.c_str(), &end, 0);
+  if (errno || end == value.c_str() || *end) {
+    return false;
+  }
+  parsed_value = static_cast<uint32_t>(parsed_long);
+  return true;
+}
+
+bool ParseAndroidProfileUint64(std::string value, uint64_t& parsed_value) {
+  value = UnquoteAndroidProfileValue(value);
+  char* end = nullptr;
+  errno = 0;
+  unsigned long long parsed_long = std::strtoull(value.c_str(), &end, 0);
+  if (errno || end == value.c_str() || *end) {
+    return false;
+  }
+  parsed_value = static_cast<uint64_t>(parsed_long);
+  return true;
+}
+
+bool ApplyAndroidProfileOverride(const std::string& name,
+                                 const std::string& value) {
+  if (name == "render_target_path" || name == "render_target_path_vulkan" ||
+      name == "readback_resolve" || name == "xma_decoder" ||
+      name == "postprocess_antialiasing" ||
+      name == "postprocess_scaling_and_sharpening") {
+    OverrideAndroidConfigVar<std::string>(
+        name.c_str(), UnquoteAndroidProfileValue(value));
+    return true;
+  }
+
+  if (name == "async_shader_compilation" ||
+      name == "vulkan_dynamic_rendering" ||
+      name == "vulkan_sparse_shared_memory" ||
+      name == "tiled_shared_memory" || name == "postprocess_dither" ||
+      name == "mrt_edram_used_range_clamp_to_min" ||
+      name == "native_2x_msaa" || name == "halo_android_gpu_frame_dumps" ||
+      name == "readback_memexport" || name == "readback_memexport_fast" ||
+      name == "halo_android_diag_direct_fb_fill_linear" ||
+      name == "halo_android_diag_direct_fb_fill_tiled" ||
+      name == "halo_android_diag_linear_to_tiled_frontbuffer" ||
+      name == "halo_android_diag_strict_barriers" ||
+      name == "halo_android_diag_log_resolve_constants" ||
+      name == "halo_android_diag_force_full_32bpp_non80" ||
+      name == "halo_android_diag_synthetic_edram_fill" ||
+      name == "halo_android_diag_dump_shader_pattern" ||
+      name == "halo_android_diag_transfer_dump_8bpp" ||
+      name == "halo_android_diag_force_1010102_rt_as_rgba8" ||
+      name == "halo_android_diag_blit_rt_transfers" ||
+      name == "halo_android_diag_force_null_textures" ||
+      name == "halo_android_diag_log_texture_bindings" ||
+      name == "halo_android_diag_dump_resolve_images" ||
+      name == "halo_android_diag_log_draws" ||
+      name == "halo_android_diag_skip_draws_to_base_1350" ||
+      name == "halo_android_diag_log_rt_transfers" ||
+      name == "halo_android_diag_skip_rt_transfers_to_base_1350" ||
+      name == "halo_android_diag_skip_resolve_clear_to_base_1350" ||
+      name == "halo_android_diag_depth_to_color_pattern" ||
+      name == "halo_android_diag_depth_to_color_zero_stencil" ||
+      name == "halo_android_diag_force_d32s8_depth_format" ||
+      name == "halo_android_compat_presentable_color_shadow" ||
+      name == "halo_android_disable_high_4k_physical_routing") {
+    bool parsed_value = false;
+    if (!ParseAndroidProfileBool(value, parsed_value)) {
+      return false;
+    }
+    OverrideAndroidConfigVar<bool>(name.c_str(), parsed_value);
+    return true;
+  }
+
+    if (name == "vulkan_pipeline_creation_threads" ||
+        name == "halo_android_diag_depth_to_color_sample_mode" ||
+        name == "halo_android_diag_depth_to_color_mode") {
+    int32_t parsed_value = 0;
+    if (!ParseAndroidProfileInt32(value, parsed_value)) {
+      return false;
+    }
+    OverrideAndroidConfigVar<int32_t>(name.c_str(), parsed_value);
+    return true;
+  }
+
+  if (name == "halo_android_gpu_summary_ms" ||
+      name == "halo_android_diag_swap_base_page_override") {
+    uint32_t parsed_value = 0;
+    if (!ParseAndroidProfileUint32(value, parsed_value)) {
+      return false;
+    }
+    OverrideAndroidConfigVar<uint32_t>(name.c_str(), parsed_value);
+    return true;
+  }
+
+  if (name == "framerate_limit") {
+    uint64_t parsed_value = 0;
+    if (!ParseAndroidProfileUint64(value, parsed_value)) {
+      return false;
+    }
+    OverrideAndroidConfigVar<uint64_t>(name.c_str(), parsed_value);
+    return true;
+  }
+
+  return false;
+}
+
+void ApplyAndroidProfileFileOverrides(
+    const std::filesystem::path& storage_root) {
+  const std::array<std::filesystem::path, 3> profile_paths = {
+      storage_root / "xenios_android_profile.txt",
+      std::filesystem::path(
+          "/sdcard/Android/data/jp.xenios.emulator.github.debug/files/"
+          "xenios_android_profile.txt"),
+      std::filesystem::path(
+          "/sdcard/Android/data/jp.xenios.emulator.github/files/"
+          "xenios_android_profile.txt"),
+  };
+  for (const std::filesystem::path& profile_path : profile_paths) {
+    std::ifstream profile_file(profile_path);
+    if (!profile_file) {
+      continue;
+    }
+    XELOGI("Android profile overrides: loading {}", profile_path);
+
+    std::string line;
+    uint32_t line_number = 0;
+    while (std::getline(profile_file, line)) {
+      ++line_number;
+      size_t comment = line.find('#');
+      if (comment != std::string::npos) {
+        line.resize(comment);
+      }
+      size_t equals = line.find('=');
+      if (equals == std::string::npos) {
+        continue;
+      }
+      std::string name = TrimAndroidProfileToken(line.substr(0, equals));
+      std::string value = TrimAndroidProfileToken(line.substr(equals + 1));
+      if (name.empty()) {
+        continue;
+      }
+      if (ApplyAndroidProfileOverride(name, value)) {
+        XELOGI("Android profile override {}={}", name,
+               UnquoteAndroidProfileValue(value));
+      } else {
+        XELOGW("Android profile override ignored at {}:{}: {}={}",
+               profile_path, line_number, name, value);
+      }
+    }
+    return;
+  }
+}
+
+void EnsureAndroidDefaultProfile(xe::Emulator* emulator) {
+  if (!emulator || !emulator->kernel_state() ||
+      !emulator->kernel_state()->xam_state()) {
+    return;
+  }
+  auto* profile_manager =
+      emulator->kernel_state()->xam_state()->profile_manager();
+  if (!profile_manager) {
+    return;
+  }
+
+  profile_manager->ReloadProfiles();
+  if (!profile_manager->GetAccounts()->empty()) {
+    if (!profile_manager->IsAnyProfileSignedIn()) {
+      profile_manager->Login(profile_manager->GetAccounts()->begin()->first, 0,
+                             true);
+    }
+    return;
+  }
+
+  constexpr char kDefaultAndroidGamertag[] = "AndroidPlayer";
+  if (!xe::kernel::xam::ProfileManager::IsGamertagValid(
+          kDefaultAndroidGamertag)) {
+    return;
+  }
+
+  if (profile_manager->CreateProfile(kDefaultAndroidGamertag, true)) {
+    XELOGI("Android: created default offline profile {}",
+           kDefaultAndroidGamertag);
+  }
+}
+
+void EnsureAndroidEmptyUpdateMount(xe::Emulator* emulator) {
+  if (!emulator) {
+    return;
+  }
+  auto* fs = emulator->file_system();
+  if (!fs) {
+    return;
+  }
+
+  std::string resolved_path;
+  if (fs->FindSymbolicLink("UPDATE:", resolved_path)) {
+    return;
+  }
+
+  const std::filesystem::path update_root =
+      emulator->storage_root() / "update_empty";
+  std::error_code ec;
+  std::filesystem::create_directories(update_root, ec);
+
+  auto update_device = std::make_unique<xe::vfs::HostPathDevice>(
+      "\\UPDATE", update_root, false);
+  if (!update_device->Initialize()) {
+    XELOGW("Android: unable to initialize empty UPDATE mount at {}",
+           update_root);
+    return;
+  }
+  if (!fs->RegisterDevice(std::move(update_device))) {
+    XELOGW("Android: unable to register empty UPDATE device");
+    return;
+  }
+  fs->RegisterSymbolicLink("UPDATE:", "\\UPDATE");
+}
+
+}  // namespace
+#endif
+
 EmulatorApp::~EmulatorApp() {
   // Should be shut down from OnDestroy if OnInitialize has ever been done, but
   // for the most safety as a running thread may be destroyed only after
@@ -385,9 +716,9 @@ std::unique_ptr<apu::AudioSystem> EmulatorApp::CreateAudioSystem(
 #if XE_PLATFORM_WIN32
   factory.Add<apu::xaudio2::XAudio2AudioSystem>("xaudio2");
 #endif  // XE_PLATFORM_WIN32
-#if XE_PLATFORM_LINUX
+#if XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
   factory.Add<apu::alsa::ALSAAudioSystem>("alsa");
-#endif  // XE_PLATFORM_LINUX
+#endif  // XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
 #if !XE_PLATFORM_ANDROID
   factory.Add<apu::sdl::SDLAudioSystem>("sdl");
 #endif  // !XE_PLATFORM_ANDROID
@@ -512,8 +843,19 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
 std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
     ui::Window* window) {
   std::vector<std::unique_ptr<hid::InputDriver>> drivers;
+  auto add_driver_if_ready = [&drivers](std::unique_ptr<hid::InputDriver> driver)
+                                 -> bool {
+    if (!driver) {
+      return false;
+    }
+    if (XFAILED(driver->Setup())) {
+      return false;
+    }
+    drivers.emplace_back(std::move(driver));
+    return true;
+  };
   if (cvars::hid.compare("nop") == 0) {
-    drivers.emplace_back(
+    add_driver_if_ready(
         xe::hid::nop::Create(window, EmulatorWindow::kZOrderHidInput));
   } else {
     Factory<hid::InputDriver, ui::Window*, size_t> factory;
@@ -529,13 +871,11 @@ std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
 #endif  // XE_PLATFORM_WIN32
     for (auto& driver : factory.CreateAll(cvars::hid, window,
                                           EmulatorWindow::kZOrderHidInput)) {
-      if (XSUCCEEDED(driver->Setup())) {
-        drivers.emplace_back(std::move(driver));
-      }
+      add_driver_if_ready(std::move(driver));
     }
     if (drivers.empty()) {
       // Fallback to nop if none created.
-      drivers.emplace_back(
+      add_driver_if_ready(
           xe::hid::nop::Create(window, EmulatorWindow::kZOrderHidInput));
     }
   }
@@ -572,6 +912,47 @@ bool EmulatorApp::OnInitialize() {
   if (!cvars::target.empty()) {
     config::LoadGameConfigForFile(cvars::target);
   }
+
+#if XE_PLATFORM_ANDROID
+  // Saved config files can override Android launch/default values. Keep the
+  // mobile profile deterministic for compatibility and battery/thermal limits.
+  OVERRIDE_bool(discord, false);
+  OverrideAndroidConfigVar<bool>("async_shader_compilation", false);
+  OverrideAndroidConfigVar<int32_t>("vulkan_pipeline_creation_threads", 1);
+  OverrideAndroidConfigVar<std::string>("xma_decoder", "old");
+  OverrideAndroidConfigVar<uint64_t>("framerate_limit", 30);
+  OverrideAndroidConfigVar<std::string>("render_target_path", "accuracy");
+  OverrideAndroidConfigVar<std::string>("render_target_path_vulkan", "fsi");
+  OverrideAndroidConfigVar<std::string>("readback_resolve", "full");
+  OverrideAndroidConfigVar<bool>("readback_memexport", true);
+  OverrideAndroidConfigVar<bool>("readback_memexport_fast", true);
+  OverrideAndroidConfigVar<bool>("vulkan_dynamic_rendering", false);
+  OverrideAndroidConfigVar<bool>("vulkan_sparse_shared_memory", true);
+  OverrideAndroidConfigVar<bool>("tiled_shared_memory", true);
+  OverrideAndroidConfigVar<std::string>("postprocess_antialiasing", "");
+  OverrideAndroidConfigVar<std::string>("postprocess_scaling_and_sharpening",
+                                        "");
+  OverrideAndroidConfigVar<bool>("postprocess_dither", false);
+  ApplyAndroidProfileFileOverrides(storage_root);
+  XELOGI(
+      "Android forced profile: discord={} async_shader_compilation={} "
+      "vulkan_pipeline_creation_threads={} xma_decoder={} framerate_limit={} "
+      "render_target_path={} readback_resolve={} readback_memexport={} "
+      "readback_memexport_fast={} vulkan_dynamic_rendering={} "
+      "vulkan_sparse_shared_memory={} tiled_shared_memory={} "
+      "mrt_edram_used_range_clamp_to_min={} native_2x_msaa={} "
+      "postprocess_antialiasing={} postprocess_scaling_and_sharpening={} "
+      "postprocess_dither={}",
+      cvars::discord, cvars::async_shader_compilation,
+      cvars::vulkan_pipeline_creation_threads, cvars::xma_decoder,
+      cvars::framerate_limit, cvars::render_target_path,
+      cvars::readback_resolve, cvars::readback_memexport,
+      cvars::readback_memexport_fast, cvars::vulkan_dynamic_rendering,
+      cvars::vulkan_sparse_shared_memory, cvars::tiled_shared_memory,
+      cvars::mrt_edram_used_range_clamp_to_min, cvars::native_2x_msaa,
+      cvars::postprocess_antialiasing,
+      cvars::postprocess_scaling_and_sharpening, cvars::postprocess_dither);
+#endif
 
 #if XE_ARCH_AMD64 == 1
   amd64::InitFeatureFlags();
@@ -620,10 +1001,12 @@ bool EmulatorApp::OnInitialize() {
 #endif
 
   // Initialize Discord rich presence only for game process
+  #if !XE_PLATFORM_ANDROID
   if (is_game_process && cvars::discord) {
     discord::DiscordPresence::Initialize();
     discord::DiscordPresence::NotPlaying();
   }
+  #endif
 
   // Determine window size based on process type
   uint32_t window_width, window_height;
@@ -668,9 +1051,11 @@ bool EmulatorApp::OnInitialize() {
 void EmulatorApp::OnDestroy() {
   ShutdownEmulatorThreadFromUIThread();
 
+  #if !XE_PLATFORM_ANDROID
   if (cvars::discord) {
     discord::DiscordPresence::Shutdown();
   }
+  #endif
 
   Profiler::Dump();
   // The profiler needs to shut down before the graphics context.
@@ -798,6 +1183,11 @@ void EmulatorApp::EmulatorThread(bool is_game_process) {
     fs->RegisterSymbolicLink("e:", "\\DEVKIT");
   }
 
+#if XE_PLATFORM_ANDROID
+  EnsureAndroidDefaultProfile(emulator_.get());
+  EnsureAndroidEmptyUpdateMount(emulator_.get());
+#endif
+
   // Set a debug handler.
   // This will respond to debugging requests so we can open the debug UI.
   if (cvars::debug) {
@@ -814,7 +1204,9 @@ void EmulatorApp::EmulatorThread(bool is_game_process) {
           });
       emulator_->processor()->ShowDebugger();
 #endif
-    } else {
+    }
+#if !XE_PLATFORM_ANDROID
+    else {
       emulator_->processor()->set_debug_listener_request_handler(
           [this](xe::cpu::Processor* processor) {
             if (debug_window_) {
@@ -830,13 +1222,16 @@ void EmulatorApp::EmulatorThread(bool is_game_process) {
             return debug_window_.get();
           });
     }
+#endif
   }
 
   emulator_->on_launch.AddListener([&](auto title_id, const auto& game_title) {
+#if !XE_PLATFORM_ANDROID
     if (cvars::discord) {
       discord::DiscordPresence::PlayingTitle(
           game_title.empty() ? "Unknown Title" : std::string(game_title));
     }
+#endif
     app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
     emulator_thread_event_->Set();
   });
@@ -853,9 +1248,11 @@ void EmulatorApp::EmulatorThread(bool is_game_process) {
   });
 
   emulator_->on_terminate.AddListener([]() {
+#if !XE_PLATFORM_ANDROID
     if (cvars::discord) {
       discord::DiscordPresence::NotPlaying();
     }
+#endif
   });
 
   // Enable emulator input now that the emulator is properly loaded.
@@ -909,8 +1306,13 @@ void EmulatorApp::EmulatorThread(bool is_game_process) {
     result = emulator_->LaunchPath(abs_path);
 #endif
     if (XFAILED(result)) {
+#if XE_PLATFORM_ANDROID
+      XELOGE("Failed to launch target: {:08X}", result);
+      app_context().RequestDeferredQuit();
+#else
       xe::FatalError(fmt::format("Failed to launch target: {:08X}", result));
       app_context().RequestDeferredQuit();
+#endif
       return;
     }
   }

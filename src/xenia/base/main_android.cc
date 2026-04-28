@@ -48,10 +48,19 @@ void InitializeAndroidAppFromMainThread(int32_t api_level,
                                         JNIEnv* main_thread_jni_env,
                                         jobject application_context,
                                         jobject launch_arguments_bundle) {
-  if (android_initializations_++) {
+  if (android_initializations_) {
+    ++android_initializations_;
+    // Multiple activities may run in the same process. Even if the Android
+    // process globals are already initialized, each activity still needs its
+    // own launch bundle parsed into cvars.
+    cvar::ClearAndroidLaunchArgumentOverrides();
+    if (launch_arguments_bundle) {
+      cvar::ParseLaunchArgumentsFromAndroidBundle(launch_arguments_bundle);
+    }
     // Already initialized for another component in the process.
     return;
   }
+  android_initializations_ = 1;
 
   // Set the API level before everything else if available - may be needed by
   // subsystem initialization itself.
@@ -102,6 +111,7 @@ void InitializeAndroidAppFromMainThread(int32_t api_level,
   xe::filesystem::AndroidInitialize();
 
   // Initialize the cvars before logging.
+  cvar::ClearAndroidLaunchArgumentOverrides();
   if (launch_arguments_bundle) {
     cvar::ParseLaunchArgumentsFromAndroidBundle(launch_arguments_bundle);
   }

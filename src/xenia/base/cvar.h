@@ -44,6 +44,7 @@ class ICommandVar {
   virtual void UpdateValue() = 0;
   virtual void AddToLaunchOptions(cxxopts::Options* options) = 0;
   virtual void LoadFromLaunchOptions(cxxopts::ParseResult* result) = 0;
+  virtual void ClearCommandLineValue() = 0;
 };
 
 class IConfigVar : virtual public ICommandVar {
@@ -72,6 +73,7 @@ class CommandVar : virtual public ICommandVar {
   void AddToLaunchOptions(cxxopts::Options* options) override;
   void LoadFromLaunchOptions(cxxopts::ParseResult* result) override;
   void SetCommandLineValue(T val);
+  void ClearCommandLineValue() override;
   T* current_value() { return current_value_; }
 
  protected:
@@ -313,6 +315,11 @@ void CommandVar<T>::SetCommandLineValue(const T val) {
   UpdateValue();
 }
 template <class T>
+void CommandVar<T>::ClearCommandLineValue() {
+  commandline_value_.reset();
+  UpdateValue();
+}
+template <class T>
 void ConfigVar<T>::SetConfigValue(T val) {
   config_value_ = std::make_unique<T>(val);
   UpdateValue();
@@ -374,6 +381,7 @@ void ParseLaunchArguments(int& argc, char**& argv,
                           const std::string_view positional_help,
                           const std::vector<std::string>& positional_options);
 #if XE_PLATFORM_ANDROID
+void ClearAndroidLaunchArgumentOverrides();
 void ParseLaunchArgumentsFromAndroidBundle(jobject bundle);
 #endif  // XE_PLATFORM_ANDROID
 

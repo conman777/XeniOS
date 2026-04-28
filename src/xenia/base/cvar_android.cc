@@ -9,12 +9,58 @@
 
 #include <jni.h>
 
+#include <cstring>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/main_android.h"
 
 namespace cvar {
+
+namespace {
+
+constexpr const char* kAllowedAndroidLaunchCvars[] = {
+    "target",
+    "target_trace_file",
+    "storage_root",
+    "content_root",
+    "cache_root",
+    "apu",
+    "gpu",
+    "hid",
+    "discord",
+    "a64_fail_fast_on_access_violation",
+    "log_undefined_extern_args",
+    "a64_watch_store_address",
+    "framerate_limit",
+    "async_shader_compilation",
+    "vulkan_pipeline_creation_threads",
+    "xma_decoder",
+};
+
+bool IsAllowedAndroidLaunchCvar(const char* name) {
+  for (const char* allowed_name : kAllowedAndroidLaunchCvars) {
+    if (!std::strcmp(name, allowed_name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+void ClearAndroidLaunchArgumentOverrides() {
+  if (!ConfigVars) {
+    return;
+  }
+  for (const char* name : kAllowedAndroidLaunchCvars) {
+    auto cvar_it = ConfigVars->find(name);
+    if (cvar_it != ConfigVars->end()) {
+      cvar_it->second->ClearCommandLineValue();
+    }
+  }
+}
 
 void ParseLaunchArgumentsFromAndroidBundle(jobject bundle) {
   if (!ConfigVars) {
@@ -121,7 +167,8 @@ void ParseLaunchArgumentsFromAndroidBundle(jobject bundle) {
       jni_env->DeleteLocalRef(key);
       continue;
     }
-    auto cvar_it = ConfigVars->find(key_utf);
+    const bool is_allowed = IsAllowedAndroidLaunchCvar(key_utf);
+    auto cvar_it = is_allowed ? ConfigVars->find(key_utf) : ConfigVars->end();
     jni_env->ReleaseStringUTFChars(key, key_utf);
     // key_utf can't be used from now on.
     if (cvar_it == ConfigVars->end()) {

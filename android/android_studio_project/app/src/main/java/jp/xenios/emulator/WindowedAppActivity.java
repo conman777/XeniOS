@@ -8,6 +8,8 @@ import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.View;
+import android.view.WindowManager;
+import android.widget.Toast;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -48,6 +50,23 @@ public abstract class WindowedAppActivity extends Activity {
     private native void paintWindow(long appContext, boolean forcePaint);
 
     protected abstract String getWindowedAppIdentifier();
+
+    protected boolean isWindowedAppReady() {
+        return mAppContext != 0;
+    }
+
+    private void enterImmersiveMode() {
+        getWindow().setFlags(
+                WindowManager.LayoutParams.FLAG_FULLSCREEN,
+                WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+    }
 
     protected void setWindowSurfaceView(@Nullable final WindowSurfaceView windowSurfaceView) {
         if (mWindowSurfaceView == windowSurfaceView) {
@@ -105,13 +124,24 @@ public abstract class WindowedAppActivity extends Activity {
     @Override
     protected void onCreate(final Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        enterImmersiveMode();
 
         final String windowedAppIdentifier = getWindowedAppIdentifier();
         mAppContext = initializeWindowedAppOnCreate(windowedAppIdentifier, getAssets());
         if (mAppContext == 0) {
+            Toast.makeText(
+                    this,
+                    "Unable to start " + windowedAppIdentifier + ".",
+                    Toast.LENGTH_LONG).show();
             finish();
-            throw new XeniosRuntimeException(
-                    "Error initializing the windowed app " + windowedAppIdentifier);
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(final boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            enterImmersiveMode();
         }
     }
 

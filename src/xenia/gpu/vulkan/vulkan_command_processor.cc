@@ -9,16 +9,24 @@
 
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <string>
 
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/string_util.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -38,6 +46,8 @@
 
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(gpu_debug_markers);
+DECLARE_bool(halo_android_diagnostics);
+DECLARE_uint32(halo_android_gpu_summary_ms);
 DECLARE_bool(occlusion_query_enable);
 DECLARE_bool(readback_memexport_fast);
 DECLARE_bool(submit_on_primary_buffer_end);
@@ -48,10 +58,354 @@ DEFINE_bool(
     "May improve or worsen performance depending on driver. Requires Vulkan "
     "1.3 or VK_KHR_dynamic_rendering extension support.",
     "Vulkan");
+DEFINE_bool(halo_android_gpu_frame_dumps, false,
+            "Dump selected Android guest output frames for Halo diagnostics.",
+            "Android");
+DEFINE_bool(halo_android_diag_dump_resolve_images, false,
+            "Dump selected Android Halo resolve readback buffers as PPM "
+            "images for frontbuffer address investigation.",
+            "Android");
+DEFINE_bool(halo_android_diag_log_draws, false,
+            "Log Android guest draws and render-target bindings.", "Android");
+DEFINE_bool(halo_android_diag_skip_draws_to_base_1350, false,
+            "Skip Android guest draws that target color RT base tile 1350.",
+            "Android");
 
 namespace xe {
 namespace gpu {
 namespace vulkan {
+
+#if XE_PLATFORM_ANDROID
+namespace {
+
+struct AndroidRawImageStats {
+  uint8_t min[3] = {std::numeric_limits<uint8_t>::max(),
+                    std::numeric_limits<uint8_t>::max(),
+                    std::numeric_limits<uint8_t>::max()};
+  uint8_t max[3] = {};
+  uint64_t sum[3] = {};
+  uint32_t nonblack_pixels = 0;
+};
+
+struct AndroidResolveBufferStats {
+  uint8_t min[3] = {std::numeric_limits<uint8_t>::max(),
+                    std::numeric_limits<uint8_t>::max(),
+                    std::numeric_limits<uint8_t>::max()};
+  uint8_t max[3] = {};
+  uint64_t sum[3] = {};
+  uint32_t nonblack_pixels = 0;
+  uint32_t pixel_count = 0;
+  uint32_t first_nonzero_offset = UINT32_MAX;
+  uint32_t first_nonzero_dword = 0;
+};
+
+bool ShouldDumpAndroidGuestOutputFrame(uint32_t frame_index) {
+  constexpr uint32_t kDiagnosticFrames[] = {1, 10, 30, 90, 180,
+                                            600, 1200, 1800};
+  for (uint32_t diagnostic_frame : kDiagnosticFrames) {
+    if (frame_index == diagnostic_frame) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const char* AndroidReadbackModeName(ReadbackResolveMode mode) {
+  switch (mode) {
+    case ReadbackResolveMode::kDisabled:
+      return "none";
+    case ReadbackResolveMode::kSome:
+      return "some";
+    case ReadbackResolveMode::kFast:
+      return "fast";
+    case ReadbackResolveMode::kFull:
+      return "full";
+  }
+  return "unknown";
+}
+
+uint32_t ReadAndroidLe32(const uint8_t* data) {
+  return uint32_t(data[0]) | (uint32_t(data[1]) << 8) |
+         (uint32_t(data[2]) << 16) | (uint32_t(data[3]) << 24);
+}
+
+AndroidResolveBufferStats ComputeAndroidResolveBufferStats(const uint8_t* data,
+                                                           uint32_t length) {
+  AndroidResolveBufferStats stats;
+  if (!data || length < 4) {
+    stats.min[0] = stats.min[1] = stats.min[2] = 0;
+    return stats;
+  }
+
+  stats.pixel_count = length >> 2;
+  for (uint32_t i = 0; i < stats.pixel_count; ++i) {
+    const uint8_t* pixel = data + size_t(i) * 4;
+    bool nonblack = false;
+    for (uint32_t c = 0; c < 3; ++c) {
+      stats.min[c] = std::min(stats.min[c], pixel[c]);
+      stats.max[c] = std::max(stats.max[c], pixel[c]);
+      stats.sum[c] += pixel[c];
+      nonblack |= pixel[c] != 0;
+    }
+    if (nonblack) {
+      ++stats.nonblack_pixels;
+      if (stats.first_nonzero_offset == UINT32_MAX) {
+        stats.first_nonzero_offset = i << 2;
+        stats.first_nonzero_dword = ReadAndroidLe32(pixel);
+      }
+    }
+  }
+  return stats;
+}
+
+void LogAndroidResolveBufferStats(uint32_t resolve_total, const char* stage,
+                                  uint32_t written_address,
+                                  uint32_t written_length,
+                                  const uint8_t* data) {
+  AndroidResolveBufferStats stats =
+      ComputeAndroidResolveBufferStats(data, written_length);
+  const double divisor =
+      stats.pixel_count ? static_cast<double>(stats.pixel_count) : 1.0;
+  XELOGI(
+      "HaloReach ResolveReadbackStats total={} stage={} addr=0x{:08X} "
+      "len={} pixels={} first_nonzero=0x{:X} first_dword=0x{:08X} "
+      "nonblack={}/{} min_rgb={},{},{} max_rgb={},{},{} "
+      "mean_rgb={:.2f},{:.2f},{:.2f}",
+      resolve_total, stage, written_address, written_length,
+      stats.pixel_count,
+      stats.first_nonzero_offset == UINT32_MAX ? 0 : stats.first_nonzero_offset,
+      stats.first_nonzero_dword, stats.nonblack_pixels, stats.pixel_count,
+      uint32_t(stats.min[0]), uint32_t(stats.min[1]), uint32_t(stats.min[2]),
+      uint32_t(stats.max[0]), uint32_t(stats.max[1]), uint32_t(stats.max[2]),
+      stats.sum[0] / divisor, stats.sum[1] / divisor,
+      stats.sum[2] / divisor);
+}
+
+void LogAndroidMemexportBufferStats(uint32_t sequence, const char* mode,
+                                    const char* stage, uint32_t address,
+                                    uint32_t length, const uint8_t* data) {
+  AndroidResolveBufferStats stats =
+      ComputeAndroidResolveBufferStats(data, length);
+  const double divisor =
+      stats.pixel_count ? static_cast<double>(stats.pixel_count) : 1.0;
+  XELOGI(
+      "HaloReach MemexportReadbackStats seq={} mode={} stage={} "
+      "addr=0x{:08X} len={} dwords={} first_nonzero=0x{:X} "
+      "first_dword=0x{:08X} nonzero_dwords={}/{} "
+      "min_b0b1b2={},{},{} max_b0b1b2={},{},{} "
+      "mean_b0b1b2={:.2f},{:.2f},{:.2f}",
+      sequence, mode, stage, address, length, stats.pixel_count,
+      stats.first_nonzero_offset == UINT32_MAX ? 0 : stats.first_nonzero_offset,
+      stats.first_nonzero_dword, stats.nonblack_pixels, stats.pixel_count,
+      uint32_t(stats.min[0]), uint32_t(stats.min[1]), uint32_t(stats.min[2]),
+      uint32_t(stats.max[0]), uint32_t(stats.max[1]), uint32_t(stats.max[2]),
+      stats.sum[0] / divisor, stats.sum[1] / divisor,
+      stats.sum[2] / divisor);
+}
+
+AndroidRawImageStats ComputeAndroidRawImageStats(const ui::RawImage& image) {
+  AndroidRawImageStats stats;
+  if (!image.width || !image.height || image.data.empty()) {
+    stats.min[0] = stats.min[1] = stats.min[2] = 0;
+    return stats;
+  }
+
+  for (uint32_t y = 0; y < image.height; ++y) {
+    const uint8_t* row = image.data.data() + size_t(y) * image.stride;
+    for (uint32_t x = 0; x < image.width; ++x) {
+      const uint8_t* pixel = row + size_t(x) * 4;
+      bool nonblack = false;
+      for (uint32_t c = 0; c < 3; ++c) {
+        stats.min[c] = std::min(stats.min[c], pixel[c]);
+        stats.max[c] = std::max(stats.max[c], pixel[c]);
+        stats.sum[c] += pixel[c];
+        nonblack |= pixel[c] != 0;
+      }
+      if (nonblack) {
+        ++stats.nonblack_pixels;
+      }
+    }
+  }
+  return stats;
+}
+
+void LogAndroidRawImageStats(uint32_t frame_index,
+                             xenos::TextureFormat frontbuffer_format,
+                             const ui::RawImage& image) {
+  const uint64_t pixel_count = uint64_t(image.width) * image.height;
+  AndroidRawImageStats stats = ComputeAndroidRawImageStats(image);
+  const double divisor = pixel_count ? static_cast<double>(pixel_count) : 1.0;
+  XELOGI(
+      "Android GPU image stats frame={} size={}x{} stride={} format={} "
+      "min_rgb={},{},{} max_rgb={},{},{} mean_rgb={:.2f},{:.2f},{:.2f} "
+      "nonblack={}/{}",
+      frame_index, image.width, image.height, image.stride,
+      uint32_t(frontbuffer_format), uint32_t(stats.min[0]),
+      uint32_t(stats.min[1]), uint32_t(stats.min[2]),
+      uint32_t(stats.max[0]), uint32_t(stats.max[1]),
+      uint32_t(stats.max[2]), stats.sum[0] / divisor, stats.sum[1] / divisor,
+      stats.sum[2] / divisor, stats.nonblack_pixels, pixel_count);
+}
+
+bool WriteAndroidGuestOutputPpm(const std::filesystem::path& path,
+                                const ui::RawImage& image) {
+  if (!image.width || !image.height || image.data.empty()) {
+    return false;
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  if (ec) {
+    return false;
+  }
+
+  std::ofstream file(path, std::ios::binary);
+  if (!file) {
+    return false;
+  }
+
+  file << "P6\n" << image.width << " " << image.height << "\n255\n";
+  for (uint32_t y = 0; y < image.height; ++y) {
+    const uint8_t* row = image.data.data() + size_t(y) * image.stride;
+    for (uint32_t x = 0; x < image.width; ++x) {
+      file.write(reinterpret_cast<const char*>(row + size_t(x) * 4), 3);
+    }
+  }
+  return file.good();
+}
+
+bool WriteAndroidResolvePpm(const std::filesystem::path& path,
+                            const uint8_t* data, uint32_t data_length,
+                            uint32_t width, uint32_t height,
+                            bool bgra_to_rgb) {
+  if (!data || !width || !height) {
+    return false;
+  }
+  const uint64_t required_length = uint64_t(width) * height * 4;
+  if (required_length > data_length) {
+    return false;
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  if (ec) {
+    return false;
+  }
+
+  std::ofstream file(path, std::ios::binary);
+  if (!file) {
+    return false;
+  }
+
+  file << "P6\n" << width << " " << height << "\n255\n";
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint8_t* row = data + size_t(y) * width * 4;
+    for (uint32_t x = 0; x < width; ++x) {
+      const uint8_t* pixel = row + size_t(x) * 4;
+      if (bgra_to_rgb) {
+        const uint8_t rgb[3] = {pixel[2], pixel[1], pixel[0]};
+        file.write(reinterpret_cast<const char*>(rgb), sizeof(rgb));
+      } else {
+        file.write(reinterpret_cast<const char*>(pixel), 3);
+      }
+    }
+  }
+  return file.good();
+}
+
+void MaybeDumpAndroidResolveImage(uint32_t resolve_total,
+                                  uint32_t written_address,
+                                  uint32_t written_length,
+                                  const uint8_t* data) {
+  if (!cvars::halo_android_diag_dump_resolve_images || !data ||
+      written_length < 1152 * 720 * 4) {
+    return;
+  }
+
+  struct Candidate {
+    uint32_t address;
+    uint32_t dumps;
+    uint32_t last_total;
+  };
+  static Candidate candidates[] = {
+      {0x02354000, 0, 0}, {0x02690000, 0, 0}, {0x029CC000, 0, 0},
+      {0x02D08000, 0, 0}, {0x02F6C000, 0, 0}, {0x03044000, 0, 0},
+  };
+
+  Candidate* candidate = nullptr;
+  for (Candidate& entry : candidates) {
+    if (entry.address == written_address) {
+      candidate = &entry;
+      break;
+    }
+  }
+  if (!candidate || candidate->dumps >= 4 || resolve_total < 16000 ||
+      (candidate->last_total &&
+       resolve_total - candidate->last_total < 600)) {
+    return;
+  }
+
+  constexpr const char* kDiagnosticRoots[] = {
+      "/sdcard/Android/data/jp.xenios.emulator.github.debug/files/diagnostics",
+      "/sdcard/Android/data/jp.xenios.emulator.github/files/diagnostics",
+  };
+  const std::string base_name =
+      "resolve_total_" + std::to_string(resolve_total) + "_addr_0x" +
+      xe::string_util::to_hex_string(written_address) + "_1152x720";
+  bool wrote_any = false;
+  for (const char* diagnostic_root : kDiagnosticRoots) {
+    std::filesystem::path raw_path =
+        std::filesystem::path(diagnostic_root) / (base_name + "_raw.ppm");
+    std::filesystem::path rgb_path =
+        std::filesystem::path(diagnostic_root) / (base_name + "_bgra.ppm");
+    if (WriteAndroidResolvePpm(raw_path, data, written_length, 1152, 720,
+                               false)) {
+      WriteAndroidResolvePpm(rgb_path, data, written_length, 1152, 720, true);
+      XELOGI("Android resolve diagnostic wrote {} and {}",
+             raw_path.string(), rgb_path.string());
+      wrote_any = true;
+      break;
+    }
+  }
+  if (wrote_any) {
+    ++candidate->dumps;
+    candidate->last_total = resolve_total;
+  }
+}
+
+bool DumpAndroidGuestOutputFrame(uint32_t frame_index,
+                                 xenos::TextureFormat frontbuffer_format,
+                                 ui::Presenter& presenter) {
+  ui::RawImage image;
+  if (!presenter.CaptureGuestOutput(image)) {
+    XELOGW("Android GPU diagnostic frame {} capture failed", frame_index);
+    return false;
+  }
+  LogAndroidRawImageStats(frame_index, frontbuffer_format, image);
+
+  std::string filename =
+      "guest_output_frame_" + std::to_string(frame_index) + "_" +
+      std::to_string(image.width) + "x" + std::to_string(image.height) +
+      "_format_" + std::to_string(uint32_t(frontbuffer_format)) + ".ppm";
+  constexpr const char* kDiagnosticRoots[] = {
+      "/sdcard/Android/data/jp.xenios.emulator.github.debug/files/diagnostics",
+      "/sdcard/Android/data/jp.xenios.emulator.github/files/diagnostics",
+  };
+  for (const char* diagnostic_root : kDiagnosticRoots) {
+    std::filesystem::path path =
+        std::filesystem::path(diagnostic_root) / filename;
+    if (WriteAndroidGuestOutputPpm(path, image)) {
+      XELOGI("Android GPU diagnostic wrote {}", path.string());
+      return true;
+    }
+  }
+
+  XELOGW("Android GPU diagnostic frame {} write failed", frame_index);
+  return false;
+}
+
+}  // namespace
+#endif  // XE_PLATFORM_ANDROID
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1685,7 +2039,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 
   auto aspect = graphics_system_->GetScaledAspectRatio();
 
-  presenter->RefreshGuestOutput(
+  bool guest_output_refreshed = presenter->RefreshGuestOutput(
       frontbuffer_width_scaled, frontbuffer_height_scaled, aspect.first,
       aspect.second,
       [this, frontbuffer_width_scaled, frontbuffer_height_scaled,
@@ -2238,6 +2592,64 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         EndSubmission(true);
         return true;
       });
+
+#if XE_PLATFORM_ANDROID
+  if (cvars::halo_android_diagnostics) {
+    static uint32_t android_swap_total = 0;
+    static uint32_t android_swap_refreshed_total = 0;
+    static uint32_t android_swap_last_total = 0;
+    static uint32_t android_swap_last_refreshed = 0;
+    static uint64_t android_swap_last_summary_ms = 0;
+
+    ++android_swap_total;
+    if (guest_output_refreshed) {
+      ++android_swap_refreshed_total;
+    }
+
+    uint64_t now_ms = xe::Clock::QueryHostUptimeMillis();
+    uint32_t summary_interval_ms = cvars::halo_android_gpu_summary_ms
+                                       ? cvars::halo_android_gpu_summary_ms
+                                       : 5000;
+    if (!android_swap_last_summary_ms) {
+      android_swap_last_summary_ms = now_ms;
+      android_swap_last_total = android_swap_total;
+      android_swap_last_refreshed = android_swap_refreshed_total;
+    } else if (now_ms - android_swap_last_summary_ms >= summary_interval_ms) {
+      uint32_t delta_swaps = android_swap_total - android_swap_last_total;
+      uint32_t delta_refreshed =
+          android_swap_refreshed_total - android_swap_last_refreshed;
+      uint64_t dt_ms = now_ms - android_swap_last_summary_ms;
+      double dt_seconds = dt_ms ? static_cast<double>(dt_ms) / 1000.0 : 1.0;
+      XELOGI(
+          "HaloReach SwapSummary dt_ms={} swaps={} (+{}) refreshed={} (+{}) "
+          "swap_fps={:.1f} refresh_fps={:.1f} frontbuffer={}x{} format={} "
+          "refreshed_last={}",
+          dt_ms, android_swap_total, delta_swaps,
+          android_swap_refreshed_total, delta_refreshed,
+          delta_swaps / dt_seconds, delta_refreshed / dt_seconds,
+          frontbuffer_width_scaled, frontbuffer_height_scaled,
+          uint32_t(frontbuffer_format), uint32_t(guest_output_refreshed));
+      android_swap_last_summary_ms = now_ms;
+      android_swap_last_total = android_swap_total;
+      android_swap_last_refreshed = android_swap_refreshed_total;
+    }
+  }
+
+  if (cvars::halo_android_diagnostics &&
+      cvars::halo_android_gpu_frame_dumps && guest_output_refreshed) {
+    static uint32_t android_guest_output_frame_index = 0;
+    uint32_t diagnostic_frame_index = ++android_guest_output_frame_index;
+    if (ShouldDumpAndroidGuestOutputFrame(diagnostic_frame_index)) {
+      XELOGI(
+          "Android GPU diagnostic frame {}: frontbuffer={}x{} format={} "
+          "guest_capture=enabled",
+          diagnostic_frame_index, frontbuffer_width_scaled,
+          frontbuffer_height_scaled, uint32_t(frontbuffer_format));
+      DumpAndroidGuestOutputFrame(diagnostic_frame_index, frontbuffer_format,
+                                  *presenter);
+    }
+  }
+#endif  // XE_PLATFORM_ANDROID
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
@@ -3087,6 +3499,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       // Nothing to draw.
       return true;
     }
+    if (primitive_processing_result.IsTessellated() &&
+        !device_properties.tessellationShader) {
+      static bool warned_tessellation_unsupported = false;
+      if (!warned_tessellation_unsupported) {
+        XELOGW(
+            "VulkanCommandProcessor: Skipping tessellated draws because the "
+            "host Vulkan device does not support usable tessellation shaders");
+        warned_tessellation_unsupported = true;
+      }
+      return true;
+    }
     // TODO(Triang3l): Geometry-type-specific vertex shader, vertex shader as
     // compute.
     // Skip unsupported host vertex shader types (but allow tessellation types
@@ -3096,6 +3519,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             Shader::HostVertexShaderType::kVertex &&
         primitive_processing_result.host_vertex_shader_type !=
             Shader::HostVertexShaderType::kPointListAsTriangleStrip &&
+        primitive_processing_result.host_vertex_shader_type !=
+            Shader::HostVertexShaderType::kRectangleListAsTriangleStrip &&
         !Shader::IsHostVertexShaderTypeDomain(
             primitive_processing_result.host_vertex_shader_type)) {
       return false;
@@ -3211,6 +3636,76 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
   }
+
+#if XE_PLATFORM_ANDROID
+  bool android_targets_base_1350 = false;
+  bool android_logged_rt_draw = false;
+  if (render_target_cache_->GetPath() ==
+      RenderTargetCache::Path::kHostRenderTargets) {
+    auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    for (uint32_t rt_index = 0; rt_index < xenos::kMaxColorRenderTargets;
+         ++rt_index) {
+      uint32_t rt_write_mask = (normalized_color_mask >> (rt_index * 4)) & 0xF;
+      if (!rt_write_mask) {
+        continue;
+      }
+      auto rb_color_info = regs.Get<reg::RB_COLOR_INFO>(
+          reg::RB_COLOR_INFO::rt_register_indices[rt_index]);
+      android_targets_base_1350 |= rb_color_info.color_base == 1350;
+      if (cvars::halo_android_diag_log_draws) {
+        static uint32_t android_draw_log_count = 0;
+        if (android_draw_log_count < 768 &&
+            (rb_color_info.color_base == 1350 || android_draw_log_count < 96)) {
+          bool is_64bpp =
+              xenos::IsColorRenderTargetFormat64bpp(rb_color_info.color_format);
+          uint32_t pitch_tiles = xenos::GetSurfacePitchTiles(
+              rb_surface_info.surface_pitch, rb_surface_info.msaa_samples,
+              is_64bpp);
+          XELOGI(
+              "Android draw {}: prim={} index_count={} host_vertices={} "
+              "edram_mode={} raster={} color_mask=0x{:X} rt{} write=0x{:X} "
+              "base={} pitch={} msaa={} fmt={} surface_pitch={} "
+              "surface_msaa={} vs=0x{:016X} ps=0x{:016X}",
+              android_draw_log_count, uint32_t(prim_type), index_count,
+              primitive_processing_result.host_draw_vertex_count,
+              uint32_t(edram_mode), uint32_t(is_rasterization_done),
+              normalized_color_mask, rt_index, rt_write_mask,
+              rb_color_info.color_base, pitch_tiles,
+              uint32_t(rb_surface_info.msaa_samples),
+              uint32_t(rb_color_info.color_format),
+              uint32_t(rb_surface_info.surface_pitch),
+              uint32_t(rb_surface_info.msaa_samples),
+              vertex_shader->ucode_data_hash(),
+              pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+          ++android_draw_log_count;
+          android_logged_rt_draw = true;
+        }
+      }
+    }
+  }
+  if (cvars::halo_android_diag_log_draws && !android_logged_rt_draw) {
+    static uint32_t android_non_rt_draw_log_count = 0;
+    if (android_non_rt_draw_log_count < 32) {
+      auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      XELOGI(
+          "Android draw non-RT {}: prim={} index_count={} host_vertices={} "
+          "edram_mode={} raster={} color_mask=0x{:X} surface_pitch={} "
+          "surface_msaa={} vs=0x{:016X} ps=0x{:016X}",
+          android_non_rt_draw_log_count, uint32_t(prim_type), index_count,
+          primitive_processing_result.host_draw_vertex_count,
+          uint32_t(edram_mode), uint32_t(is_rasterization_done),
+          normalized_color_mask, uint32_t(rb_surface_info.surface_pitch),
+          uint32_t(rb_surface_info.msaa_samples),
+          vertex_shader->ucode_data_hash(),
+          pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+      ++android_non_rt_draw_log_count;
+    }
+  }
+  if (cvars::halo_android_diag_skip_draws_to_base_1350 &&
+      android_targets_base_1350) {
+    return true;
+  }
+#endif
 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
@@ -3564,6 +4059,49 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     }
 
     if (memexport_total_size > 0) {
+#if XE_PLATFORM_ANDROID
+      static uint32_t android_memexport_total = 0;
+      static uint32_t android_memexport_fast_total = 0;
+      static uint32_t android_memexport_full_total = 0;
+      static uint64_t android_memexport_last_summary_ms = 0;
+      ++android_memexport_total;
+      if (cvars::readback_memexport_fast) {
+        ++android_memexport_fast_total;
+      } else {
+        ++android_memexport_full_total;
+      }
+      bool android_memexport_detail_log =
+          cvars::halo_android_diagnostics &&
+          (android_memexport_total <= 24 ||
+           (android_memexport_total % 120) == 0);
+      if (android_memexport_detail_log) {
+        const draw_util::MemExportRange& first_range = memexport_ranges_.front();
+        XELOGI(
+            "HaloReach MemexportReadback total={} mode={} ranges={} bytes={} "
+            "first_addr=0x{:08X} first_len={}",
+            android_memexport_total,
+            cvars::readback_memexport_fast ? "fast" : "full",
+            memexport_ranges_.size(), memexport_total_size,
+            first_range.base_address_dwords << 2, first_range.size_bytes);
+      }
+      uint64_t now_ms = xe::Clock::QueryHostUptimeMillis();
+      uint32_t summary_interval_ms = cvars::halo_android_gpu_summary_ms
+                                         ? cvars::halo_android_gpu_summary_ms
+                                         : 5000;
+      if (cvars::halo_android_diagnostics &&
+          (!android_memexport_last_summary_ms ||
+           now_ms - android_memexport_last_summary_ms >=
+               summary_interval_ms)) {
+        XELOGI(
+            "HaloReach MemexportSummary total={} fast={} full={} "
+            "last_ranges={} last_bytes={} last_mode={}",
+            android_memexport_total, android_memexport_fast_total,
+            android_memexport_full_total, memexport_ranges_.size(),
+            memexport_total_size,
+            cvars::readback_memexport_fast ? "fast" : "full");
+        android_memexport_last_summary_ms = now_ms;
+      }
+#endif  // XE_PLATFORM_ANDROID
       if (cvars::readback_memexport_fast) {
         // Fast mode: use double-buffered readback (delayed sync)
         IssueDraw_MemexportReadbackFastPath(memexport_total_size);
@@ -3620,12 +4158,42 @@ void VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(
         if (mapped_data) {
           const uint8_t* readback_bytes =
               static_cast<const uint8_t*>(mapped_data);
+#if XE_PLATFORM_ANDROID
+          static uint32_t android_memexport_full_copy_sequence = 0;
+          ++android_memexport_full_copy_sequence;
+          bool android_memexport_stats_log =
+              cvars::halo_android_diagnostics &&
+              (android_memexport_full_copy_sequence <= 16 ||
+               (android_memexport_full_copy_sequence % 120) == 0);
+#endif  // XE_PLATFORM_ANDROID
           for (const draw_util::MemExportRange& memexport_range :
                memexport_ranges_) {
-            memory::vastcpy(memory_->TranslatePhysical(
-                                memexport_range.base_address_dwords << 2),
-                            const_cast<uint8_t*>(readback_bytes),
-                            memexport_range.size_bytes);
+            uint32_t dest_address = memexport_range.base_address_dwords << 2;
+            uint8_t* dest_ptr = memory_->TranslatePhysical(dest_address);
+#if XE_PLATFORM_ANDROID
+            if (android_memexport_stats_log) {
+              LogAndroidMemexportBufferStats(android_memexport_full_copy_sequence,
+                                             "full", "staging", dest_address,
+                                             memexport_range.size_bytes,
+                                             readback_bytes);
+            }
+#endif  // XE_PLATFORM_ANDROID
+            if ((reinterpret_cast<uintptr_t>(dest_ptr) & 63) == 0 &&
+                (reinterpret_cast<uintptr_t>(readback_bytes) & 63) == 0) {
+              memory::vastcpy(dest_ptr, const_cast<uint8_t*>(readback_bytes),
+                              memexport_range.size_bytes);
+            } else {
+              std::memcpy(dest_ptr, readback_bytes, memexport_range.size_bytes);
+            }
+#if XE_PLATFORM_ANDROID
+            if (android_memexport_stats_log) {
+              LogAndroidMemexportBufferStats(android_memexport_full_copy_sequence,
+                                             "full", "guest_after_copy",
+                                             dest_address,
+                                             memexport_range.size_bytes,
+                                             dest_ptr);
+            }
+#endif  // XE_PLATFORM_ANDROID
             readback_bytes += memexport_range.size_bytes;
           }
         } else {
@@ -3814,11 +4382,27 @@ void VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(
   if (rb.buffers[read_index] != VK_NULL_HANDLE &&
       memexport_total_size <= rb.sizes[read_index] &&
       rb.mapped_data[read_index] != nullptr) {
+#if XE_PLATFORM_ANDROID
+    static uint32_t android_memexport_fast_copy_sequence = 0;
+    ++android_memexport_fast_copy_sequence;
+    bool android_memexport_stats_log =
+        cvars::halo_android_diagnostics &&
+        (android_memexport_fast_copy_sequence <= 16 ||
+         (android_memexport_fast_copy_sequence % 120) == 0);
+#endif  // XE_PLATFORM_ANDROID
     const uint8_t* readback_bytes =
         static_cast<const uint8_t*>(rb.mapped_data[read_index]);
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-      uint8_t* dest_ptr =
-          memory_->TranslatePhysical(memexport_range.base_address_dwords << 2);
+      uint32_t dest_address = memexport_range.base_address_dwords << 2;
+      uint8_t* dest_ptr = memory_->TranslatePhysical(dest_address);
+#if XE_PLATFORM_ANDROID
+      if (android_memexport_stats_log) {
+        LogAndroidMemexportBufferStats(android_memexport_fast_copy_sequence,
+                                       "fast", "staging", dest_address,
+                                       memexport_range.size_bytes,
+                                       readback_bytes);
+      }
+#endif  // XE_PLATFORM_ANDROID
       // vastcpy requires 64-byte alignment for non-temporal stores.
       // If addresses aren't aligned, fall back to memcpy.
       if ((reinterpret_cast<uintptr_t>(dest_ptr) & 63) == 0 &&
@@ -3828,6 +4412,14 @@ void VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(
       } else {
         std::memcpy(dest_ptr, readback_bytes, memexport_range.size_bytes);
       }
+#if XE_PLATFORM_ANDROID
+      if (android_memexport_stats_log) {
+        LogAndroidMemexportBufferStats(android_memexport_fast_copy_sequence,
+                                       "fast", "guest_after_copy",
+                                       dest_address, memexport_range.size_bytes,
+                                       dest_ptr);
+      }
+#endif  // XE_PLATFORM_ANDROID
       readback_bytes += memexport_range.size_bytes;
     }
   }
@@ -3894,8 +4486,43 @@ bool VulkanCommandProcessor::IssueCopy() {
 
   // CPU readback resolve path (if not disabled).
   ReadbackResolveMode readback_mode = GetReadbackResolveMode();
+#if XE_PLATFORM_ANDROID
+  static uint32_t android_resolve_total = 0;
+  static uint32_t android_resolve_written_total = 0;
+  static uint32_t android_resolve_unscaled_readback_total = 0;
+  static uint32_t android_resolve_scaled_readback_total = 0;
+  static uint32_t android_resolve_copy_total = 0;
+  static uint32_t android_resolve_inaccessible_total = 0;
+  static uint64_t android_resolve_last_summary_ms = 0;
+  ++android_resolve_total;
+  if (written_length) {
+    ++android_resolve_written_total;
+  }
+  bool android_resolve_detail_log =
+      cvars::halo_android_diagnostics && written_length &&
+      (android_resolve_written_total <= 24 ||
+       (android_resolve_written_total % 120) == 0);
+  const bool android_resolve_frontbuffer =
+      written_address == 0x03044000 && written_length >= 0x300000;
+  const bool android_resolve_stats_log =
+      cvars::halo_android_diagnostics && written_length &&
+      (android_resolve_written_total <= 24 ||
+       (android_resolve_frontbuffer &&
+        (android_resolve_written_total % 600) == 0));
+  if (android_resolve_detail_log) {
+    XELOGI(
+        "HaloReach ResolveWrite total={} written={} addr=0x{:08X} len={} "
+        "mode={} draw_scaled={}",
+        android_resolve_total, android_resolve_written_total, written_address,
+        written_length, AndroidReadbackModeName(readback_mode),
+        uint32_t(texture_cache_->IsDrawResolutionScaled()));
+  }
+#endif  // XE_PLATFORM_ANDROID
   if (readback_mode != ReadbackResolveMode::kDisabled &&
       !texture_cache_->IsDrawResolutionScaled() && written_length > 0) {
+#if XE_PLATFORM_ANDROID
+    ++android_resolve_unscaled_readback_total;
+#endif  // XE_PLATFORM_ANDROID
     // Early check: if destination memory is not accessible, skip all the
     // expensive GPU readback work.
     VirtualHeap* physical_heap = memory_->GetPhysicalHeap();
@@ -3914,6 +4541,16 @@ bool VulkanCommandProcessor::IssueCopy() {
     }
 
     if (!memory_accessible) {
+#if XE_PLATFORM_ANDROID
+      ++android_resolve_inaccessible_total;
+      if (android_resolve_detail_log) {
+        XELOGI(
+            "HaloReach ResolveSkip inaccessible addr=0x{:08X} len={} "
+            "mode={}",
+            written_address, written_length,
+            AndroidReadbackModeName(readback_mode));
+      }
+#endif  // XE_PLATFORM_ANDROID
       // Destination memory not accessible, skip readback entirely
       PopDebugMarker();
       return true;
@@ -4095,15 +4732,42 @@ bool VulkanCommandProcessor::IssueCopy() {
         written_length <= rb.sizes[read_index] &&
         rb.mapped_data[read_index] != nullptr) {
       uint8_t* dest_ptr = memory_->TranslatePhysical(written_address);
-      memory::vastcpy(dest_ptr,
-                      static_cast<uint8_t*>(rb.mapped_data[read_index]),
-                      written_length);
+      uint8_t* readback_ptr = static_cast<uint8_t*>(rb.mapped_data[read_index]);
+#if XE_PLATFORM_ANDROID
+      if (android_resolve_stats_log) {
+        LogAndroidResolveBufferStats(android_resolve_written_total, "staging",
+                                     written_address, written_length,
+                                     readback_ptr);
+      }
+#endif  // XE_PLATFORM_ANDROID
+      memory::vastcpy(dest_ptr, readback_ptr, written_length);
+#if XE_PLATFORM_ANDROID
+      if (android_resolve_stats_log) {
+        LogAndroidResolveBufferStats(android_resolve_written_total,
+                                     "guest_after_copy", written_address,
+                                     written_length, dest_ptr);
+      }
+      MaybeDumpAndroidResolveImage(android_resolve_written_total,
+                                   written_address, written_length, dest_ptr);
+      ++android_resolve_copy_total;
+      if (android_resolve_detail_log) {
+        XELOGI(
+            "HaloReach ResolveCopy addr=0x{:08X} len={} mode={} "
+            "read_index={} delayed={} cache_miss={}",
+            written_address, written_length,
+            AndroidReadbackModeName(readback_mode), read_index,
+            uint32_t(use_delayed_sync), uint32_t(is_cache_miss));
+      }
+#endif  // XE_PLATFORM_ANDROID
     }
 
     // Swap buffer index for next time this specific resolve address is used
     rb.current_index = 1 - rb.current_index;
   } else if (readback_mode != ReadbackResolveMode::kDisabled &&
              texture_cache_->IsDrawResolutionScaled() && written_length > 0) {
+#if XE_PLATFORM_ANDROID
+    ++android_resolve_scaled_readback_total;
+#endif  // XE_PLATFORM_ANDROID
     /* Scaled resolution readback path - GPU compute shader downscaling */
 
     // Early check: if destination memory is not accessible, skip all the
@@ -4124,6 +4788,16 @@ bool VulkanCommandProcessor::IssueCopy() {
     }
 
     if (!memory_accessible) {
+#if XE_PLATFORM_ANDROID
+      ++android_resolve_inaccessible_total;
+      if (android_resolve_detail_log) {
+        XELOGI(
+            "HaloReach ResolveSkip scaled inaccessible addr=0x{:08X} len={} "
+            "mode={}",
+            written_address, written_length,
+            AndroidReadbackModeName(readback_mode));
+      }
+#endif  // XE_PLATFORM_ANDROID
       // Destination memory not accessible, skip readback entirely
       if (debug_markers_enabled_) {
         PopDebugMarker();
@@ -4611,11 +5285,45 @@ bool VulkanCommandProcessor::IssueCopy() {
       memory::vastcpy(physaddr,
                       static_cast<uint8_t*>(rb.mapped_data[read_index]),
                       written_length);
+#if XE_PLATFORM_ANDROID
+      ++android_resolve_copy_total;
+      if (android_resolve_detail_log) {
+        XELOGI(
+            "HaloReach ResolveCopy scaled addr=0x{:08X} len={} mode={} "
+            "read_index={} delayed={} cache_miss={}",
+            written_address, written_length,
+            AndroidReadbackModeName(readback_mode), read_index,
+            uint32_t(use_delayed_sync), uint32_t(is_cache_miss));
+      }
+#endif  // XE_PLATFORM_ANDROID
     }
 
     // Swap buffer index for next time
     rb.current_index = 1 - rb.current_index;
   }
+
+#if XE_PLATFORM_ANDROID
+  if (cvars::halo_android_diagnostics) {
+    uint64_t now_ms = xe::Clock::QueryHostUptimeMillis();
+    uint32_t summary_interval_ms = cvars::halo_android_gpu_summary_ms
+                                       ? cvars::halo_android_gpu_summary_ms
+                                       : 5000;
+    if (!android_resolve_last_summary_ms ||
+        now_ms - android_resolve_last_summary_ms >= summary_interval_ms) {
+      XELOGI(
+          "HaloReach ResolveSummary total={} written={} unscaled_readback={} "
+          "scaled_readback={} copied={} inaccessible={} last_addr=0x{:08X} "
+          "last_len={} mode={} draw_scaled={}",
+          android_resolve_total, android_resolve_written_total,
+          android_resolve_unscaled_readback_total,
+          android_resolve_scaled_readback_total, android_resolve_copy_total,
+          android_resolve_inaccessible_total, written_address, written_length,
+          AndroidReadbackModeName(readback_mode),
+          uint32_t(texture_cache_->IsDrawResolutionScaled()));
+      android_resolve_last_summary_ms = now_ms;
+    }
+  }
+#endif  // XE_PLATFORM_ANDROID
 
   // Pop debug marker for resolve operation.
   if (debug_markers_enabled_) {
