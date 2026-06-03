@@ -97,7 +97,14 @@ class TextureCache {
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  enum class ResolveProvenanceSource : uint32_t {
+    kUnknown,
+    kDirectHost,
+    kRenderTarget,
+  };
+  void MarkRangeAsResolved(
+      uint32_t start_unscaled, uint32_t length_unscaled,
+      ResolveProvenanceSource source = ResolveProvenanceSource::kUnknown);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(
@@ -128,6 +135,14 @@ class TextureCache {
   // bindings or reload texture data from guest memory. Used as a cheap
   // pre-check to skip the full RequestTextures call when nothing changed.
   bool AnyUsedTextureRequestWorkPending(uint32_t used_texture_mask) const;
+  // Conservative non-mutating check for whether RequestTextures may call
+  // LoadTextureDataFromResidentMemoryImpl for any used texture.
+  bool MayRequestTexturesLoadData(uint32_t used_texture_mask) const;
+  uint32_t GetUsedTextureRequestWorkMask(uint32_t used_texture_mask) const;
+  uint32_t GetUsedTextureRangeOverlapMask(uint32_t used_texture_mask,
+                                          uint32_t start,
+                                          uint32_t length) const;
+  size_t GetTotalTextureCount() const { return textures_.size(); }
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -165,6 +180,8 @@ class TextureCache {
   }
 
  protected:
+  void RequestTextures(uint32_t used_texture_mask, bool load_data);
+
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
     // constants so fewer bits can be used, while the maximum size (8192 for 2D)
@@ -249,6 +266,12 @@ class TextureCache {
     void LogAction(const char* action) const;
   };
 
+  enum class TextureWatchInvalidationSource : uint32_t {
+    kCpu,
+    kGpuOther,
+    kGpuResolve,
+  };
+
   class Texture {
    public:
     Texture(const Texture& texture) = delete;
@@ -292,9 +315,39 @@ class TextureCache {
     // not).
     bool base_outdated_lockless() const { return base_outdated_; }
     bool mips_outdated_lockless() const { return mips_outdated_; }
+    TextureWatchInvalidationSource last_base_watch_invalidation_source() const {
+      return last_base_watch_invalidation_source_;
+    }
+    TextureWatchInvalidationSource last_mips_watch_invalidation_source() const {
+      return last_mips_watch_invalidation_source_;
+    }
+    uint32_t last_base_watch_invalidation_range_start() const {
+      return last_base_watch_invalidation_range_start_;
+    }
+    uint32_t last_base_watch_invalidation_range_length() const {
+      return last_base_watch_invalidation_range_length_;
+    }
+    uint32_t last_mips_watch_invalidation_range_start() const {
+      return last_mips_watch_invalidation_range_start_;
+    }
+    uint32_t last_mips_watch_invalidation_range_length() const {
+      return last_mips_watch_invalidation_range_length_;
+    }
+    ResolveProvenanceSource last_base_watch_resolve_source() const {
+      return last_base_watch_resolve_source_;
+    }
+    ResolveProvenanceSource last_mips_watch_resolve_source() const {
+      return last_mips_watch_resolve_source_;
+    }
     void MakeUpToDateAndWatch(const global_unique_lock_type& global_lock);
+    void MakeLoadedDataUpToDateAndWatch(
+        const global_unique_lock_type& global_lock, bool loaded_base,
+        bool loaded_mips);
 
-    void WatchCallback(const global_unique_lock_type& global_lock, bool is_mip);
+    void WatchCallback(const global_unique_lock_type& global_lock, bool is_mip,
+                       TextureWatchInvalidationSource source,
+                       uint32_t source_start, uint32_t source_length,
+                       ResolveProvenanceSource resolve_source);
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
@@ -344,6 +397,18 @@ class TextureCache {
     bool base_outdated_ = false;
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
+    TextureWatchInvalidationSource last_base_watch_invalidation_source_ =
+        TextureWatchInvalidationSource::kCpu;
+    TextureWatchInvalidationSource last_mips_watch_invalidation_source_ =
+        TextureWatchInvalidationSource::kCpu;
+    uint32_t last_base_watch_invalidation_range_start_ = 0;
+    uint32_t last_base_watch_invalidation_range_length_ = 0;
+    uint32_t last_mips_watch_invalidation_range_start_ = 0;
+    uint32_t last_mips_watch_invalidation_range_length_ = 0;
+    ResolveProvenanceSource last_base_watch_resolve_source_ =
+        ResolveProvenanceSource::kUnknown;
+    ResolveProvenanceSource last_mips_watch_resolve_source_ =
+        ResolveProvenanceSource::kUnknown;
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
@@ -551,6 +616,7 @@ class TextureCache {
   // to the implementation that are used in their destructor, and will become
   // invalid if the implementation is destroyed before the texture.
   void DestroyAllTextures(bool from_destructor = false);
+  bool DestroyOldestTextureIfUnused(uint64_t completed_submission_index);
 
   // Whether the signed version of the texture has a different representation on
   // the host than its unsigned version (for example, if it's a fixed-point
@@ -597,6 +663,24 @@ class TextureCache {
   }
   bool LoadTextureData(Texture& texture);
   void LoadTexturesData(Texture** textures, uint32_t n_textures);
+  virtual bool PrepareTextureDataLoadRanges(Texture** textures,
+                                            uint32_t texture_count,
+                                            uint64_t base_outdated_mask,
+                                            uint64_t mips_outdated_mask) {
+    return true;
+  }
+  enum class TextureDataRangeSource {
+    kBase,
+    kMips,
+  };
+  virtual bool RequestTextureDataRange(Texture&,
+                                       TextureDataRangeSource,
+                                       uint32_t start, uint32_t length) {
+    // TODO(xenios-jp): Backend texture caches with encoder-lifetime ownership
+    // must not use this default direct shared-memory request while an encoder
+    // is active. Metal routes texture residency through backend preflight.
+    return shared_memory().RequestRange(start, length);
+  }
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is
   // done outside this function, the implementation just needs to load the data
@@ -604,6 +688,9 @@ class TextureCache {
   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                      bool load_base,
                                                      bool load_mips) = 0;
+  global_unique_lock_type AcquireGlobalLock() {
+    return global_critical_region_.Acquire();
+  }
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
@@ -627,6 +714,10 @@ class TextureCache {
   // Called when something in a texture binding is changed for the
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {}
+  virtual void RecordTextureWatchInvalidation(
+      [[maybe_unused]] const Texture& texture, [[maybe_unused]] bool is_mip,
+      [[maybe_unused]] TextureWatchInvalidationSource source,
+      [[maybe_unused]] uint32_t byte_count) {}
 
  private:
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
@@ -650,6 +741,12 @@ class TextureCache {
 
   const RegisterFile& register_file_;
   SharedMemory& shared_memory_;
+  TextureWatchInvalidationSource texture_watch_invalidation_source_ =
+      TextureWatchInvalidationSource::kGpuOther;
+  uint32_t texture_watch_invalidation_range_start_ = 0;
+  uint32_t texture_watch_invalidation_range_length_ = 0;
+  ResolveProvenanceSource texture_watch_resolve_source_ =
+      ResolveProvenanceSource::kUnknown;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
   divisors::MagicDiv draw_resolution_scale_x_divisor_;

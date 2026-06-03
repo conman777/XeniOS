@@ -68,6 +68,18 @@ DECLARE_bool(readback_resolve_half_pixel_offset);
 
 DECLARE_bool(gpu_3d_to_2d_texture);
 
+DECLARE_bool(metal_shader_disk_cache);
+DECLARE_bool(metal_pipeline_binary_archive);
+DECLARE_int32(metal_draw_ring_count);
+DECLARE_bool(metal_use_heaps);
+DECLARE_int32(metal_heap_min_bytes);
+DECLARE_bool(metal_texture_cache_use_private);
+DECLARE_bool(metal_texture_upload_via_blit);
+DECLARE_string(metal_residency_sets);
+DECLARE_bool(metal_backend_telemetry);
+DECLARE_int32(metal_backend_telemetry_interval);
+DECLARE_bool(metal_root_rebuild_detail_telemetry);
+
 DECLARE_bool(ac6_ground_fix);
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1

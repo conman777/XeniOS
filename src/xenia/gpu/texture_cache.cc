@@ -266,7 +266,8 @@ void TextureCache::BeginFrame() {
 }
 
 void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled,
-                                       uint32_t length_unscaled) {
+                                       uint32_t length_unscaled,
+                                       ResolveProvenanceSource source) {
   if (length_unscaled == 0) {
     return;
   }
@@ -294,7 +295,26 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled,
 
   // Invalidate textures. Toggling individual textures between scaled and
   // unscaled also relies on invalidation through shared memory.
+  TextureWatchInvalidationSource previous_watch_invalidation_source =
+      texture_watch_invalidation_source_;
+  uint32_t previous_watch_invalidation_range_start =
+      texture_watch_invalidation_range_start_;
+  uint32_t previous_watch_invalidation_range_length =
+      texture_watch_invalidation_range_length_;
+  ResolveProvenanceSource previous_watch_resolve_source =
+      texture_watch_resolve_source_;
+  texture_watch_invalidation_source_ =
+      TextureWatchInvalidationSource::kGpuResolve;
+  texture_watch_invalidation_range_start_ = start_unscaled;
+  texture_watch_invalidation_range_length_ = length_unscaled;
+  texture_watch_resolve_source_ = source;
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+  texture_watch_invalidation_source_ = previous_watch_invalidation_source;
+  texture_watch_invalidation_range_start_ =
+      previous_watch_invalidation_range_start;
+  texture_watch_invalidation_range_length_ =
+      previous_watch_invalidation_range_length;
+  texture_watch_resolve_source_ = previous_watch_resolve_source;
 }
 
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle,
@@ -317,6 +337,10 @@ uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle,
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+  RequestTextures(used_texture_mask, true);
+}
+
+void TextureCache::RequestTextures(uint32_t used_texture_mask, bool load_data) {
   const auto& regs = register_file();
 
   // Clear the aggregate flag, but invalidate only actually used outdated
@@ -422,7 +446,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
   }
 
-  LoadTexturesData(textures_to_load, num_textures_to_load);
+  if (load_data) {
+    LoadTexturesData(textures_to_load, num_textures_to_load);
+  }
 
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
@@ -431,24 +457,176 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
 
 bool TextureCache::AnyUsedTextureRequestWorkPending(
     uint32_t used_texture_mask) const {
-  if (!used_texture_mask) {
+  return GetUsedTextureRequestWorkMask(used_texture_mask) != 0;
+}
+
+bool TextureCache::MayRequestTexturesLoadData(
+    uint32_t used_texture_mask) const {
+  uint32_t work_mask = GetUsedTextureRequestWorkMask(used_texture_mask);
+  if (!work_mask) {
     return false;
   }
-  // Any used slot that is out of sync needs work.
-  if (used_texture_mask & ~texture_bindings_in_sync_) {
-    return true;
+
+  const auto& regs = register_file();
+  auto is_texture_outdated = [](const Texture* texture) {
+    return texture && (texture->base_outdated_lockless() ||
+                       texture->mips_outdated_lockless());
+  };
+  auto key_may_need_load = [this, &is_texture_outdated](TextureKey key) {
+    auto texture_it = textures_.find(key);
+    if (texture_it == textures_.end()) {
+      return true;
+    }
+    return is_texture_outdated(texture_it->second.get());
+  };
+
+  uint32_t remaining_bits = work_mask;
+  uint32_t index = 0;
+  while (xe::bit_scan_forward(remaining_bits, &index)) {
+    const uint32_t index_bit = UINT32_C(1) << index;
+    remaining_bits = xe::clear_lowest_bit(remaining_bits);
+
+    const TextureBinding& binding = texture_bindings_[index];
+    const TextureKey old_key = binding.key;
+    const uint8_t old_swizzled_signs = binding.swizzled_signs;
+
+    TextureKey new_key;
+    uint8_t new_swizzled_signs = kSwizzledSignsUnsigned;
+    if (texture_bindings_in_sync_ & index_bit) {
+      new_key = old_key;
+      new_swizzled_signs = old_swizzled_signs;
+    } else {
+      BindingInfoFromFetchConstant(regs.GetTextureFetch(index), new_key,
+                                   &new_swizzled_signs);
+    }
+    if (!new_key.is_valid) {
+      continue;
+    }
+
+    const bool key_changed = new_key != old_key;
+    const bool any_sign_was_not_signed =
+        texture_util::IsAnySignNotSigned(old_swizzled_signs);
+    const bool any_sign_was_signed =
+        texture_util::IsAnySignSigned(old_swizzled_signs);
+    const bool any_sign_is_not_signed =
+        texture_util::IsAnySignNotSigned(new_swizzled_signs);
+    const bool any_sign_is_signed =
+        texture_util::IsAnySignSigned(new_swizzled_signs);
+
+    if (IsSignedVersionSeparateForFormat(new_key)) {
+      if (any_sign_is_not_signed) {
+        if (key_changed || !any_sign_was_not_signed) {
+          if (key_may_need_load(new_key)) {
+            return true;
+          }
+        } else if (is_texture_outdated(binding.texture)) {
+          return true;
+        }
+      }
+      if (any_sign_is_signed) {
+        TextureKey signed_key = new_key;
+        signed_key.signed_separate = 1;
+        if (key_changed || !any_sign_was_signed) {
+          if (key_may_need_load(signed_key)) {
+            return true;
+          }
+        } else if (is_texture_outdated(binding.texture_signed)) {
+          return true;
+        }
+      }
+    } else if (key_changed ? key_may_need_load(new_key)
+                           : is_texture_outdated(binding.texture)) {
+      return true;
+    }
   }
+
+  return false;
+}
+
+uint32_t TextureCache::GetUsedTextureRequestWorkMask(
+    uint32_t used_texture_mask) const {
+  if (!used_texture_mask) {
+    return 0;
+  }
+  // Any used slot that is out of sync needs work.
+  uint32_t work_mask = used_texture_mask & ~texture_bindings_in_sync_;
   // Any in-sync slot whose backing texture data is outdated also needs work.
   uint32_t used_in_sync = used_texture_mask & texture_bindings_in_sync_;
   uint32_t index = 0;
   while (xe::bit_scan_forward(used_in_sync, &index)) {
+    uint32_t index_bit = UINT32_C(1) << index;
     used_in_sync = xe::clear_lowest_bit(used_in_sync);
     const TextureBinding& binding = texture_bindings_[index];
     if (binding.key.is_valid && IsBindingOutdatedForUse(binding)) {
-      return true;
+      work_mask |= index_bit;
     }
   }
-  return false;
+  return work_mask;
+}
+
+uint32_t TextureCache::GetUsedTextureRangeOverlapMask(
+    uint32_t used_texture_mask, uint32_t start, uint32_t length) const {
+  if (!used_texture_mask || !length) {
+    return 0;
+  }
+  start &= 0x1FFFFFFF;
+  length = std::min(length, 0x20000000 - start);
+  if (!length) {
+    return 0;
+  }
+  const uint64_t range_start = start;
+  const uint64_t range_end = range_start + length;
+  auto overlaps = [&](uint32_t texture_start, uint32_t texture_length) {
+    if (!texture_length) {
+      return false;
+    }
+    const uint64_t texture_end = uint64_t(texture_start) + texture_length;
+    return uint64_t(texture_start) < range_end && texture_end > range_start;
+  };
+  const auto& regs = register_file();
+  uint32_t overlap_mask = 0;
+  uint32_t remaining_bits = used_texture_mask;
+  uint32_t index = 0;
+  while (xe::bit_scan_forward(remaining_bits, &index)) {
+    const uint32_t index_bit = UINT32_C(1) << index;
+    remaining_bits = xe::clear_lowest_bit(remaining_bits);
+    TextureKey key;
+    texture_util::TextureGuestLayout computed_layout;
+    const texture_util::TextureGuestLayout* layout = nullptr;
+    const TextureBinding& binding = texture_bindings_[index];
+    if ((texture_bindings_in_sync_ & index_bit) && binding.key.is_valid) {
+      key = binding.key;
+      const Texture* texture =
+          binding.texture ? binding.texture : binding.texture_signed;
+      if (texture) {
+        layout = &texture->guest_layout();
+      }
+    } else {
+      uint8_t swizzled_signs = 0;
+      BindingInfoFromFetchConstant(regs.GetTextureFetch(index), key,
+                                   &swizzled_signs);
+    }
+    if (!key.is_valid) {
+      continue;
+    }
+    if (!layout) {
+      computed_layout = key.GetGuestLayout();
+      layout = &computed_layout;
+    }
+    if (key.base_page &&
+        overlaps(key.base_page << 12,
+                 xe::align(layout->base.level_data_extent_bytes,
+                           UINT32_C(16)))) {
+      overlap_mask |= index_bit;
+      continue;
+    }
+    if (key.mip_page &&
+        overlaps(key.mip_page << 12,
+                 xe::align(layout->mips_total_extent_bytes, UINT32_C(16)))) {
+      overlap_mask |= index_bit;
+    }
+  }
+  return overlap_mask;
 }
 
 bool TextureCache::IsBindingOutdatedForUse(
@@ -576,20 +754,30 @@ TextureCache::Texture::~Texture() {
 
 void TextureCache::Texture::MakeUpToDateAndWatch(
     const global_unique_lock_type& global_lock) {
+  MakeLoadedDataUpToDateAndWatch(global_lock, true, true);
+}
+
+void TextureCache::Texture::MakeLoadedDataUpToDateAndWatch(
+    const global_unique_lock_type& global_lock, bool loaded_base,
+    bool loaded_mips) {
   SharedMemory& shared_memory = texture_cache().shared_memory();
-  if (base_outdated_) {
+  if (loaded_base && base_outdated_) {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = false;
     base_watch_handle_ = shared_memory.WatchMemoryRange(
         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback,
         this, nullptr, 0);
+    shared_memory.WatchRangeForCpuWrites(key().base_page << 12,
+                                         GetGuestBaseSize());
   }
-  if (mips_outdated_) {
+  if (loaded_mips && mips_outdated_) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = false;
     mips_watch_handle_ = shared_memory.WatchMemoryRange(
         key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback,
         this, nullptr, 1);
+    shared_memory.WatchRangeForCpuWrites(key().mip_page << 12,
+                                         GetGuestMipsSize());
   }
 }
 
@@ -624,15 +812,25 @@ void TextureCache::Texture::MarkAsUsed() {
 }
 
 void TextureCache::Texture::WatchCallback(
-    [[maybe_unused]] const global_unique_lock_type& global_lock, bool is_mip) {
+    [[maybe_unused]] const global_unique_lock_type& global_lock, bool is_mip,
+    TextureWatchInvalidationSource source, uint32_t source_start,
+    uint32_t source_length, ResolveProvenanceSource resolve_source) {
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
     mips_watch_handle_ = nullptr;
+    last_mips_watch_invalidation_source_ = source;
+    last_mips_watch_invalidation_range_start_ = source_start;
+    last_mips_watch_invalidation_range_length_ = source_length;
+    last_mips_watch_resolve_source_ = resolve_source;
   } else {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = true;
     base_watch_handle_ = nullptr;
+    last_base_watch_invalidation_source_ = source;
+    last_base_watch_invalidation_range_start_ = source_start;
+    last_base_watch_invalidation_range_length_ = source_length;
+    last_base_watch_resolve_source_ = resolve_source;
   }
 }
 
@@ -640,7 +838,29 @@ void TextureCache::WatchCallback(const global_unique_lock_type& global_lock,
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
-  texture.WatchCallback(global_lock, argument != 0);
+  bool is_mip = argument != 0;
+  uint32_t byte_count =
+      is_mip ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize();
+  TextureWatchInvalidationSource source =
+      invalidated_by_gpu
+          ? texture.texture_cache().texture_watch_invalidation_source_
+          : TextureWatchInvalidationSource::kCpu;
+  uint32_t source_start =
+      invalidated_by_gpu
+          ? texture.texture_cache().texture_watch_invalidation_range_start_
+          : 0;
+  uint32_t source_length =
+      invalidated_by_gpu
+          ? texture.texture_cache().texture_watch_invalidation_range_length_
+          : 0;
+  ResolveProvenanceSource resolve_source =
+      source == TextureWatchInvalidationSource::kGpuResolve
+          ? texture.texture_cache().texture_watch_resolve_source_
+          : ResolveProvenanceSource::kUnknown;
+  texture.texture_cache().RecordTextureWatchInvalidation(
+      texture, is_mip, source, byte_count);
+  texture.WatchCallback(global_lock, is_mip, source, source_start,
+                        source_length, resolve_source);
   texture.texture_cache().texture_became_outdated_.store(
       true, std::memory_order_release);
 }
@@ -649,6 +869,25 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
+}
+
+bool TextureCache::DestroyOldestTextureIfUnused(
+    uint64_t completed_submission_index) {
+  Texture* texture = texture_used_first_;
+  if (!texture ||
+      texture->last_usage_submission_index() > completed_submission_index) {
+    return false;
+  }
+  ResetTextureBindings();
+  auto found_texture_it = textures_.find(texture->key());
+  assert_true(found_texture_it != textures_.end());
+  if (found_texture_it == textures_.end()) {
+    return false;
+  }
+  assert_true(found_texture_it->second.get() == texture);
+  textures_.erase(found_texture_it);
+  COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+  return true;
 }
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
@@ -763,6 +1002,11 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
   if (nkept == 0) {
     return;
   }
+  if (!PrepareTextureDataLoadRanges(textures, n_textures,
+                                    index_base_outdated,
+                                    index_mips_outdated)) {
+    return;
+  }
 
   for (uint32_t i = 0; i < n_textures; ++i) {
     Texture* p_texture = textures[i];
@@ -788,14 +1032,16 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     // from the shared memory to load the unscaled parts.
     // TODO(Triang3l): Load unscaled parts.
     if (index_base_outdated & (1ULL << i)) {
-      if (!shared_memory().RequestRange(
+      if (!RequestTextureDataRange(
+              texture, TextureDataRangeSource::kBase,
               texture_key.base_page << 12,
               xe::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
         continue;
       }
     }
     if (index_mips_outdated & (1ULL << i)) {
-      if (!shared_memory().RequestRange(
+      if (!RequestTextureDataRange(
+              texture, TextureDataRangeSource::kMips,
               texture_key.mip_page << 12,
               xe::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
         continue;
@@ -864,6 +1110,12 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   }
 
   TextureKey texture_key = texture.key();
+  Texture* texture_to_load = &texture;
+  if (!PrepareTextureDataLoadRanges(
+          &texture_to_load, 1, base_outdated ? UINT64_C(1) : 0,
+          mips_outdated ? UINT64_C(1) : 0)) {
+    return false;
+  }
 
   // Implementation may load multiple blocks at once via accesses of up to 128
   // bits (R32G32B32A32_UINT), so aligning the size to this value to make sure
@@ -880,14 +1132,16 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   // shared memory to load the unscaled parts.
   // TODO(Triang3l): Load unscaled parts.
   if (base_outdated) {
-    if (!shared_memory().RequestRange(
+    if (!RequestTextureDataRange(
+            texture, TextureDataRangeSource::kBase,
             texture_key.base_page << 12,
             xe::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
       return false;
     }
   }
   if (mips_outdated) {
-    if (!shared_memory().RequestRange(
+    if (!RequestTextureDataRange(
+            texture, TextureDataRangeSource::kMips,
             texture_key.mip_page << 12,
             xe::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
       return false;
