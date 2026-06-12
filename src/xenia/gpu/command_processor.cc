@@ -495,6 +495,13 @@ void CommandProcessor::ThrottlePresentation() {
 }
 
 void CommandProcessor::WorkerThreadMain() {
+#if XE_PLATFORM_IOS
+  // The command processor feeds the frame; without an explicit QoS class the
+  // Darwin scheduler may park it on an efficiency core and preempt it freely,
+  // stalling guest threads that wait on GPU progress.
+  xe::threading::set_current_thread_qos(
+      xe::threading::ThreadQoS::kUserInteractive);
+#endif  // XE_PLATFORM_IOS
   if (!SetupContext()) {
     xe::FatalError("Unable to setup command processor internal state");
     return;
