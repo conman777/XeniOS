@@ -1485,6 +1485,7 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
       uint32_t width;
       uint32_t height;
       uint32_t bpp;
+      uint32_t msaa_log2;
       uint32_t edram_base;
       uint32_t edram_pitch;
       uint32_t depth_src;
@@ -1495,6 +1496,7 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
         copy_width,
         copy_height,
         copy_bpp,
+        uint32_t(copy_shader_constants.dest_relative.edram_info.msaa_samples),
         uint32_t(copy_shader_constants.dest_relative.edram_info.base_tiles),
         uint32_t(copy_shader_constants.dest_relative.edram_info.pitch_tiles),
         uint32_t(resolve_info.IsCopyingDepth())};
@@ -1507,6 +1509,7 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
           logged_key.width == android_resolvemap_key.width &&
           logged_key.height == android_resolvemap_key.height &&
           logged_key.bpp == android_resolvemap_key.bpp &&
+          logged_key.msaa_log2 == android_resolvemap_key.msaa_log2 &&
           logged_key.edram_base == android_resolvemap_key.edram_base &&
           logged_key.edram_pitch == android_resolvemap_key.edram_pitch &&
           logged_key.depth_src == android_resolvemap_key.depth_src) {
@@ -1518,11 +1521,13 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
       android_resolvemap_log_keys.push_back(android_resolvemap_key);
       XELOGI(
           "RESOLVEMAP dest=0x{:08X} fmt={} {}x{} bpp={} edram_base={} "
-          "edram_pitch={} depth_src={}",
+          "pitch_tiles={} msaa={} depth_src={}",
           android_resolvemap_key.dest, android_resolvemap_key.format,
           android_resolvemap_key.width, android_resolvemap_key.height,
           android_resolvemap_key.bpp, android_resolvemap_key.edram_base,
-          android_resolvemap_key.edram_pitch, android_resolvemap_key.depth_src);
+          android_resolvemap_key.edram_pitch,
+          UINT32_C(1) << android_resolvemap_key.msaa_log2,
+          android_resolvemap_key.depth_src);
     }
 #endif
     bool android_halo_frontbuffer_resolve = false;

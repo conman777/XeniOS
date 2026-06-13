@@ -41,6 +41,11 @@ constexpr float kAndroidStartMinY = 0.72f;
 constexpr float kAndroidDeadZone = 0.18f;
 constexpr float kAndroidDpadThreshold = 0.55f;
 constexpr uint32_t kAndroidDebugInputFilePollInterval = 20;
+constexpr uint8_t kAndroidDebugLeftTrigger = 1;
+constexpr uint8_t kAndroidDebugRightTrigger = 2;
+
+std::atomic<uint8_t> android_debug_trigger_bits{0};
+std::atomic<uint32_t> android_debug_trigger_polls{0};
 
 constexpr const char* kAndroidDebugInputPaths[] = {
     "/sdcard/Android/data/jp.xenios.emulator.github.debug/files/"
@@ -120,17 +125,28 @@ uint16_t ReadAndroidDebugInputFileAtPath(const std::filesystem::path& path) {
   std::istringstream tokens(contents);
   std::string token;
   uint16_t buttons = 0;
+  uint8_t trigger_bits = 0;
   while (tokens >> token) {
-    buttons |= ButtonForAndroidDebugInputToken(UppercaseAscii(token));
+    const std::string upper_token = UppercaseAscii(token);
+    buttons |= ButtonForAndroidDebugInputToken(upper_token);
+    if (upper_token == "LT" || upper_token == "L2") {
+      trigger_bits |= kAndroidDebugLeftTrigger;
+    } else if (upper_token == "RT" || upper_token == "R2") {
+      trigger_bits |= kAndroidDebugRightTrigger;
+    }
   }
   const std::string log_contents =
       contents.size() <= 128 ? contents : contents.substr(0, 128);
-  if (buttons) {
-    XELOGI("Android debug input command '{}' -> buttons=0x{:04X}",
-           log_contents, buttons);
+  if (buttons || trigger_bits) {
+    if (trigger_bits) {
+      android_debug_trigger_bits.fetch_or(trigger_bits);
+      android_debug_trigger_polls.store(kAndroidTapPulsePolls);
+    }
+    XELOGI("Android debug input command '{}' -> buttons=0x{:04X} triggers=0x{:02X}",
+           log_contents, buttons, trigger_bits);
     return buttons;
   }
-  XELOGW("Android debug input command '{}' did not map to any buttons",
+  XELOGW("Android debug input command '{}' did not map to any inputs",
          log_contents);
   return 0;
 }
@@ -379,17 +395,31 @@ X_RESULT NopInputDriver::GetState(uint32_t user_index,
 
   std::memset(out_state, 0, sizeof(*out_state));
   const uint16_t buttons = GetButtonsForPoll(poll_count_++);
+  uint8_t trigger_bits = 0;
+#if XE_PLATFORM_ANDROID
+  if (android_debug_trigger_polls.load()) {
+    trigger_bits = android_debug_trigger_bits.load();
+    if (android_debug_trigger_polls.fetch_sub(1) == 1) {
+      android_debug_trigger_bits.store(0);
+    }
+  }
+#endif
   const int16_t thumb_lx = android_thumb_lx_.load();
   const int16_t thumb_ly = android_thumb_ly_.load();
-  if (buttons != last_buttons_ || thumb_lx != last_thumb_lx_ ||
-      thumb_ly != last_thumb_ly_) {
+  if (buttons != last_buttons_ || trigger_bits != last_trigger_bits_ ||
+      thumb_lx != last_thumb_lx_ || thumb_ly != last_thumb_ly_) {
     ++packet_number_;
     last_buttons_ = buttons;
+    last_trigger_bits_ = trigger_bits;
     last_thumb_lx_ = thumb_lx;
     last_thumb_ly_ = thumb_ly;
   }
   out_state->packet_number = packet_number_;
   out_state->gamepad.buttons = buttons;
+  out_state->gamepad.left_trigger =
+      trigger_bits & kAndroidDebugLeftTrigger ? 0xFF : 0;
+  out_state->gamepad.right_trigger =
+      trigger_bits & kAndroidDebugRightTrigger ? 0xFF : 0;
   out_state->gamepad.thumb_lx = thumb_lx;
   out_state->gamepad.thumb_ly = thumb_ly;
   return X_ERROR_SUCCESS;

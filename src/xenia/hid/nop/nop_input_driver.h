@@ -49,6 +49,7 @@ class NopInputDriver final : public InputDriver,
   uint32_t packet_number_ = 0;
   uint32_t poll_count_ = 0;
   uint16_t last_buttons_ = 0;
+  uint8_t last_trigger_bits_ = 0;
   int16_t last_thumb_lx_ = 0;
   int16_t last_thumb_ly_ = 0;
 
