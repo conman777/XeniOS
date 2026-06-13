@@ -399,6 +399,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool rounding_mode_rte_float32;
 
     bool fragment_shader_sample_interlock;
+    // Any interlock flavor available at all. When false but the FSI render
+    // target path is forced (Android experiment), interlock instructions and
+    // the SPV_EXT_fragment_shader_interlock extension are omitted - EDRAM
+    // access stays bit-exact but unordered.
+    bool fragment_shader_interlock;
 
     bool demote_to_helper_invocation;
 

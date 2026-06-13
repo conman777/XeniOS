@@ -54,6 +54,7 @@ class VulkanSharedMemory : public SharedMemory {
   void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
 
   VkBuffer buffer() const { return buffer_; }
+  Memory& guest_memory_for_diagnostics() const { return memory(); }
 
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();

@@ -12,6 +12,10 @@ import java.util.Set;
 
 final class GameFileScanner {
     private static final String[] GAME_EXTENSIONS = {".iso", ".xex", ".zar"};
+    private static final String[] SKIPPED_DIRECTORY_NAMES = {
+        "cache", "cache0", "cache1", "code_cache", "content", "diagnostics",
+        "modules", "shaders", "update_empty"
+    };
     private static final int MAX_SCAN_DEPTH = 8;
 
     private GameFileScanner() {}
@@ -66,11 +70,23 @@ final class GameFileScanner {
         }
         for (final File child : children) {
             if (child.isDirectory()) {
-                collectGameFiles(child, results, visitedDirectories, depth + 1);
+                if (!isSkippedDirectory(child)) {
+                    collectGameFiles(child, results, visitedDirectories, depth + 1);
+                }
             } else if (isGameFile(child)) {
                 results.add(child);
             }
         }
+    }
+
+    private static boolean isSkippedDirectory(final File directory) {
+        final String name = directory.getName().toLowerCase(Locale.ROOT);
+        for (final String skippedName : SKIPPED_DIRECTORY_NAMES) {
+            if (name.equals(skippedName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String canonicalPath(final File file) {

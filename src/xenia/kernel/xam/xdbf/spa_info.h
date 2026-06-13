@@ -17,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "xenia/base/memory.h"
@@ -77,7 +78,7 @@ enum class ViewFieldEntryFlags : uint32_t {
 
 enum class ViewFieldType : uint8_t { kContextField, kPropertyField };
 
-constexpr inline std::string GetAggregationTypeName(
+constexpr inline std::string_view GetAggregationTypeName(
     const uint32_t aggregation_type) {
   switch (static_cast<AggregationType>(aggregation_type)) {
     case AggregationType::kLast:
@@ -93,7 +94,7 @@ constexpr inline std::string GetAggregationTypeName(
   }
 }
 
-constexpr inline std::string GetViewTypeName(const uint32_t view_type) {
+constexpr inline std::string_view GetViewTypeName(const uint32_t view_type) {
   switch (static_cast<ViewType>(view_type)) {
     case ViewType::kLeaderboard:
       return "Leaderboard";
@@ -105,7 +106,7 @@ constexpr inline std::string GetViewTypeName(const uint32_t view_type) {
       return "";
   }
 }
-constexpr inline std::string AttributeIdToName(const uint16_t id) {
+constexpr inline std::string_view AttributeIdToName(const uint16_t id) {
   switch (id) {
     case std::numeric_limits<uint16_t>::max():
       return "Rank";
@@ -120,7 +121,7 @@ constexpr inline std::string AttributeIdToName(const uint16_t id) {
   }
 }
 
-constexpr inline std::string GetViewTypeName(const ViewType view_type) {
+constexpr inline std::string_view GetViewTypeName(const ViewType view_type) {
   return GetViewTypeName(static_cast<uint32_t>(view_type));
 }
 

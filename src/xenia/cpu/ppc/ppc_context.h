@@ -431,6 +431,12 @@ typedef struct alignas(64) PPCContext_s {
   ThreadState* thread_state;
   uint8_t* virtual_membase;
 
+  // Debug-only execution sampling. Updated by the A64 JIT so Android test
+  // logs can identify guest-code stalls without root-only native backtraces.
+  uint32_t last_guest_function;
+  uint32_t last_guest_pc;
+  uint64_t debug_sample_reserved[7];
+
   template <typename T = uint8_t*>
   inline T TranslateVirtual(uint32_t guest_address) XE_RESTRICT const {
     static_assert(std::is_pointer_v<T>);

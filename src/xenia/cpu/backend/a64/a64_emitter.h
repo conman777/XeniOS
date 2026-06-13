@@ -272,6 +272,7 @@ class A64Emitter : public oaknut::VectorCodeGenerator {
   uint32_t debug_info_flags_ = 0;
   FunctionTraceData* trace_data_ = nullptr;
   XexModule* guest_module_ = nullptr;
+  uint32_t current_function_guest_address_ = 0;
   Arena source_map_arena_;
 
   size_t stack_size_ = 0;

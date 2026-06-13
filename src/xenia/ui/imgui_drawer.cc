@@ -11,7 +11,6 @@
 
 #include <cfloat>
 #include <cstring>
-#include <ranges>
 
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/assert.h"
@@ -31,7 +30,7 @@
 #include <ShlObj_core.h>
 #endif
 
-#if XE_PLATFORM_LINUX
+#if XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
 #include <fontconfig/fontconfig.h>
 #endif
 
@@ -400,7 +399,7 @@ bool ImGuiDrawer::LoadWindowsFont(ImGuiIO& io, ImFontConfig& font_config,
   return true;
 #endif
 
-#if XE_PLATFORM_LINUX
+#if XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
   // On Linux, use fontconfig to find the system's default sans-serif font
   FcConfig* config = FcInitLoadConfigAndFonts();
   if (!config) {
@@ -480,7 +479,7 @@ bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
   return true;
 #endif
 
-#if XE_PLATFORM_LINUX
+#if XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
   // On Linux, find and merge CJK font using fontconfig
   FcConfig* config = FcInitLoadConfigAndFonts();
   if (!config) {
@@ -702,25 +701,37 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   dialog_loop_next_index_ = SIZE_MAX;
 
   if (!notifications_.empty() && are_notifications_enabled_) {
-    auto guest_notifications =
-        notifications_ | std::views::filter([](auto* notification) {
-          return notification->GetNotificationType() == NotificationType::Guest;
-        });
-
-    auto host_notifications =
-        notifications_ | std::views::filter([](auto* notification) {
-          return notification->GetNotificationType() == NotificationType::Host;
-        });
-
-    if (!guest_notifications.empty()) {
-      guest_notifications.front()->Draw();
+    ImGuiNotification* first_guest_notification = nullptr;
+    ImGuiNotification* first_host_notification = nullptr;
+    size_t host_notification_count = 0;
+    for (auto* notification : notifications_) {
+      if (!notification) {
+        continue;
+      }
+      switch (notification->GetNotificationType()) {
+        case NotificationType::Guest:
+          if (!first_guest_notification) {
+            first_guest_notification = notification;
+          }
+          break;
+        case NotificationType::Host:
+          if (!first_host_notification) {
+            first_host_notification = notification;
+          }
+          ++host_notification_count;
+          break;
+      }
     }
 
-    if (!host_notifications.empty()) {
-      host_notifications.front()->Draw();
+    if (first_guest_notification) {
+      first_guest_notification->Draw();
+    }
 
-      if (std::ranges::distance(host_notifications) > 1) {
-        host_notifications.front()->SetDeletionPending();
+    if (first_host_notification) {
+      first_host_notification->Draw();
+
+      if (host_notification_count > 1) {
+        first_host_notification->SetDeletionPending();
       }
     }
   }

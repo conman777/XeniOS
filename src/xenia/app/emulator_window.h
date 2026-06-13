@@ -15,7 +15,7 @@
 
 #include "xenia/base/platform.h"
 
-#if !XE_PLATFORM_IOS
+#if !XE_PLATFORM_IOS && !XE_PLATFORM_ANDROID
 #include <QPointer>
 class QTimer;
 #endif
@@ -243,7 +243,7 @@ class EmulatorWindow {
   bool is_game_process_;
   EmulatorWindowListener window_listener_;
 
-#if !XE_PLATFORM_IOS
+#if !XE_PLATFORM_IOS && !XE_PLATFORM_ANDROID
   // Timer for debouncing resize events (save config after resize is done)
   std::unique_ptr<QTimer> resize_save_timer_;
 #endif
@@ -265,11 +265,11 @@ class EmulatorWindow {
 
   ui::ImGuiPostProcessingDialog* postprocessing_dialog_ = nullptr;
   ui::ImGuiPerformanceDialog* performance_dialog_ = nullptr;
-#if !XE_PLATFORM_IOS
+#if !XE_PLATFORM_IOS && !XE_PLATFORM_ANDROID
   QPointer<class GameListDialogQt> game_list_dialog_qt_;
 #endif
   ProfileConfigDialog* profile_dialog_ = nullptr;
-#if !XE_PLATFORM_IOS
+#if !XE_PLATFORM_IOS && !XE_PLATFORM_ANDROID
   QPointer<class SimpleConfigDialogQt> simple_config_dialog_qt_;
   QPointer<class ConfigDialogQt> config_dialog_qt_;
 #endif

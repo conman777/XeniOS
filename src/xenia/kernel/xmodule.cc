@@ -19,6 +19,42 @@
 namespace xe {
 namespace kernel {
 
+namespace {
+
+std::string_view StripKnownModuleExtension(const std::string_view name) {
+  static constexpr std::string_view kKnownExtensions[] = {".dll", ".xex",
+                                                          ".exe"};
+  for (const auto extension : kKnownExtensions) {
+    if (name.size() <= extension.size()) {
+      continue;
+    }
+
+    const auto suffix = name.substr(name.size() - extension.size());
+    if (xe::utf8::equal_case(suffix, extension)) {
+      return name.substr(0, name.size() - extension.size());
+    }
+  }
+  return name;
+}
+
+bool ModuleNameMatches(const std::string_view loaded,
+                       const std::string_view requested) {
+  if (xe::utf8::equal_case(loaded, requested)) {
+    return true;
+  }
+
+  const auto loaded_name = xe::utf8::find_name_from_guest_path(loaded);
+  const auto requested_name = xe::utf8::find_name_from_guest_path(requested);
+  if (xe::utf8::equal_case(loaded_name, requested_name)) {
+    return true;
+  }
+
+  return xe::utf8::equal_case(StripKnownModuleExtension(loaded_name),
+                              StripKnownModuleExtension(requested_name));
+}
+
+}  // namespace
+
 XModule::XModule(KernelState* kernel_state, ModuleType module_type,
                  bool host_object)
     : XObject(kernel_state, kObjectType, host_object),
@@ -42,11 +78,8 @@ XModule::~XModule() {
 }
 
 bool XModule::Matches(const std::string_view name) const {
-  return xe::utf8::equal_case(xe::utf8::find_name_from_guest_path(path()),
-                              name) ||
-         xe::utf8::equal_case(this->name(), name) ||
-         xe::utf8::equal_case(path(), name);
-}  // namespace kernel
+  return ModuleNameMatches(path(), name) || ModuleNameMatches(this->name(), name);
+}
 
 void XModule::OnLoad() { kernel_state_->RegisterModule(this); }
 

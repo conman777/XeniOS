@@ -11,6 +11,9 @@ public class WindowDemoActivity extends WindowedAppActivity {
     @Override
     protected void onCreate(final Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (!isWindowedAppReady()) {
+            return;
+        }
 
         setContentView(R.layout.activity_window_demo);
         setWindowSurfaceView(findViewById(R.id.window_demo_surface_view));

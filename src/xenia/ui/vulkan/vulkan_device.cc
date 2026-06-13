@@ -671,7 +671,18 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
     XE_UI_VULKAN_FEATURE(independentBlend)
     XE_UI_VULKAN_FEATURE(geometryShader)
-    XE_UI_VULKAN_FEATURE(tessellationShader)
+    enabled_features.tessellationShader =
+        supported_features.tessellationShader &&
+        properties.limits.maxTessellationEvaluationOutputComponents != 0;
+    device->properties_.tessellationShader =
+        enabled_features.tessellationShader;
+    if (enabled_features.tessellationShader) {
+      XELOGI("* tessellationShader");
+    } else if (supported_features.tessellationShader) {
+      XELOGW(
+          "Disabling Vulkan tessellation because the device reports unusable "
+          "tessellation limits");
+    }
     XE_UI_VULKAN_FEATURE(sampleRateShading)
     XE_UI_VULKAN_FEATURE(depthClamp)
     XE_UI_VULKAN_FEATURE(fillModeNonSolid)
@@ -837,34 +848,99 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   Functions& dfn = device->functions_;
 
-#define XE_UI_VULKAN_FUNCTION(name)                                   \
-  functions_loaded &= (dfn.name = PFN_##name(ifn.vkGetDeviceProcAddr( \
-                           device->device_, #name))) != nullptr;
+#define XE_UI_VULKAN_FUNCTION(name)                                         \
+  do {                                                                      \
+    dfn.name = PFN_##name(ifn.vkGetDeviceProcAddr(device->device_, #name)); \
+    if (!dfn.name) {                                                        \
+      XELOGW("Missing Vulkan device function '{}'", #name);                 \
+      functions_loaded = false;                                             \
+    }                                                                       \
+  } while (false);
 
   // Vulkan 1.0.
 #include "xenia/ui/vulkan/functions/device_1_0.inc"
 
   // Extensions promoted to a Vulkan version supported by the device.
-#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
-  functions_loaded &=                                             \
-      (dfn.core_name = PFN_##core_name(                           \
-           ifn.vkGetDeviceProcAddr(device->device_, #core_name))) != nullptr;
+  bool dynamic_rendering_functions_loaded = true;
+  bool maintenance4_functions_loaded = true;
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name)       \
+  do {                                                                  \
+    auto function_ptr = ifn.vkGetDeviceProcAddr(device->device_,        \
+                                                #core_name);            \
+    if (!function_ptr) {                                                 \
+      function_ptr = ifn.vkGetDeviceProcAddr(device->device_,           \
+                                             #extension_name);           \
+    }                                                                   \
+    dfn.core_name = PFN_##core_name(function_ptr);                      \
+    if (!dfn.core_name) {                                               \
+      XELOGW("Missing Vulkan device function '{}' / '{}'", #core_name,  \
+             #extension_name);                                          \
+      functions_loaded = false;                                         \
+    }                                                                   \
+  } while (false);
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
 #include "xenia/ui/vulkan/functions/device_1_1_khr_bind_memory2.inc"
 #include "xenia/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc"
   }
-  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
-#include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
-#include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
-  }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
+
+  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name)       \
+  do {                                                                  \
+    auto function_ptr = ifn.vkGetDeviceProcAddr(device->device_,        \
+                                                #core_name);            \
+    if (!function_ptr) {                                                 \
+      function_ptr = ifn.vkGetDeviceProcAddr(device->device_,           \
+                                             #extension_name);           \
+    }                                                                   \
+    dfn.core_name = PFN_##core_name(function_ptr);                      \
+    if (!dfn.core_name) {                                               \
+      XELOGW("Disabling dynamic rendering because Vulkan device function " \
+             "'{}' / '{}' is unavailable",                              \
+             #core_name, #extension_name);                              \
+      dynamic_rendering_functions_loaded = false;                       \
+    }                                                                   \
+  } while (false);
+#include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name)       \
+  do {                                                                  \
+    auto function_ptr = ifn.vkGetDeviceProcAddr(device->device_,        \
+                                                #core_name);            \
+    if (!function_ptr) {                                                 \
+      function_ptr = ifn.vkGetDeviceProcAddr(device->device_,           \
+                                             #extension_name);           \
+    }                                                                   \
+    dfn.core_name = PFN_##core_name(function_ptr);                      \
+    if (!dfn.core_name) {                                               \
+      XELOGW("Disabling maintenance4 because Vulkan device function '{}' " \
+             "/ '{}' is unavailable",                                   \
+             #core_name, #extension_name);                              \
+      maintenance4_functions_loaded = false;                            \
+    }                                                                   \
+  } while (false);
+#include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+  }
 
   // Non-promoted extensions, and extensions promoted to a Vulkan version not
   // supported by the device.
-#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
-  functions_loaded &=                                             \
-      (dfn.core_name = PFN_##core_name(ifn.vkGetDeviceProcAddr(   \
-           device->device_, #extension_name))) != nullptr;
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name)       \
+  do {                                                                  \
+    auto function_ptr = ifn.vkGetDeviceProcAddr(device->device_,        \
+                                                #extension_name);        \
+    if (!function_ptr) {                                                 \
+      function_ptr = ifn.vkGetDeviceProcAddr(device->device_,           \
+                                             #core_name);                \
+    }                                                                   \
+    dfn.core_name = PFN_##core_name(function_ptr);                      \
+    if (!dfn.core_name) {                                               \
+      XELOGW("Missing Vulkan device function '{}' / '{}'",              \
+             #extension_name, #core_name);                              \
+      functions_loaded = false;                                         \
+    }                                                                   \
+  } while (false);
   if (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     if (device->extensions_.ext_1_1_KHR_get_memory_requirements2) {
 #include "xenia/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc"
@@ -887,6 +963,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
 #undef XE_UI_VULKAN_FUNCTION
+
+  if (!dynamic_rendering_functions_loaded) {
+    device->extensions_.ext_1_3_KHR_dynamic_rendering = false;
+    device->properties_.dynamicRendering = false;
+  }
+  if (!maintenance4_functions_loaded) {
+    device->extensions_.ext_1_3_KHR_maintenance4 = false;
+  }
 
   if (!functions_loaded) {
     XELOGE("Failed to get all Vulkan device function pointers for '{}'",

@@ -7,8 +7,6 @@
  ******************************************************************************
  */
 
-#include <ranges>
-
 #include "xenia/emulator.h"
 
 #include <algorithm>
@@ -2238,8 +2236,8 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
           achievement_list = game_info_database_->GetAchievements();
       for (const kernel::util::GameInfoDatabase::Achievement& entry :
            achievement_list) {
-        const std::string type = GetAchievementTypeName(
-            kernel::xam::GetAchievementType(entry.flags));
+        const std::string type = std::string(GetAchievementTypeName(
+            kernel::xam::GetAchievementType(entry.flags)));
 
         table.add_row({fmt::format("{}", entry.id), entry.label,
                        entry.description, type,
@@ -2292,20 +2290,22 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
           game_info_database_->GetStatsViews();
 
       // 4D5307EA SPA contains a lot of stats, limit views to log.
-      const auto stats_views_limit = stats_views | std::views::take(100);
+      const size_t stats_views_limit =
+          std::min<size_t>(stats_views.size(), size_t(100));
 
       table = tabulate::Table();
       table.format().multi_byte_characters(true);
       table.add_row({"ID", "View Type", "Name", "Skilled", "Arbitrated",
                      "Hidden", "Team View", "Online Only"});
 
-      for (const kernel::util::GameInfoDatabase::StatsView& entry :
-           stats_views_limit) {
+      for (size_t i = 0; i < stats_views_limit; ++i) {
+        const kernel::util::GameInfoDatabase::StatsView& entry =
+            stats_views[i];
         const std::string name =
             string_util::remove_eol(string_util::trim(entry.view.name));
 
         const std::string view_type =
-            kernel::xam::GetViewTypeName(entry.view.view_type);
+            std::string(kernel::xam::GetViewTypeName(entry.view.view_type));
 
         table.add_row({fmt::format("{:08X}", entry.view.id), view_type, name,
                        entry.view.skilled ? "True" : "False",
@@ -2317,8 +2317,8 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
 
       std::string totals;
 
-      if (stats_views.size() > stats_views_limit.size()) {
-        totals = fmt::format("\nViews: {}/{}", stats_views_limit.size(),
+      if (stats_views.size() > stats_views_limit) {
+        totals = fmt::format("\nViews: {}/{}", stats_views_limit,
                              stats_views.size());
       }
       XELOGI("\n-------------------- Stats Views --------------------{}\n{}",

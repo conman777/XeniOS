@@ -1,7 +1,7 @@
 project_root = "../../../../.."
 include(project_root.."/tools/build")
 
-if TARGET_ARCH ~= "ARM64" then
+if TARGET_ARCH ~= "ARM64" and not os.istarget("android") then
   return
 end
 

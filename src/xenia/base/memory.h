@@ -712,7 +712,10 @@ union alignas(XE_HOST_CACHE_LINE_SIZE) CacheLine {
 XE_FORCEINLINE
 static void WriteLineNT(CacheLine* XE_RESTRICT destination,
                         const CacheLine* XE_RESTRICT source) {
-  assert_true((reinterpret_cast<uintptr_t>(destination) & 63ULL) == 0);
+  if ((reinterpret_cast<uintptr_t>(destination) & 63ULL) != 0) {
+    std::memcpy(destination, source, sizeof(CacheLine));
+    return;
+  }
   __m256 low = _mm256_loadu_ps(&source->floats[0]);
   __m256 high = _mm256_loadu_ps(&source->floats[8]);
   _mm256_stream_ps(&destination->floats[0], low);
@@ -722,7 +725,10 @@ static void WriteLineNT(CacheLine* XE_RESTRICT destination,
 XE_FORCEINLINE
 static void ReadLineNT(CacheLine* XE_RESTRICT destination,
                        const CacheLine* XE_RESTRICT source) {
-  assert_true((reinterpret_cast<uintptr_t>(source) & 63ULL) == 0);
+  if ((reinterpret_cast<uintptr_t>(source) & 63ULL) != 0) {
+    std::memcpy(destination, source, sizeof(CacheLine));
+    return;
+  }
 
   __m128i first = _mm_stream_load_si128(&source->xmms[0]);
   __m128i second = _mm_stream_load_si128(&source->xmms[1]);
@@ -737,7 +743,10 @@ static void ReadLineNT(CacheLine* XE_RESTRICT destination,
 XE_FORCEINLINE
 static void ReadLine(CacheLine* XE_RESTRICT destination,
                      const CacheLine* XE_RESTRICT source) {
-  assert_true((reinterpret_cast<uintptr_t>(source) & 63ULL) == 0);
+  if ((reinterpret_cast<uintptr_t>(source) & 63ULL) != 0) {
+    std::memcpy(destination, source, sizeof(CacheLine));
+    return;
+  }
   __m256 low = _mm256_loadu_ps(&source->floats[0]);
   __m256 high = _mm256_loadu_ps(&source->floats[8]);
   _mm256_storeu_ps(&destination->floats[0], low);
@@ -746,7 +755,10 @@ static void ReadLine(CacheLine* XE_RESTRICT destination,
 XE_FORCEINLINE
 static void WriteLine(CacheLine* XE_RESTRICT destination,
                       const CacheLine* XE_RESTRICT source) {
-  assert_true((reinterpret_cast<uintptr_t>(destination) & 63ULL) == 0);
+  if ((reinterpret_cast<uintptr_t>(destination) & 63ULL) != 0) {
+    std::memcpy(destination, source, sizeof(CacheLine));
+    return;
+  }
   __m256 low = _mm256_loadu_ps(&source->floats[0]);
   __m256 high = _mm256_loadu_ps(&source->floats[8]);
   _mm256_storeu_ps(&destination->floats[0], low);

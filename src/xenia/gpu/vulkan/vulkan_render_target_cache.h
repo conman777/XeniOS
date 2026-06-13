@@ -593,6 +593,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       xenos::MsaaSamples host_depth_source_msaa_samples
           : xenos::kMsaaSamplesBits;
       uint32_t source_resource_format : xenos::kRenderTargetFormatBits;
+      // Android-only Halo Reach diagnostics for 4x depth -> 1x color
+      // ownership transfers. Kept in the key so diagnostic shaders don't
+      // accidentally reuse the normal cached transfer shader.
+      uint32_t android_depth_to_color_diag_mode : 4;
+      uint32_t android_depth_to_color_sample_mode : 3;
 
       // Last bits because this affects the pipeline layout - after sorting,
       // only change it as fewer times as possible. Depth buffers have an
@@ -721,6 +726,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     struct {
       xenos::MsaaSamples msaa_samples : 2;
       uint32_t resource_format : 4;
+      // Read host sample 0 for every EDRAM sample slot, collapsing an MSAA
+      // source so a subsequent 1x-MSAA resolve read returns one shaded value
+      // per source pixel instead of interleaved samples (Android Halo
+      // frontbuffer compat).
+      uint32_t source_to_1x : 1;
+      // Android Halo diagnostic: swap G/B while packing 8888 color dumps into
+      // EDRAM, used to test whether the final-presentable writer is the menu
+      // channel-order root cause.
+      uint32_t android_writer_gb_fix : 1;
       // Last bit because this affects the pipeline - after sorting, only change
       // it at most once. Depth buffers have an additional stencil SRV.
       uint32_t is_depth : 1;
@@ -876,11 +890,74 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   void DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                          uint32_t dump_rows, uint32_t dump_pitch);
+  void ExecutePendingDumpRectanglesToEdram(uint32_t dump_base,
+                                           uint32_t dump_row_length_used,
+                                           uint32_t dump_rows,
+                                           uint32_t dump_pitch);
+
+#if XE_PLATFORM_ANDROID
+  enum class AndroidHaloOwnerKind {
+    kUnknown,
+    kPresentableColor,
+    kDepthColorAliasNonPresentable,
+  };
+
+  static constexpr uint32_t kAndroidHaloShadowBaseTiles = 1350;
+  static constexpr uint32_t kAndroidHaloShadowPitchTiles = 15;
+  static constexpr uint32_t kAndroidHaloShadowRows = 45;
+  static constexpr uint32_t kAndroidHaloShadowRowLengthTiles = 15;
+  static constexpr uint32_t kAndroidHaloShadowTileBytes =
+      xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples *
+      sizeof(uint32_t);
+  static constexpr uint32_t kAndroidHaloShadowBytes =
+      kAndroidHaloShadowPitchTiles * kAndroidHaloShadowRows *
+      kAndroidHaloShadowTileBytes;
+
+  bool IsAndroidHaloCompatActive() const;
+  static bool IsAndroidHaloShadowSpan(uint32_t base, uint32_t row_length_used,
+                                      uint32_t rows, uint32_t pitch);
+  static bool IsAndroidHaloPresentableColorKey(const RenderTargetKey& key);
+  static const char* GetAndroidHaloOwnerKindName(AndroidHaloOwnerKind kind);
+  void AndroidHaloNoteColorDrawTargets(
+      RenderTarget* const* depth_and_color_render_targets);
+  void AndroidHaloQuarantineDepthToColor(const Transfer& transfer,
+                                         const RenderTargetKey& source_key,
+                                         const RenderTargetKey& dest_key);
+  void AndroidHaloTransitionShadowBuffer(VkPipelineStageFlags dst_stage_mask,
+                                         VkAccessFlags dst_access_mask);
+  bool AndroidHaloRefreshPresentableEdramForFinalResolve(
+      const draw_util::ResolveInfo& resolve_info, uint32_t dump_base,
+      uint32_t dump_row_length_used, uint32_t dump_rows, uint32_t dump_pitch,
+      uint32_t copy_width, uint32_t copy_height, uint32_t copy_bpp,
+      const draw_util::ResolveCopyShaderConstants& copy_shader_constants);
+  void AndroidHaloExecutePendingDumpRectangles(uint32_t dump_base,
+                                               uint32_t dump_row_length_used,
+                                               uint32_t dump_rows,
+                                               uint32_t dump_pitch) {
+    ExecutePendingDumpRectanglesToEdram(dump_base, dump_row_length_used,
+                                        dump_rows, dump_pitch);
+  }
+  void AndroidHaloCapturePresentableShadow(uint32_t dump_base,
+                                           uint32_t dump_row_length_used,
+                                           uint32_t dump_rows,
+                                           uint32_t dump_pitch);
+  bool AndroidHaloMaybeOverrideEdramWithPresentableShadow(
+      const draw_util::ResolveInfo& resolve_info, uint32_t dump_base,
+      uint32_t dump_row_length_used, uint32_t dump_rows, uint32_t dump_pitch,
+      uint32_t copy_width, uint32_t copy_height, uint32_t copy_bpp,
+      const draw_util::ResolveCopyShaderConstants& copy_shader_constants);
+#endif
 
   bool gamma_render_target_as_unorm16_ = false;
 
   bool depth_unorm24_vulkan_format_supported_ = false;
   bool depth_float24_round_ = false;
+  bool snorm16_color_attachments_supported_ = true;
+  // Set around DumpRenderTargets during a resolve when the guest reads the
+  // dumped span as 1x MSAA (used to collapse 4x-MSAA owner samples on
+  // Android - samples-as-pixels aliasing).
+  bool android_resolve_read_msaa_1x_ = false;
+  bool android_resolve_read_64bpp_ = false;
 
   bool msaa_2x_attachments_supported_ = false;
   bool msaa_2x_no_attachments_supported_ = false;
@@ -931,6 +1008,32 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<DumpInvocation> dump_invocations_;
+
+#if XE_PLATFORM_ANDROID
+  // Narrow Halo Reach fallback: if the exact 4x depth -> 1x color ownership
+  // transfer at base 1350 is skipped, dump the source depth RT directly to
+  // EDRAM on the next matching resolve span instead of dumping the corrupt
+  // destination color RT.
+  VulkanRenderTarget* android_depth_to_color_edram_fallback_source_ = nullptr;
+  VulkanRenderTarget* android_halo_presentable_color_rt_ = nullptr;
+
+  VkDeviceMemory android_halo_present_shadow_memory_ = VK_NULL_HANDLE;
+  VkBuffer android_halo_present_shadow_buffer_ = VK_NULL_HANDLE;
+  VkPipelineStageFlags android_halo_present_shadow_stage_mask_ =
+      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+  VkAccessFlags android_halo_present_shadow_access_mask_ = 0;
+  bool android_halo_present_shadow_valid_ = false;
+  AndroidHaloOwnerKind android_halo_owner_kind_ =
+      AndroidHaloOwnerKind::kUnknown;
+  bool android_halo_transfer_render_pass_active_ = false;
+  bool android_halo_depth_alias_quarantine_latched_ = false;
+  uint32_t android_halo_depth_to_color_quarantine_count_ = 0;
+  uint32_t android_halo_presentable_owner_suppressed_count_ = 0;
+  uint32_t android_halo_present_shadow_update_count_ = 0;
+  uint32_t android_halo_present_shadow_override_count_ = 0;
+  uint32_t android_halo_direct_presentable_resolve_count_ = 0;
+  uint32_t android_halo_present_shadow_skip_log_count_ = 0;
+#endif
 
   // For pixel (fragment) shader interlock.
 

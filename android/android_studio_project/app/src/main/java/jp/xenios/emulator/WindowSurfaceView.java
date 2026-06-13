@@ -38,5 +38,6 @@ public class WindowSurfaceView extends SurfaceView {
         }
         final WindowedAppActivity activity = (WindowedAppActivity) context;
         activity.onWindowSurfaceDraw(false);
+        postInvalidateOnAnimation();
     }
 }

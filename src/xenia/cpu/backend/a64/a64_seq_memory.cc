@@ -17,10 +17,12 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
+#include "xenia/base/string_buffer.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #include "xenia/cpu/backend/a64/a64_op.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/xex_module.h"
 #include "xenia/kernel/kernel_state.h"
@@ -136,18 +138,362 @@ static void LogReservationStore32(void* raw_context, uint64_t guest_addr,
       uint32_t(guest_addr), uint32_t(value), uint32_t(status), thread_id);
 }
 
-static void LogStoreWatch32(void* raw_context, uint64_t guest_addr,
-                            uint64_t value, uint64_t guest_pc) {
+static void DumpGuestDisassembly(const ppc::PPCContext* context,
+                                 const char* label, uint32_t center_pc,
+                                 int before, int after) {
+  if (!context || !context->kernel_state || !context->kernel_state->memory() ||
+      !center_pc) {
+    return;
+  }
+
+  auto* memory = context->kernel_state->memory();
+  for (int i = -before; i <= after; ++i) {
+    const uint32_t pc = center_pc + uint32_t(i * 4);
+    const uint32_t* code_ptr = memory->TranslateVirtual<const uint32_t*>(pc);
+    if (!code_ptr) {
+      continue;
+    }
+    xe::memory::PageAccess access;
+    size_t code_length = sizeof(uint32_t);
+    if (!xe::memory::QueryProtect(const_cast<uint32_t*>(code_ptr), code_length,
+                                  access) ||
+        access == xe::memory::PageAccess::kNoAccess) {
+      continue;
+    }
+
+    const uint32_t instruction = xe::load_and_swap<uint32_t>(code_ptr);
+    StringBuffer disasm;
+    if (cpu::ppc::DisasmPPC(pc, instruction, &disasm)) {
+      XELOGI("A64 store watch {}{} pc=0x{:08X} 0x{:08X} {}", label,
+             i == 0 ? "*" : " ", pc, instruction, disasm.to_string_view());
+    } else {
+      XELOGI("A64 store watch {}{} pc=0x{:08X} 0x{:08X}", label,
+             i == 0 ? "*" : " ", pc, instruction);
+    }
+  }
+}
+
+static void DumpGuestWords(const ppc::PPCContext* context, const char* label,
+                           uint32_t guest_addr) {
+  if (!context || !context->kernel_state || !context->kernel_state->memory() ||
+      !guest_addr) {
+    return;
+  }
+
+  auto* memory = context->kernel_state->memory();
+  const uint32_t* data_ptr = memory->TranslateVirtual<const uint32_t*>(guest_addr);
+  if (!data_ptr) {
+    XELOGI("A64 store watch {} addr=0x{:08X}: <unreadable>", label,
+           guest_addr);
+    return;
+  }
+
+  xe::memory::PageAccess access;
+  size_t data_length = sizeof(uint32_t) * 16;
+  if (!xe::memory::QueryProtect(const_cast<uint32_t*>(data_ptr), data_length,
+                                access) ||
+      access == xe::memory::PageAccess::kNoAccess) {
+    XELOGI("A64 store watch {} addr=0x{:08X}: <unreadable>", label,
+           guest_addr);
+    return;
+  }
+
+  uint32_t words[16] = {};
+  std::memcpy(words, data_ptr, sizeof(words));
+  XELOGI(
+      "A64 store watch {} addr=0x{:08X}: "
+      "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+      "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+      label, guest_addr, words[0], words[1], words[2], words[3], words[4],
+      words[5], words[6], words[7], words[8], words[9], words[10],
+      words[11], words[12], words[13], words[14], words[15]);
+}
+
+static void DumpGuestBytes(const ppc::PPCContext* context, const char* label,
+                           uint32_t guest_addr) {
+  if (!context || !context->kernel_state || !context->kernel_state->memory() ||
+      !guest_addr) {
+    return;
+  }
+
+  auto* memory = context->kernel_state->memory();
+  const uint8_t* data_ptr = memory->TranslateVirtual<const uint8_t*>(guest_addr);
+  if (!data_ptr) {
+    XELOGI("A64 store watch bytes {} addr=0x{:08X}: <unreadable>", label,
+           guest_addr);
+    return;
+  }
+
+  xe::memory::PageAccess access;
+  size_t data_length = 96;
+  if (!xe::memory::QueryProtect(const_cast<uint8_t*>(data_ptr), data_length,
+                                access) ||
+      access == xe::memory::PageAccess::kNoAccess) {
+    XELOGI("A64 store watch bytes {} addr=0x{:08X}: <unreadable>", label,
+           guest_addr);
+    return;
+  }
+
+  uint8_t bytes[96] = {};
+  std::memcpy(bytes, data_ptr, sizeof(bytes));
+  char ascii[97] = {};
+  for (size_t i = 0; i < sizeof(bytes); ++i) {
+    const uint8_t c = bytes[i];
+    ascii[i] = c >= 32 && c <= 126 ? char(c) : '.';
+  }
+  ascii[sizeof(bytes)] = 0;
+
+  XELOGI(
+      "A64 store watch bytes {} addr=0x{:08X}: "
+      "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
+      "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
+      "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
+      "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+      label, guest_addr, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+      bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+      bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17],
+      bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+      bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29],
+      bytes[30], bytes[31]);
+  XELOGI(
+      "A64 store watch ascii {} addr=0x{:08X}: \"{}\"",
+      label, guest_addr, ascii);
+}
+
+static bool ReadGuestInstruction(const ppc::PPCContext* context, uint32_t pc,
+                                 uint32_t* instruction_out) {
+  if (!context || !context->kernel_state || !context->kernel_state->memory() ||
+      !pc || !instruction_out) {
+    return false;
+  }
+
+  auto* memory = context->kernel_state->memory();
+  const uint32_t* code_ptr = memory->TranslateVirtual<const uint32_t*>(pc);
+  if (!code_ptr) {
+    return false;
+  }
+
+  xe::memory::PageAccess access;
+  size_t code_length = sizeof(uint32_t);
+  if (!xe::memory::QueryProtect(const_cast<uint32_t*>(code_ptr), code_length,
+                                access) ||
+      access == xe::memory::PageAccess::kNoAccess) {
+    return false;
+  }
+
+  *instruction_out = xe::load_and_swap<uint32_t>(code_ptr);
+  return true;
+}
+
+static bool DecodeDirectBranchTarget(uint32_t branch_pc, uint32_t instruction,
+                                     uint32_t* target_out) {
+  if (!target_out || (instruction >> 26) != 18) {
+    return false;
+  }
+
+  int32_t displacement = int32_t(instruction & 0x03FFFFFC);
+  if (displacement & 0x02000000) {
+    displacement |= int32_t(0xFC000000);
+  }
+
+  const bool absolute = (instruction & 0x2) != 0;
+  *target_out = absolute ? uint32_t(displacement)
+                         : branch_pc + uint32_t(displacement);
+  return true;
+}
+
+static bool ReadGuestU32BE(const ppc::PPCContext* context, uint32_t guest_addr,
+                           uint32_t* value_out) {
+  if (!context || !context->kernel_state || !context->kernel_state->memory() ||
+      !guest_addr || !value_out) {
+    return false;
+  }
+
+  auto* memory = context->kernel_state->memory();
+  const uint32_t* data_ptr = memory->TranslateVirtual<const uint32_t*>(guest_addr);
+  if (!data_ptr) {
+    return false;
+  }
+
+  xe::memory::PageAccess access;
+  size_t data_length = sizeof(uint32_t);
+  if (!xe::memory::QueryProtect(const_cast<uint32_t*>(data_ptr), data_length,
+                                access) ||
+      access == xe::memory::PageAccess::kNoAccess) {
+    return false;
+  }
+
+  *value_out = xe::load_and_swap<uint32_t>(data_ptr);
+  return true;
+}
+
+static bool IsLikelyHaloCodeAddress(uint32_t address) {
+  return (address & 3) == 0 && address >= 0x82000000 && address < 0x83000000;
+}
+
+static bool IsLikelyPpcCallInstruction(uint32_t instruction) {
+  const uint32_t opcode = instruction >> 26;
+  if ((opcode == 18 || opcode == 16) && (instruction & 1)) {
+    return true;
+  }
+
+  // bctrl and bclrl forms are common saved-LR callsites.
+  return (instruction & 0xFC00FFFF) == 0x4C000421 ||
+         (instruction & 0xFC00FFFF) == 0x4C000021;
+}
+
+static void DumpGuestStackBackchain(const ppc::PPCContext* context,
+                                    uint32_t stack_pointer) {
+  uint32_t frame = stack_pointer;
+  for (uint32_t depth = 0; depth < 8; ++depth) {
+    uint32_t next_frame = 0;
+    if (!ReadGuestU32BE(context, frame, &next_frame)) {
+      XELOGI("A64 store watch stack frame={} sp=0x{:08X}: <unreadable>",
+             depth, frame);
+      return;
+    }
+
+    XELOGI("A64 store watch stack frame={} sp=0x{:08X} next=0x{:08X}",
+           depth, frame, next_frame);
+
+    for (uint32_t offset = 4; offset < 0x100; offset += 4) {
+      uint32_t candidate = 0;
+      if (!ReadGuestU32BE(context, frame + offset, &candidate) ||
+          !IsLikelyHaloCodeAddress(candidate)) {
+        continue;
+      }
+
+      uint32_t call_instruction = 0;
+      const bool call_like =
+          candidate >= 4 &&
+          ReadGuestInstruction(context, candidate - 4, &call_instruction) &&
+          IsLikelyPpcCallInstruction(call_instruction);
+
+      if (!call_like && offset != 0x14 && offset != 0x18 &&
+          offset != 0x38 && offset != 0x44) {
+        continue;
+      }
+
+      XELOGI(
+          "A64 store watch stack candidate: frame={} sp=0x{:08X} "
+          "off=0x{:02X} ret=0x{:08X} call_like={} call_insn=0x{:08X}",
+          depth, frame, offset, candidate, call_like, call_instruction);
+      DumpGuestDisassembly(context, call_like ? "stack_call" : "stack_addr",
+                           candidate, 6, 4);
+    }
+
+    if (!next_frame || next_frame <= frame || next_frame - frame > 0x20000) {
+      return;
+    }
+    frame = next_frame;
+  }
+}
+
+static void LogStoreWatchCommon(void* raw_context, uint64_t guest_addr,
+                                uint64_t value, uint64_t guest_pc,
+                                uint32_t byte_count) {
   uint32_t thread_id = 0;
   const ppc::PPCContext* context =
       reinterpret_cast<ppc::PPCContext*>(raw_context);
   if (context) {
     thread_id = context->thread_id;
   }
+  const uint32_t watch_addr = cvars::a64_watch_store_address;
+  const uint32_t addr32 = uint32_t(guest_addr);
+  const uint32_t watch_offset = watch_addr - addr32;
+  uint8_t old_watch_byte = 0;
+  bool old_watch_ok = false;
+  if (context && context->kernel_state && context->kernel_state->memory() &&
+      watch_addr) {
+    auto* memory = context->kernel_state->memory();
+    auto* heap = memory->LookupHeap(watch_addr);
+    uint32_t prot = 0;
+    if (heap && heap->QueryProtect(watch_addr, &prot) &&
+        (prot & kMemoryProtectRead)) {
+      std::memcpy(&old_watch_byte, memory->TranslateVirtual(watch_addr),
+                  sizeof(old_watch_byte));
+      old_watch_ok = true;
+    }
+  }
   XELOGI(
-      "A64 store watch: guest_pc=0x{:08X} addr=0x{:08X} value=0x{:08X} "
-      "tid=0x{:08X}",
-      uint32_t(guest_pc), uint32_t(guest_addr), uint32_t(value), thread_id);
+      "A64 store watch: guest_pc=0x{:08X} size={} addr=0x{:08X} "
+      "watch=0x{:08X} watch_off={} value=0x{:016X} old_watch={}:0x{:02X} "
+      "tid=0x{:08X} lr=0x{:08X} r1=0x{:08X} r3=0x{:08X} r4=0x{:08X} "
+      "r5=0x{:08X} r10=0x{:08X} r11=0x{:08X} r29=0x{:08X} "
+      "r30=0x{:08X} r31=0x{:08X}",
+      uint32_t(guest_pc), byte_count, addr32, watch_addr, watch_offset, value,
+      old_watch_ok ? "ok" : "no", old_watch_byte, thread_id,
+      context ? uint32_t(context->lr) : 0, context ? uint32_t(context->r[1]) : 0,
+      context ? uint32_t(context->r[3]) : 0, context ? uint32_t(context->r[4]) : 0,
+      context ? uint32_t(context->r[5]) : 0,
+      context ? uint32_t(context->r[10]) : 0,
+      context ? uint32_t(context->r[11]) : 0,
+      context ? uint32_t(context->r[29]) : 0,
+      context ? uint32_t(context->r[30]) : 0,
+      context ? uint32_t(context->r[31]) : 0);
+  DumpGuestDisassembly(context, "insn", uint32_t(guest_pc), 8, 8);
+  if (context && uint32_t(value) == 1) {
+    static std::atomic<bool> logged_set_context{false};
+    if (!logged_set_context.exchange(true)) {
+      DumpGuestDisassembly(context, "caller", uint32_t(context->lr), 48, 32);
+      uint32_t branch_instruction = 0;
+      uint32_t branch_target = 0;
+      const uint32_t branch_pc = uint32_t(context->lr) - 4;
+      if (ReadGuestInstruction(context, branch_pc, &branch_instruction) &&
+          DecodeDirectBranchTarget(branch_pc, branch_instruction,
+                                   &branch_target)) {
+        XELOGI(
+            "A64 store watch branch: branch_pc=0x{:08X} "
+            "instruction=0x{:08X} target=0x{:08X}",
+            branch_pc, branch_instruction, branch_target);
+        DumpGuestDisassembly(context, "branch_target", branch_target, 16, 48);
+      }
+      DumpGuestWords(context, "status_17a0", uint32_t(context->r[31]) + 0x17A0);
+      DumpGuestWords(context, "status_1860", uint32_t(context->r[31]) + 0x1860);
+      DumpGuestWords(context, "stack_000", uint32_t(context->r[1]));
+      DumpGuestWords(context, "stack_040", uint32_t(context->r[1]) + 0x40);
+      DumpGuestWords(context, "stack_080", uint32_t(context->r[1]) + 0x80);
+      DumpGuestStackBackchain(context, uint32_t(context->r[1]));
+      DumpGuestBytes(context, "r27", uint32_t(context->r[27]));
+      DumpGuestBytes(context, "r28", uint32_t(context->r[28]));
+      DumpGuestBytes(context, "r29", uint32_t(context->r[29]));
+      DumpGuestBytes(context, "r30", uint32_t(context->r[30]));
+      DumpGuestBytes(context, "crash_literal", 0x82061DE0);
+      DumpGuestBytes(context, "stack_ret_826f5b5c", 0x826F5B5C);
+      XELOGI(
+          "A64 store watch set gprs: r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} "
+          "r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
+          uint32_t(context->r[0]), uint32_t(context->r[1]),
+          uint32_t(context->r[2]), uint32_t(context->r[3]),
+          uint32_t(context->r[4]), uint32_t(context->r[5]),
+          uint32_t(context->r[6]), uint32_t(context->r[7]));
+      XELOGI(
+          "A64 store watch set gprs: r8=0x{:08X} r9=0x{:08X} "
+          "r10=0x{:08X} r11=0x{:08X} r12=0x{:08X} r13=0x{:08X} "
+          "r14=0x{:08X} r15=0x{:08X}",
+          uint32_t(context->r[8]), uint32_t(context->r[9]),
+          uint32_t(context->r[10]), uint32_t(context->r[11]),
+          uint32_t(context->r[12]), uint32_t(context->r[13]),
+          uint32_t(context->r[14]), uint32_t(context->r[15]));
+      XELOGI(
+          "A64 store watch set gprs: r16=0x{:08X} r17=0x{:08X} "
+          "r18=0x{:08X} r19=0x{:08X} r20=0x{:08X} r21=0x{:08X} "
+          "r22=0x{:08X} r23=0x{:08X}",
+          uint32_t(context->r[16]), uint32_t(context->r[17]),
+          uint32_t(context->r[18]), uint32_t(context->r[19]),
+          uint32_t(context->r[20]), uint32_t(context->r[21]),
+          uint32_t(context->r[22]), uint32_t(context->r[23]));
+      XELOGI(
+          "A64 store watch set gprs: r24=0x{:08X} r25=0x{:08X} "
+          "r26=0x{:08X} r27=0x{:08X} r28=0x{:08X} r29=0x{:08X} "
+          "r30=0x{:08X} r31=0x{:08X} lr=0x{:08X} ctr=0x{:08X}",
+          uint32_t(context->r[24]), uint32_t(context->r[25]),
+          uint32_t(context->r[26]), uint32_t(context->r[27]),
+          uint32_t(context->r[28]), uint32_t(context->r[29]),
+          uint32_t(context->r[30]), uint32_t(context->r[31]),
+          uint32_t(context->lr), uint32_t(context->ctr));
+    }
+  }
   if (context && uint32_t(value) == 0) {
     static std::atomic<bool> logged_dump{false};
     const uint32_t r11 = uint32_t(context->r[11]);
@@ -210,26 +556,25 @@ static void LogStoreWatch32(void* raw_context, uint64_t guest_addr,
   }
 }
 
+static void LogStoreWatch8(void* raw_context, uint64_t guest_addr,
+                           uint64_t value, uint64_t guest_pc) {
+  LogStoreWatchCommon(raw_context, guest_addr, value & 0xFF, guest_pc, 1);
+}
+
+static void LogStoreWatch16(void* raw_context, uint64_t guest_addr,
+                            uint64_t value, uint64_t guest_pc) {
+  LogStoreWatchCommon(raw_context, guest_addr, value & 0xFFFF, guest_pc, 2);
+}
+
+static void LogStoreWatch32(void* raw_context, uint64_t guest_addr,
+                            uint64_t value, uint64_t guest_pc) {
+  LogStoreWatchCommon(raw_context, guest_addr, value & 0xFFFFFFFFull, guest_pc,
+                      4);
+}
+
 static void LogStoreWatch64(void* raw_context, uint64_t guest_addr,
                             uint64_t value, uint64_t guest_pc) {
-  uint32_t thread_id = 0;
-  const ppc::PPCContext* context =
-      reinterpret_cast<ppc::PPCContext*>(raw_context);
-  if (context) {
-    thread_id = context->thread_id;
-  }
-  uint32_t watch_addr = cvars::a64_watch_store_address;
-  uint32_t addr32 = uint32_t(guest_addr);
-  const uint32_t low = uint32_t(value);
-  const uint32_t high = uint32_t(value >> 32);
-  const char* which = "base";
-  if (watch_addr && addr32 + 4 == watch_addr) {
-    which = "base+4";
-  }
-  XELOGI(
-      "A64 store watch64: guest_pc=0x{:08X} addr=0x{:08X} {} "
-      "value=0x{:016X} low=0x{:08X} high=0x{:08X} tid=0x{:08X}",
-      uint32_t(guest_pc), addr32, which, value, low, high, thread_id);
+  LogStoreWatchCommon(raw_context, guest_addr, value, guest_pc, 8);
 }
 
 static void LogReservationStore64(void* raw_context, uint64_t guest_addr,
@@ -1356,6 +1701,34 @@ struct STORE_OFFSET_I8
     : Sequence<STORE_OFFSET_I8,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I8Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    const uint32_t watch_addr = cvars::a64_watch_store_address;
+    if (watch_addr) {
+      oaknut::Label skip_watch;
+      if (i.src1.is_constant) {
+        e.MOV(W0, uint32_t(i.src1.constant()));
+      } else {
+        e.MOV(W0, i.src1.reg().toW());
+      }
+      if (i.src2.is_constant) {
+        e.MOV(W2, uint32_t(i.src2.constant()));
+        e.ADD(W0, W0, W2);
+      } else {
+        e.ADD(W0, W0, i.src2.reg().toW());
+      }
+      e.MOV(W1, watch_addr);
+      e.CMP(W0, W1);
+      e.B(Cond::NE, skip_watch);
+      e.MOV(e.GetNativeParam(0).toW(), W0);
+      if (i.src3.is_constant) {
+        e.MOV(e.GetNativeParam(1).toW(), uint32_t(i.src3.constant()));
+      } else {
+        e.MOV(e.GetNativeParam(1).toW(), i.src3.reg().toW());
+      }
+      e.MOV(e.GetNativeParam(2).toW(), i.instr->GuestAddressFor());
+      e.CallNativeSafe(reinterpret_cast<void*>(LogStoreWatch8));
+      e.l(skip_watch);
+    }
+
     auto addr_reg = ComputeMemoryAddressOffset(e, i.src1, i.src2);
     if (i.src3.is_constant) {
       e.MOV(W0, i.src3.constant());
@@ -1370,6 +1743,37 @@ struct STORE_OFFSET_I16
     : Sequence<STORE_OFFSET_I16,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    const uint32_t watch_addr = cvars::a64_watch_store_address;
+    if (watch_addr) {
+      oaknut::Label skip_watch;
+      if (i.src1.is_constant) {
+        e.MOV(W0, uint32_t(i.src1.constant()));
+      } else {
+        e.MOV(W0, i.src1.reg().toW());
+      }
+      if (i.src2.is_constant) {
+        e.MOV(W2, uint32_t(i.src2.constant()));
+        e.ADD(W0, W0, W2);
+      } else {
+        e.ADD(W0, W0, i.src2.reg().toW());
+      }
+      e.MOV(W1, watch_addr);
+      e.CMP(W0, W1);
+      e.B(Cond::HI, skip_watch);
+      e.ADD(W2, W0, 1);
+      e.CMP(W1, W2);
+      e.B(Cond::HI, skip_watch);
+      e.MOV(e.GetNativeParam(0).toW(), W0);
+      if (i.src3.is_constant) {
+        e.MOV(e.GetNativeParam(1).toW(), uint32_t(i.src3.constant()));
+      } else {
+        e.MOV(e.GetNativeParam(1).toW(), i.src3.reg().toW());
+      }
+      e.MOV(e.GetNativeParam(2).toW(), i.instr->GuestAddressFor());
+      e.CallNativeSafe(reinterpret_cast<void*>(LogStoreWatch16));
+      e.l(skip_watch);
+    }
+
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       void* addrptr = (void*)&MMIOAwareStore<uint16_t, true>;
       const auto guest_addr_reg = e.GetNativeParam(0).toW();
@@ -1425,7 +1829,10 @@ struct STORE_OFFSET_I32
       }
       e.MOV(W1, watch_addr);
       e.CMP(W0, W1);
-      e.B(Cond::NE, skip_watch);
+      e.B(Cond::HI, skip_watch);
+      e.ADD(W2, W0, 3);
+      e.CMP(W1, W2);
+      e.B(Cond::HI, skip_watch);
       e.MOV(e.GetNativeParam(0).toW(), W0);
       if (i.src3.is_constant) {
         e.MOV(e.GetNativeParam(1).toW(), uint32_t(i.src3.constant()));
@@ -1502,7 +1909,6 @@ struct STORE_OFFSET_I64
     const uint32_t watch_addr = cvars::a64_watch_store_address;
     if (watch_addr) {
       oaknut::Label skip_watch;
-      oaknut::Label do_watch;
       if (i.src1.is_constant) {
         e.MOV(W0, uint32_t(i.src1.constant()));
       } else {
@@ -1516,11 +1922,10 @@ struct STORE_OFFSET_I64
       }
       e.MOV(W1, watch_addr);
       e.CMP(W0, W1);
-      e.B(Cond::EQ, do_watch);
-      e.ADD(W2, W0, 4);
-      e.CMP(W2, W1);
-      e.B(Cond::NE, skip_watch);
-      e.l(do_watch);
+      e.B(Cond::HI, skip_watch);
+      e.ADD(W2, W0, 7);
+      e.CMP(W1, W2);
+      e.B(Cond::HI, skip_watch);
       e.MOV(e.GetNativeParam(0).toW(), W0);
       if (i.src3.is_constant) {
         e.MOV(e.GetNativeParam(1).toX(), i.src3.constant());
@@ -1701,6 +2106,28 @@ EMITTER_OPCODE_TABLE(OPCODE_LOAD, LOAD_I8, LOAD_I16, LOAD_I32, LOAD_I64,
 // Note: most *should* be aligned, but needs to be checked!
 struct STORE_I8 : Sequence<STORE_I8, I<OPCODE_STORE, VoidOp, I64Op, I8Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    const uint32_t watch_addr = cvars::a64_watch_store_address;
+    if (watch_addr) {
+      oaknut::Label skip_watch;
+      if (i.src1.is_constant) {
+        e.MOV(W0, uint32_t(i.src1.constant()));
+      } else {
+        e.MOV(W0, i.src1.reg().toW());
+      }
+      e.MOV(W1, watch_addr);
+      e.CMP(W0, W1);
+      e.B(Cond::NE, skip_watch);
+      e.MOV(e.GetNativeParam(0).toW(), W0);
+      if (i.src2.is_constant) {
+        e.MOV(e.GetNativeParam(1).toW(), uint32_t(i.src2.constant()));
+      } else {
+        e.MOV(e.GetNativeParam(1).toW(), i.src2.reg().toW());
+      }
+      e.MOV(e.GetNativeParam(2).toW(), i.instr->GuestAddressFor());
+      e.CallNativeSafe(reinterpret_cast<void*>(LogStoreWatch8));
+      e.l(skip_watch);
+    }
+
     auto addr_reg = ComputeMemoryAddress(e, i.src1);
     if (i.src2.is_constant) {
       e.MOV(W0, i.src2.constant());
@@ -1718,6 +2145,31 @@ struct STORE_I8 : Sequence<STORE_I8, I<OPCODE_STORE, VoidOp, I64Op, I8Op>> {
 };
 struct STORE_I16 : Sequence<STORE_I16, I<OPCODE_STORE, VoidOp, I64Op, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    const uint32_t watch_addr = cvars::a64_watch_store_address;
+    if (watch_addr) {
+      oaknut::Label skip_watch;
+      if (i.src1.is_constant) {
+        e.MOV(W0, uint32_t(i.src1.constant()));
+      } else {
+        e.MOV(W0, i.src1.reg().toW());
+      }
+      e.MOV(W1, watch_addr);
+      e.CMP(W0, W1);
+      e.B(Cond::HI, skip_watch);
+      e.ADD(W2, W0, 1);
+      e.CMP(W1, W2);
+      e.B(Cond::HI, skip_watch);
+      e.MOV(e.GetNativeParam(0).toW(), W0);
+      if (i.src2.is_constant) {
+        e.MOV(e.GetNativeParam(1).toW(), uint32_t(i.src2.constant()));
+      } else {
+        e.MOV(e.GetNativeParam(1).toW(), i.src2.reg().toW());
+      }
+      e.MOV(e.GetNativeParam(2).toW(), i.instr->GuestAddressFor());
+      e.CallNativeSafe(reinterpret_cast<void*>(LogStoreWatch16));
+      e.l(skip_watch);
+    }
+
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       void* addrptr = (void*)&MMIOAwareStore<uint16_t, true>;
       const auto guest_addr_reg = e.GetNativeParam(0).toW();
@@ -1763,7 +2215,10 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
       }
       e.MOV(W1, watch_addr);
       e.CMP(W0, W1);
-      e.B(Cond::NE, skip_watch);
+      e.B(Cond::HI, skip_watch);
+      e.ADD(W2, W0, 3);
+      e.CMP(W1, W2);
+      e.B(Cond::HI, skip_watch);
       e.MOV(e.GetNativeParam(0).toW(), W0);
       if (i.src2.is_constant) {
         e.MOV(e.GetNativeParam(1).toW(), uint32_t(i.src2.constant()));
@@ -1829,7 +2284,6 @@ struct STORE_I64 : Sequence<STORE_I64, I<OPCODE_STORE, VoidOp, I64Op, I64Op>> {
     const uint32_t watch_addr = cvars::a64_watch_store_address;
     if (watch_addr) {
       oaknut::Label skip_watch;
-      oaknut::Label do_watch;
       if (i.src1.is_constant) {
         e.MOV(W0, uint32_t(i.src1.constant()));
       } else {
@@ -1837,11 +2291,10 @@ struct STORE_I64 : Sequence<STORE_I64, I<OPCODE_STORE, VoidOp, I64Op, I64Op>> {
       }
       e.MOV(W1, watch_addr);
       e.CMP(W0, W1);
-      e.B(Cond::EQ, do_watch);
-      e.ADD(W2, W0, 4);
-      e.CMP(W2, W1);
-      e.B(Cond::NE, skip_watch);
-      e.l(do_watch);
+      e.B(Cond::HI, skip_watch);
+      e.ADD(W2, W0, 7);
+      e.CMP(W1, W2);
+      e.B(Cond::HI, skip_watch);
       e.MOV(e.GetNativeParam(0).toW(), W0);
       if (i.src2.is_constant) {
         e.MOV(e.GetNativeParam(1).toX(), i.src2.constant());

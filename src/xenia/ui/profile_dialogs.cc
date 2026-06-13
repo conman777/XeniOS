@@ -220,6 +220,7 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
 
   for (auto& [xuid, account] : *profiles) {
     ImGui::PushID(static_cast<int>(xuid));
+    const uint64_t profile_xuid = xuid;
 
     const uint8_t user_index =
         profile_manager->GetUserIndexAssignedToProfile(xuid);
@@ -252,17 +253,17 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
 
         if (user_index == XUserIndexAny) {
           if (ImGui::MenuItem("Login")) {
-            profile_manager->Login(xuid);
-            if (!profile_manager->GetProfile(xuid)
+            profile_manager->Login(profile_xuid);
+            if (!profile_manager->GetProfile(profile_xuid)
                      ->GetProfileIcon(kernel::xam::XTileType::kGamerTile)
                      .empty()) {
-              LoadProfileIcon(xuid);
+              LoadProfileIcon(profile_xuid);
             }
           }
           if (ImGui::BeginMenu("Login to slot:")) {
             for (uint8_t i = 1; i <= XUserMaxUserCount; i++) {
               if (ImGui::MenuItem(fmt::format("slot {}", i).c_str())) {
-                profile_manager->Login(xuid, i - 1);
+                profile_manager->Login(profile_xuid, i - 1);
               }
             }
             ImGui::EndMenu();
@@ -270,7 +271,7 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
         } else {
           if (ImGui::MenuItem("Logout")) {
             profile_manager->Logout(user_index);
-            LoadProfileIcon(xuid);
+            LoadProfileIcon(profile_xuid);
           }
         }
         ImGui::EndPopup();
@@ -281,7 +282,7 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
 
     if (!kernel::xam::xeDrawProfileContent(
             imgui_drawer(), xuid, user_index, &account, profile_icon,
-            context_menu_fun, [=, this]() { LoadProfileIcon(xuid); },
+            context_menu_fun, [=, this]() { LoadProfileIcon(profile_xuid); },
             &selected_xuid_)) {
       ImGui::PopID();
       ImGui::PopStyleVar(1);

@@ -227,25 +227,19 @@ class PosixFileHandle : public FileHandle {
 
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(
     const std::filesystem::path& path, uint32_t desired_access) {
-  int open_access = 0;
-  if (desired_access & FileAccess::kGenericRead) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericWrite) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kGenericExecute) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericAll) {
-    open_access |= O_RDWR;
-  }
-  if (desired_access & FileAccess::kFileReadData) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kFileWriteData) {
-    open_access |= O_WRONLY;
-  }
+  const bool wants_read =
+      (desired_access & (FileAccess::kGenericRead |
+                         FileAccess::kGenericExecute |
+                         FileAccess::kGenericAll |
+                         FileAccess::kFileReadData)) != 0;
+  const bool wants_write =
+      (desired_access & (FileAccess::kGenericWrite | FileAccess::kGenericAll |
+                         FileAccess::kFileWriteData |
+                         FileAccess::kFileAppendData)) != 0;
+
+  int open_access = wants_read && wants_write
+                        ? O_RDWR
+                        : (wants_write ? O_WRONLY : O_RDONLY);
   if (desired_access & FileAccess::kFileAppendData) {
     open_access |= O_APPEND;
   }

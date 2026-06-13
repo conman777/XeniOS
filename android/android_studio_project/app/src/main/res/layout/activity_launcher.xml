@@ -38,6 +38,13 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
+            android:onClick="onPickGameClick"
+            android:text="@string/launcher_button_pick_game" />
+
+        <Button
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
             android:onClick="onRescanGamesClick"
             android:text="@string/launcher_button_rescan" />
 

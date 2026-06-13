@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xam/xdbf/spa_info.h"
 
+#include <algorithm>
+
 namespace xe {
 namespace kernel {
 namespace xam {
@@ -505,8 +507,8 @@ const std::optional<PropertyBag> SpaInfo::GetPresenceMode(
 }
 
 const std::optional<ViewTable> SpaInfo::GetStatsView(uint32_t id) {
-  const auto itr = std::ranges::find_if(
-      stats_views_,
+  const auto itr = std::find_if(
+      stats_views_.cbegin(), stats_views_.cend(),
       [id](const ViewTable& view) { return view.view_entry.id == id; });
 
   return itr != stats_views_.cend() ? std::make_optional(*itr) : std::nullopt;

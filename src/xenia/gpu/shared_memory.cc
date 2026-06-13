@@ -17,19 +17,35 @@
 namespace {
 
 XE_FORCEINLINE uint64_t LoadValidFlag(uint64_t* ptr) {
+#if XE_PLATFORM_ANDROID
+  return __atomic_load_n(ptr, __ATOMIC_RELAXED);
+#else
   return std::atomic_ref<uint64_t>(*ptr).load(std::memory_order_relaxed);
+#endif
 }
 
 XE_FORCEINLINE void StoreValidFlag(uint64_t* ptr, uint64_t value) {
+#if XE_PLATFORM_ANDROID
+  __atomic_store_n(ptr, value, __ATOMIC_RELAXED);
+#else
   std::atomic_ref<uint64_t>(*ptr).store(value, std::memory_order_relaxed);
+#endif
 }
 
 XE_FORCEINLINE void OrValidFlag(uint64_t* ptr, uint64_t value) {
+#if XE_PLATFORM_ANDROID
+  __atomic_fetch_or(ptr, value, __ATOMIC_RELAXED);
+#else
   std::atomic_ref<uint64_t>(*ptr).fetch_or(value, std::memory_order_relaxed);
+#endif
 }
 
 XE_FORCEINLINE void AndValidFlag(uint64_t* ptr, uint64_t value) {
+#if XE_PLATFORM_ANDROID
+  __atomic_fetch_and(ptr, value, __ATOMIC_RELAXED);
+#else
   std::atomic_ref<uint64_t>(*ptr).fetch_and(value, std::memory_order_relaxed);
+#endif
 }
 
 }  // namespace

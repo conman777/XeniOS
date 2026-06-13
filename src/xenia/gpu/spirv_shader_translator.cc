@@ -132,6 +132,7 @@ SpirvShaderTranslator::Features::Features(bool all)
       denorm_flush_to_zero_float32(all),
       rounding_mode_rte_float32(all),
       fragment_shader_sample_interlock(all),
+      fragment_shader_interlock(all),
       demote_to_helper_invocation(all),
       fragment_shader_barycentric(all) {}
 
@@ -157,6 +158,9 @@ SpirvShaderTranslator::Features::Features(
           vulkan_device->properties().shaderRoundingModeRTEFloat32),
       fragment_shader_sample_interlock(
           vulkan_device->properties().fragmentShaderSampleInterlock),
+      fragment_shader_interlock(
+          vulkan_device->properties().fragmentShaderSampleInterlock ||
+          vulkan_device->properties().fragmentShaderPixelInterlock),
       demote_to_helper_invocation(
           vulkan_device->properties().shaderDemoteToHelperInvocation),
       fragment_shader_barycentric(
@@ -991,7 +995,8 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
       builder_->addExecutionMode(function_main_,
                                  spv::ExecutionModeDepthReplacing);
     }
-    if (edram_fragment_shader_interlock_) {
+    if (edram_fragment_shader_interlock_ &&
+        features_.fragment_shader_interlock) {
       // Accessing per-sample values, so interlocking just when there's common
       // coverage is enough if the device exposes that.
       if (features_.fragment_shader_sample_interlock) {
@@ -2890,7 +2895,9 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   Modification shader_modification = GetSpirvShaderModification();
 
   if (edram_fragment_shader_interlock_) {
-    builder_->addExtension("SPV_EXT_fragment_shader_interlock");
+    if (features_.fragment_shader_interlock) {
+      builder_->addExtension("SPV_EXT_fragment_shader_interlock");
+    }
 
     // EDRAM buffer uint[].
     id_vector_temp_.clear();
@@ -3135,6 +3142,20 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   // invocations, so use the sample that's the most friendly to the half-pixel
   // offset).
 
+  // gl_SampleMask is declared for every non-FSI fragment shader, but was only
+  // written on the alpha-to-mask path; a declared-but-unwritten SampleMask
+  // output makes coverage undefined per the Vulkan spec (observed as dropped
+  // color writes on Adreno). Initialize it to full coverage unconditionally;
+  // FSI_AlphaToMask overwrites it later when active.
+  if (output_fragment_sample_mask_ != spv::NoResult) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(0));
+    spv::Id sample_mask_element = builder_->createAccessChain(
+        spv::StorageClassOutput, output_fragment_sample_mask_,
+        id_vector_temp_);
+    builder_->createStore(builder_->makeIntConstant(-1), sample_mask_element);
+  }
+
   // Set up pixel killing from within the translated shader without affecting
   // the control flow (unlike with OpKill), similarly to how pixel killing works
   // on the Xenos, and also keeping a single critical section exit and return
@@ -3201,7 +3222,9 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     spv::Id msaa_samples = LoadMsaaSamplesFromFlags();
     FSI_LoadSampleMask(msaa_samples);
     FSI_LoadEdramOffsets(msaa_samples);
-    builder_->createNoResultOp(spv::OpBeginInvocationInterlockEXT);
+    if (features_.fragment_shader_interlock) {
+      builder_->createNoResultOp(spv::OpBeginInvocationInterlockEXT);
+    }
     FSI_DepthStencilTest(msaa_samples, false);
     if (!is_depth_only_fragment_shader_) {
       // Skip the rest of the shader if the whole quad (due to derivatives) has

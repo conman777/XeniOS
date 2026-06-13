@@ -9,6 +9,10 @@
 
 #include "xenia/vfs/devices/host_path_file.h"
 
+#include <cerrno>
+#include <cstring>
+
+#include "xenia/base/logging.h"
 #include "xenia/vfs/devices/host_path_entry.h"
 
 namespace xe {
@@ -39,6 +43,13 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
                          out_bytes_read)) {
     return X_STATUS_SUCCESS;
   } else {
+    const int error_code = errno;
+    XELOGW(
+        "HostPathFile::ReadSync failed path='{}' offset=0x{:X} length=0x{:X} "
+        "buffer=0x{:X} errno={} ({})",
+        entry()->absolute_path(), byte_offset, buffer.size(),
+        reinterpret_cast<uintptr_t>(buffer.data()), error_code,
+        std::strerror(error_code));
     return X_STATUS_END_OF_FILE;
   }
 }
@@ -55,6 +66,13 @@ X_STATUS HostPathFile::WriteSync(std::span<const uint8_t> buffer,
                           out_bytes_written)) {
     return X_STATUS_SUCCESS;
   } else {
+    const int error_code = errno;
+    XELOGW(
+        "HostPathFile::WriteSync failed path='{}' offset=0x{:X} length=0x{:X} "
+        "buffer=0x{:X} errno={} ({})",
+        entry()->absolute_path(), byte_offset, buffer.size(),
+        reinterpret_cast<uintptr_t>(buffer.data()), error_code,
+        std::strerror(error_code));
     return X_STATUS_END_OF_FILE;
   }
 }

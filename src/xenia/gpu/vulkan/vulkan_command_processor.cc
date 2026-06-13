@@ -9,6 +9,10 @@
 
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 
+#if XE_PLATFORM_ANDROID
+#include "xenia/gpu/vulkan/android_halo_experiment.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstdarg>
@@ -2032,11 +2036,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   uint32_t frontbuffer_width_scaled, frontbuffer_height_scaled;
   xenos::TextureFormat frontbuffer_format;
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
-      frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format);
+      frontbuffer_ptr, frontbuffer_width_scaled, frontbuffer_height_scaled,
+      frontbuffer_format);
   if (swap_texture_view == VK_NULL_HANDLE) {
     return;
   }
-
   auto aspect = graphics_system_->GetScaledAspectRatio();
 
   bool guest_output_refreshed = presenter->RefreshGuestOutput(
@@ -3681,6 +3685,29 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           android_logged_rt_draw = true;
         }
       }
+    }
+  }
+  if (cvars::halo_android_diag_log_draws) {
+    static uint64_t android_drawstat_frame = 0;
+    static uint32_t android_drawstat_total_draws = 0;
+    static uint32_t android_drawstat_base1350_draws = 0;
+    static uint32_t android_drawstat_log_count = 0;
+    const uint64_t android_current_frame = frame_current_;
+    if (android_drawstat_frame &&
+        android_current_frame != android_drawstat_frame) {
+      if (android_drawstat_log_count < 1024) {
+        XELOGI("DRAWSTAT frame={} total_draws={} draws_base1350={}",
+               android_drawstat_frame, android_drawstat_total_draws,
+               android_drawstat_base1350_draws);
+        ++android_drawstat_log_count;
+      }
+      android_drawstat_total_draws = 0;
+      android_drawstat_base1350_draws = 0;
+    }
+    android_drawstat_frame = android_current_frame;
+    ++android_drawstat_total_draws;
+    if (android_targets_base_1350) {
+      ++android_drawstat_base1350_draws;
     }
   }
   if (cvars::halo_android_diag_log_draws && !android_logged_rt_draw) {
@@ -6649,6 +6676,14 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   xenos::CompareFunction alpha_test_function =
       rb_colorcontrol.alpha_test_enable ? rb_colorcontrol.alpha_func
                                         : xenos::CompareFunction::kAlways;
+#if XE_PLATFORM_ANDROID
+  // A/B experiment: if a bogus alpha-test kill (driven by misread guest
+  // register state) is discarding all fragments after early-Z, forcing the
+  // test to always-pass restores color output without affecting depth.
+  if (GetAndroidHaloExperiment().force_alpha_pass) {
+    alpha_test_function = xenos::CompareFunction::kAlways;
+  }
+#endif
   flags |= uint32_t(alpha_test_function)
            << SpirvShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
   // Gamma writing.
@@ -6856,6 +6891,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   uint32_t alpha_to_mask = rb_colorcontrol.alpha_to_mask_enable
                                ? (rb_colorcontrol.value >> 24) | (1 << 8)
                                : 0;
+#if XE_PLATFORM_ANDROID
+  if (GetAndroidHaloExperiment().force_alpha_pass) {
+    alpha_to_mask = 0;
+  }
+#endif
   dirty |= system_constants_.alpha_to_mask != alpha_to_mask;
   system_constants_.alpha_to_mask = alpha_to_mask;
 

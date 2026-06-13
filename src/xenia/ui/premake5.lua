@@ -50,6 +50,18 @@ project("xenia-ui")
       "windowed_app_context_qt.h",
       "windowed_app_main_qt.cc",
     })
+  filter("platforms:Android-*")
+    removefiles({
+      "*_qt.cc",
+      "*_qt.h",
+      "qt_util.h",
+      "ui_resources_qrc.cpp",
+      "window_qt.cc",
+      "window_qt.h",
+      "windowed_app_context_qt.cc",
+      "windowed_app_context_qt.h",
+      "windowed_app_main_qt.cc",
+    })
   filter({})
   if os.istarget("android") then
     filter("platforms:Android-*")

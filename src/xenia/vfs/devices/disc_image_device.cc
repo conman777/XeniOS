@@ -10,11 +10,13 @@
 #include "xenia/vfs/devices/disc_image_device.h"
 
 #include <cstring>
+#include <string_view>
 #include <vector>
 
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/utf8.h"
 #include "xenia/vfs/devices/disc_image_entry.h"
 #include "xenia/vfs/gdfx_util.h"
 
@@ -22,6 +24,17 @@ namespace xe {
 namespace vfs {
 
 using namespace xe::literals;
+
+namespace {
+
+bool ShouldLogHaloDiscPath(std::string_view path) {
+  return xe::utf8::find_first_of_case(path, "maps") != std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "mainmenu") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "bink") != std::string_view::npos;
+}
+
+}  // namespace
 
 DiscImageDevice::DiscImageDevice(const std::string_view mount_path,
                                  const std::filesystem::path& host_path)
@@ -104,7 +117,19 @@ Entry* DiscImageDevice::ResolvePath(const std::string_view path) {
   // be in the form:
   // some\PATH.foo
   XELOGFS("DiscImageDevice::ResolvePath({})", path);
-  return root_entry_->ResolvePath(path);
+  auto* entry = root_entry_->ResolvePath(path);
+  if (ShouldLogHaloDiscPath(path)) {
+    if (entry) {
+      XELOGI(
+          "HaloReach VFS disc resolve path='{}' -> abs='{}' size=0x{:X} "
+          "attrs=0x{:08X} children={}",
+          path, entry->absolute_path(), entry->size(), entry->attributes(),
+          entry->child_count());
+    } else {
+      XELOGI("HaloReach VFS disc resolve path='{}' -> not found", path);
+    }
+  }
+  return entry;
 }
 
 DiscImageDevice::Error DiscImageDevice::Verify(ParseState* state) {

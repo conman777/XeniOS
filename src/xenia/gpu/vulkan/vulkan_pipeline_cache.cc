@@ -55,7 +55,12 @@ namespace shaders {
 }  // namespace shaders
 
 DEFINE_int32(
-    vulkan_pipeline_creation_threads, -1,
+    vulkan_pipeline_creation_threads,
+#if XE_PLATFORM_ANDROID
+    1,
+#else
+    -1,
+#endif
     "Number of threads used for graphics pipeline creation. -1 to calculate "
     "automatically (75% of logical CPU cores), a positive number to specify "
     "the number of threads explicitly (up to the number of logical CPU cores), "

@@ -182,8 +182,31 @@ struct ValueOp : Op<ValueOp<T, KEY_TYPE, REG_TYPE, CONST_TYPE>, KEY_TYPE> {
       return false;
     }
   }
+  template <typename U, KeyType OTHER_KEY_TYPE, typename OTHER_REG_TYPE,
+            typename OTHER_CONST_TYPE>
+  bool IsEqual(const ValueOp<U, OTHER_KEY_TYPE, OTHER_REG_TYPE, OTHER_CONST_TYPE>&
+                   b) const {
+    if (is_constant || b.is_constant) {
+      return false;
+    }
+    return reg_.index() == b.reg().index();
+  }
   bool operator==(const T& b) const { return IsEqual(b); }
   bool operator!=(const T& b) const { return !IsEqual(b); }
+  template <typename U, KeyType OTHER_KEY_TYPE, typename OTHER_REG_TYPE,
+            typename OTHER_CONST_TYPE>
+  bool operator==(
+      const ValueOp<U, OTHER_KEY_TYPE, OTHER_REG_TYPE, OTHER_CONST_TYPE>&
+          b) const {
+    return IsEqual(b);
+  }
+  template <typename U, KeyType OTHER_KEY_TYPE, typename OTHER_REG_TYPE,
+            typename OTHER_CONST_TYPE>
+  bool operator!=(
+      const ValueOp<U, OTHER_KEY_TYPE, OTHER_REG_TYPE, OTHER_CONST_TYPE>&
+          b) const {
+    return !IsEqual(b);
+  }
   bool operator==(const oaknut::Reg& b) const { return IsEqual(b); }
   bool operator!=(const oaknut::Reg& b) const { return !IsEqual(b); }
   void Load(const Instr::Op& op) {

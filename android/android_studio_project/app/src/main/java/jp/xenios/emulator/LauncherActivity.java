@@ -2,19 +2,33 @@ package jp.xenios.emulator;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.res.AssetManager;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.OpenableColumns;
 import android.view.View;
 import android.widget.Button;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 
 public class LauncherActivity extends Activity {
     private static final int REQUEST_OPEN_GPU_TRACE_VIEWER = 0;
+    private static final int REQUEST_PICK_GAME = 1;
+    private static final String PREFS_NAME = "xenios_launcher";
+    private static final String PREF_LAST_GAME_PATH = "last_game_path";
+    private static final String PREF_PROFILE_BOOTSTRAPPED = "profile_bootstrapped";
+    private static final String DEFAULT_PROFILE_ASSET = "xenios_android_default_profile.txt";
+    private static final String DEFAULT_PROFILE_FILENAME = "xenios_android_profile.txt";
 
     private Button launchGameButton;
     private TextView gamePathView;
@@ -29,6 +43,7 @@ public class LauncherActivity extends Activity {
         launchGameButton = findViewById(R.id.launch_game_button);
         gamePathView = findViewById(R.id.launcher_game_path);
         statusView = findViewById(R.id.launcher_status);
+        ensureDefaultProfileInstalled();
         refreshDetectedGame();
     }
 
@@ -51,6 +66,14 @@ public class LauncherActivity extends Activity {
                         WindowedAppActivity.EXTRA_CVARS, gpuTraceViewerLaunchArguments);
                 startActivity(gpuTraceViewerIntent);
             }
+            return;
+        }
+
+        if (requestCode == REQUEST_PICK_GAME && resultCode == RESULT_OK && data != null) {
+            final Uri uri = data.getData();
+            if (uri != null) {
+                importPickedGame(uri);
+            }
         }
     }
 
@@ -61,6 +84,16 @@ public class LauncherActivity extends Activity {
         startActivityForResult(intent, REQUEST_OPEN_GPU_TRACE_VIEWER);
     }
 
+    public void onPickGameClick(final View view) {
+        final Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(
+                Intent.EXTRA_MIME_TYPES,
+                new String[] {"application/x-iso9660-image", "application/octet-stream"});
+        startActivityForResult(intent, REQUEST_PICK_GAME);
+    }
+
     public void onLaunchWindowDemoClick(final View view) {
         startActivity(new Intent(this, WindowDemoActivity.class));
     }
@@ -69,6 +102,7 @@ public class LauncherActivity extends Activity {
         if (detectedGamePath == null) {
             return;
         }
+        rememberLastGamePath(detectedGamePath);
         final Intent emulatorIntent = new Intent(this, EmulatorActivity.class);
         emulatorIntent.putExtra(
                 WindowedAppActivity.EXTRA_CVARS, buildEmulatorLaunchArguments(detectedGamePath));
@@ -77,6 +111,126 @@ public class LauncherActivity extends Activity {
 
     public void onRescanGamesClick(final View view) {
         refreshDetectedGame();
+    }
+
+    private void importPickedGame(final Uri uri) {
+        final File gamesDir = getExternalFilesDir("games");
+        if (gamesDir == null) {
+            Toast.makeText(this, R.string.launcher_import_failed, Toast.LENGTH_LONG).show();
+            return;
+        }
+        gamesDir.mkdirs();
+
+        String fileName = queryDisplayName(uri);
+        if (fileName == null || fileName.isEmpty()) {
+            fileName = "imported-game.iso";
+        }
+        if (!GameFileScanner.isGameFile(new File(fileName))) {
+            fileName = fileName + ".iso";
+        }
+
+        final File destination = new File(gamesDir, fileName);
+        try (InputStream inputStream = getContentResolver().openInputStream(uri);
+             OutputStream outputStream = new FileOutputStream(destination)) {
+            if (inputStream == null) {
+                throw new IllegalStateException("Unable to open selected file.");
+            }
+            final byte[] buffer = new byte[1024 * 1024];
+            int read;
+            while ((read = inputStream.read(buffer)) >= 0) {
+                if (read == 0) {
+                    continue;
+                }
+                outputStream.write(buffer, 0, read);
+            }
+            outputStream.flush();
+            try {
+                final int takeFlags =
+                        dataFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                getContentResolver().takePersistableUriPermission(uri, takeFlags);
+            } catch (SecurityException ignored) {
+                // Best effort only; copied file is enough to launch.
+            }
+            Toast.makeText(
+                    this,
+                    getString(R.string.launcher_import_success, destination.getAbsolutePath()),
+                    Toast.LENGTH_LONG).show();
+            refreshDetectedGame();
+        } catch (final Exception e) {
+            Toast.makeText(
+                    this,
+                    getString(R.string.launcher_import_failed_with_reason, e.getMessage()),
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void ensureDefaultProfileInstalled() {
+        final SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (prefs.getBoolean(PREF_PROFILE_BOOTSTRAPPED, false)) {
+            return;
+        }
+
+        final File profileDestination = new File(getFilesDir(), DEFAULT_PROFILE_FILENAME);
+        if (profileDestination.exists()) {
+            prefs.edit().putBoolean(PREF_PROFILE_BOOTSTRAPPED, true).apply();
+            return;
+        }
+
+        try {
+            final AssetManager assets = getAssets();
+            try (InputStream inputStream = assets.open(DEFAULT_PROFILE_ASSET);
+                 OutputStream outputStream = new FileOutputStream(profileDestination)) {
+                final byte[] buffer = new byte[8192];
+                int read;
+                while ((read = inputStream.read(buffer)) >= 0) {
+                    if (read == 0) {
+                        continue;
+                    }
+                    outputStream.write(buffer, 0, read);
+                }
+                outputStream.flush();
+            }
+            prefs.edit().putBoolean(PREF_PROFILE_BOOTSTRAPPED, true).apply();
+        } catch (final Exception ignored) {
+            // Native defaults still apply if asset copy fails.
+        }
+    }
+
+    private void rememberLastGamePath(final String gamePath) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putString(PREF_LAST_GAME_PATH, gamePath)
+                .apply();
+    }
+
+    private static int dataFlags(final int flag) {
+        return flag & Intent.FLAG_GRANT_READ_URI_PERMISSION;
+    }
+
+    private String queryDisplayName(final Uri uri) {
+        Cursor cursor = null;
+        try {
+            cursor = getContentResolver().query(uri, null, null, null, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                final int nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (nameIndex >= 0) {
+                    return cursor.getString(nameIndex);
+                }
+            }
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        final String lastSegment = uri.getLastPathSegment();
+        if (lastSegment == null) {
+            return null;
+        }
+        final int slashIndex = lastSegment.lastIndexOf('/');
+        if (slashIndex >= 0 && slashIndex + 1 < lastSegment.length()) {
+            return lastSegment.substring(slashIndex + 1);
+        }
+        return lastSegment;
     }
 
     private Bundle buildEmulatorLaunchArguments(final String targetPath) {
@@ -108,22 +262,40 @@ public class LauncherActivity extends Activity {
     private void refreshDetectedGame() {
         ensureGameDirectories();
         final File detectedGame = findDetectedGame();
+        if (detectedGame == null) {
+            final String rememberedPath =
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                            .getString(PREF_LAST_GAME_PATH, null);
+            if (rememberedPath != null) {
+                final File rememberedGame = new File(rememberedPath);
+                if (rememberedGame.isFile() && GameFileScanner.isGameFile(rememberedGame)) {
+                    detectedGamePath = rememberedGame.getAbsolutePath();
+                    launchGameButton.setEnabled(true);
+                    updateStatusViews(getString(R.string.launcher_status_ready), detectedGamePath);
+                    return;
+                }
+            }
+        }
         detectedGamePath = detectedGame != null ? detectedGame.getAbsolutePath() : null;
         launchGameButton.setEnabled(detectedGamePath != null);
 
+        if (detectedGamePath != null) {
+            updateStatusViews(getString(R.string.launcher_status_ready), detectedGamePath);
+        } else {
+            updateStatusViews(
+                    getString(R.string.launcher_status_missing_game),
+                    getString(R.string.launcher_game_path_hint, getPreferredImportDirectory()));
+        }
+    }
+
+    private void updateStatusViews(final String statusText, final String gamePathText) {
         final StringBuilder status = new StringBuilder();
         if (isProbablyEmulator()) {
             status.append(getString(R.string.launcher_status_emulator_warning)).append('\n');
         }
-        if (detectedGamePath != null) {
-            status.append(getString(R.string.launcher_status_ready));
-            gamePathView.setText(detectedGamePath);
-        } else {
-            status.append(getString(R.string.launcher_status_missing_game));
-            gamePathView.setText(
-                    getString(R.string.launcher_game_path_hint, getPreferredImportDirectory()));
-        }
+        status.append(statusText);
         statusView.setText(status.toString().trim());
+        gamePathView.setText(gamePathText);
     }
 
     private File findDetectedGame() {

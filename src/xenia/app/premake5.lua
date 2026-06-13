@@ -56,9 +56,13 @@ project("xenia-app")
   files({
     "../base/main_init_"..platform_suffix..".cc",
   })
-  filter("not system:ios")
+  filter({"not system:ios", "platforms:not Android-*"})
     files({
       "../ui/windowed_app_main_qt.cc",
+    })
+  filter("platforms:Android-*")
+    files({
+      "../ui/windowed_app_main_android.cc",
     })
   filter("system:ios")
     files({
@@ -81,11 +85,15 @@ project("xenia-app")
     -- Unified library containing all apps as StaticLibs, not just the main
     -- emulator windowed app.
     kind("SharedLib")
-  if enableMiscSubprojects then
+  if enableMiscSubprojects or os.istarget("android") then
       links({
         "xenia-gpu-vulkan-trace-viewer",
-        "xenia-hid-demo",
         "xenia-ui-window-vulkan-demo",
+      })
+  end
+  if enableMiscSubprojects then
+      links({
+        "xenia-hid-demo",
       })
   end
   filter(NOT_SINGLE_LIBRARY_FILTER)
@@ -104,9 +112,8 @@ project("xenia-app")
       "xenia-cpu-backend-x64",
     })
 
-  -- TODO(Triang3l): The emulator itself on Android.
   -- iOS uses a native UIKit entry point, not xenia_main.cc.
-  filter({"platforms:not Android-*", "not system:ios"})
+  filter("not system:ios")
     files({
       "xenia_main.cc",
     })
@@ -144,7 +151,7 @@ project("xenia-app")
       "xenia-hid-sdl",
     })
 
-  filter({"platforms:not Android-*", "architecture:ARM64"})
+  filter("architecture:ARM64")
     links({
       "xenia-cpu-backend-a64",
     })

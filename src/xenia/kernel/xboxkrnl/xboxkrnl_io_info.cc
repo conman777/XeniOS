@@ -7,7 +7,14 @@
  ******************************************************************************
  */
 
+#include <algorithm>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/utf8.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/info/volume.h"
 #include "xenia/kernel/kernel_state.h"
@@ -15,11 +22,122 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xfile.h"
 #include "xenia/vfs/device.h"
+#include "xenia/vfs/devices/disc_image_entry.h"
 #include "xenia/xbox.h"
+
+DECLARE_bool(halo_android_diagnostics);
+DECLARE_bool(halo_android_io_verbose);
+DECLARE_uint32(halo_android_io_summary_ms);
 
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
+
+namespace {
+
+bool ShouldLogHaloIoInfoPath(std::string_view path) {
+  return xe::utf8::find_first_of_case(path, "maps") != std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "mainmenu") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "bink") != std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "cache") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "webcache") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "harddisk") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "partition") !=
+             std::string_view::npos;
+}
+
+struct HaloFilePositionStats {
+  uint64_t calls = 0;
+  uint64_t backward_seeks = 0;
+  uint64_t forward_seeks = 0;
+  uint64_t max_position = 0;
+  uint64_t last_position = 0;
+  uint32_t last_status = 0;
+  uint32_t last_emit_ms = 0;
+  uint64_t emitted_calls = 0;
+};
+
+std::mutex& HaloFilePositionStatsMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, HaloFilePositionStats>&
+HaloFilePositionStatsByPath() {
+  static std::unordered_map<std::string, HaloFilePositionStats> stats;
+  return stats;
+}
+
+uint32_t HaloIoInfoSummaryIntervalMs() {
+  return cvars::halo_android_io_summary_ms ? cvars::halo_android_io_summary_ms
+                                           : 5000;
+}
+
+void TrackHaloFilePosition(std::string_view path, X_STATUS result,
+                           uint64_t old_position, uint64_t new_position) {
+  if (!cvars::halo_android_diagnostics || !ShouldLogHaloIoInfoPath(path)) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(HaloFilePositionStatsMutex());
+  auto& stats = HaloFilePositionStatsByPath()[std::string(path)];
+  ++stats.calls;
+  if (new_position < old_position) {
+    ++stats.backward_seeks;
+  } else if (new_position > old_position) {
+    ++stats.forward_seeks;
+  }
+  stats.max_position = std::max(stats.max_position, new_position);
+  stats.last_position = new_position;
+  stats.last_status = static_cast<uint32_t>(result);
+
+  uint32_t uptime_ms = Clock::QueryGuestUptimeMillis();
+  if (!stats.last_emit_ms) {
+    stats.last_emit_ms = uptime_ms;
+    return;
+  }
+  if (uptime_ms - stats.last_emit_ms < HaloIoInfoSummaryIntervalMs()) {
+    return;
+  }
+
+  XELOGI(
+      "HaloReach FilePositionSummary path='{}' dt_ms={} calls={} (+{}) "
+      "forward={} backward={} max_position=0x{:X} last_position=0x{:X} "
+      "last_status=0x{:08X}",
+      path, uptime_ms - stats.last_emit_ms, stats.calls,
+      stats.calls - stats.emitted_calls, stats.forward_seeks,
+      stats.backward_seeks, stats.max_position, stats.last_position,
+      stats.last_status);
+  stats.last_emit_ms = uptime_ms;
+  stats.emitted_calls = stats.calls;
+}
+
+const char* FileInformationClassName(uint32_t info_class) {
+  switch (info_class) {
+    case XFileBasicInformation:
+      return "Basic";
+    case XFileDispositionInformation:
+      return "Disposition";
+    case XFilePositionInformation:
+      return "Position";
+    case XFileAllocationInformation:
+      return "Allocation";
+    case XFileEndOfFileInformation:
+      return "EndOfFile";
+    case XFileNetworkOpenInformation:
+      return "NetworkOpen";
+    case XFileSectorInformation:
+      return "Sector";
+    default:
+      return "Other";
+  }
+}
+
+}  // namespace
 
 uint32_t GetQueryFileInfoMinimumLength(uint32_t info_class) {
   switch (info_class) {
@@ -68,6 +186,10 @@ dword_result_t NtQueryInformationFile_entry(
 
   X_STATUS status = X_STATUS_SUCCESS;
   uint32_t out_length;
+  uint64_t log_value0 = 0;
+  uint64_t log_value1 = 0;
+  const char* log_value0_name = "value0";
+  const char* log_value1_name = "value1";
 
   switch (info_class) {
     case XFileInternalInformation: {
@@ -81,6 +203,8 @@ dword_result_t NtQueryInformationFile_entry(
     case XFilePositionInformation: {
       auto info = info_ptr.as<X_FILE_POSITION_INFORMATION*>();
       info->current_byte_offset = file->position();
+      log_value0 = info->current_byte_offset;
+      log_value0_name = "position";
       out_length = sizeof(*info);
       break;
     }
@@ -92,13 +216,18 @@ dword_result_t NtQueryInformationFile_entry(
       break;
     }
     case XFileSectorInformation: {
-      // SW that uses this seems to use the output as a way of uniquely
-      // identifying a file for sorting/lookup so we can just give it an
-      // arbitrary 4 byte integer most of the time
-      XELOGW("Stub XFileSectorInformation!");
       auto info = info_ptr.as<uint32_t*>();
-      size_t fname_hash = xe::memory::hash_combine(82589933LL, file->path());
-      *info = static_cast<uint32_t>(fname_hash ^ (fname_hash >> 32));
+      const size_t bytes_per_sector =
+          std::max<size_t>(1, file->device()->bytes_per_sector());
+      if (auto* disc_entry =
+              dynamic_cast<xe::vfs::DiscImageEntry*>(file->entry())) {
+        *info = static_cast<uint32_t>(disc_entry->data_offset() /
+                                      bytes_per_sector);
+      } else {
+        *info = static_cast<uint32_t>(bytes_per_sector);
+      }
+      log_value0 = *info;
+      log_value0_name = "sector";
       out_length = sizeof(uint32_t);
       break;
     }
@@ -127,6 +256,10 @@ dword_result_t NtQueryInformationFile_entry(
       info->allocation_size = file->entry()->allocation_size();
       info->end_of_file = file->entry()->size();
       info->attributes = file->entry()->attributes();
+      log_value0 = info->end_of_file;
+      log_value0_name = "eof";
+      log_value1 = info->allocation_size;
+      log_value1_name = "allocation";
       out_length = sizeof(*info);
       break;
     }
@@ -142,6 +275,17 @@ dword_result_t NtQueryInformationFile_entry(
   if (io_status_block_ptr) {
     io_status_block_ptr->status = status;
     io_status_block_ptr->information = out_length;
+  }
+
+  if (ShouldLogHaloIoInfoPath(file->entry()->absolute_path())) {
+    XELOGI(
+        "HaloReach NtQueryInformationFile path='{}' class={}({}) "
+        "result=0x{:08X} info=0x{:X} {}=0x{:X} {}=0x{:X} pos=0x{:X} "
+        "size=0x{:X}",
+        file->entry()->absolute_path(), static_cast<uint32_t>(info_class),
+        FileInformationClassName(info_class), static_cast<uint32_t>(status),
+        out_length, log_value0_name, log_value0, log_value1_name, log_value1,
+        file->position(), file->entry()->size());
   }
 
   return status;
@@ -198,10 +342,17 @@ dword_result_t NtSetInformationFile_entry(
 
   X_STATUS result = X_STATUS_SUCCESS;
   uint32_t out_length;
+  uint64_t log_value0 = 0;
+  uint64_t log_value1 = 0;
+  const char* log_value0_name = "value0";
+  const char* log_value1_name = "value1";
+  const uint64_t position_before = file->position();
 
   switch (info_class) {
     case XFileBasicInformation: {
       auto info = info_ptr.as<X_FILE_BASIC_INFORMATION*>();
+      log_value0 = info->attributes;
+      log_value0_name = "attributes";
 
       bool basic_result = true;
       if (info->creation_time) {
@@ -247,6 +398,8 @@ dword_result_t NtSetInformationFile_entry(
     case XFileDispositionInformation: {
       auto info = info_ptr.as<X_FILE_DISPOSITION_INFORMATION*>();
       bool delete_on_close = info->delete_file ? true : false;
+      log_value0 = info->delete_file;
+      log_value0_name = "delete";
       if (delete_on_close && !file->entry()->parent()) {
         result = X_STATUS_ACCESS_DENIED;
         out_length = 0;
@@ -262,12 +415,16 @@ dword_result_t NtSetInformationFile_entry(
     }
     case XFilePositionInformation: {
       auto info = info_ptr.as<X_FILE_POSITION_INFORMATION*>();
+      log_value0 = info->current_byte_offset;
+      log_value0_name = "position";
       file->set_position(info->current_byte_offset);
       out_length = sizeof(*info);
       break;
     }
     case XFileAllocationInformation: {
       auto info = info_ptr.as<X_FILE_ALLOCATION_INFORMATION*>();
+      log_value0 = info->allocation_size;
+      log_value0_name = "allocation";
       result = file->SetLength(info->allocation_size);
       out_length = sizeof(*info);
 
@@ -277,6 +434,8 @@ dword_result_t NtSetInformationFile_entry(
     }
     case XFileEndOfFileInformation: {
       auto info = info_ptr.as<X_FILE_END_OF_FILE_INFORMATION*>();
+      log_value0 = info->end_of_file;
+      log_value0_name = "eof";
       result = file->SetLength(info->end_of_file);
       out_length = sizeof(*info);
 
@@ -289,6 +448,10 @@ dword_result_t NtSetInformationFile_entry(
       auto info = info_ptr.as<X_FILE_COMPLETION_INFORMATION*>();
       auto handle = uint32_t(info->handle);
       auto key = uint32_t(info->key);
+      log_value0 = handle;
+      log_value0_name = "completion_handle";
+      log_value1 = key;
+      log_value1_name = "completion_key";
       out_length = sizeof(*info);
       auto port =
           kernel_state()->object_table()->LookupObject<XIOCompletion>(handle);
@@ -309,6 +472,24 @@ dword_result_t NtSetInformationFile_entry(
   if (io_status_block) {
     io_status_block->status = result;
     io_status_block->information = out_length;
+  }
+
+  if (info_class == XFilePositionInformation) {
+    TrackHaloFilePosition(file->entry()->absolute_path(), result,
+                          position_before, file->position());
+  }
+
+  if (ShouldLogHaloIoInfoPath(file->entry()->absolute_path()) &&
+      (cvars::halo_android_io_verbose || XFAILED(result) ||
+       info_class != XFilePositionInformation)) {
+    XELOGI(
+        "HaloReach NtSetInformationFile path='{}' class={}({}) "
+        "result=0x{:08X} info=0x{:X} {}=0x{:X} {}=0x{:X} "
+        "pos=0x{:X}->0x{:X} size=0x{:X}",
+        file->entry()->absolute_path(), static_cast<uint32_t>(info_class),
+        FileInformationClassName(info_class), static_cast<uint32_t>(result),
+        out_length, log_value0_name, log_value0, log_value1_name, log_value1,
+        position_before, file->position(), file->entry()->size());
   }
 
   return result;
@@ -414,6 +595,14 @@ dword_result_t NtQueryVolumeInformationFile_entry(
   if (io_status_block_ptr) {
     io_status_block_ptr->status = status;
     io_status_block_ptr->information = out_length;
+  }
+
+  if (ShouldLogHaloIoInfoPath(file->entry()->absolute_path())) {
+    XELOGI(
+        "HaloReach NtQueryVolumeInformationFile path='{}' class={} "
+        "result=0x{:08X} info=0x{:X}",
+        file->entry()->absolute_path(), static_cast<uint32_t>(info_class),
+        static_cast<uint32_t>(status), out_length);
   }
 
   return status;

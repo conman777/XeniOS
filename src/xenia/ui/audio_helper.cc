@@ -18,7 +18,12 @@
 #define MINIAUDIO_IMPLEMENTATION
 #include "third_party/miniaudio/miniaudio.h"
 
+#if XE_PLATFORM_ANDROID
+DEFINE_path(achievement_sound_path, "",
+            "Path to the achievement notification sound file.", "UI");
+#else
 DECLARE_path(achievement_sound_path);
+#endif
 
 namespace xe {
 namespace ui {

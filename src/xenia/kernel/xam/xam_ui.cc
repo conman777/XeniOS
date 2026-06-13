@@ -10,9 +10,9 @@
 #include "xenia/kernel/xam/xam_ui.h"
 
 #include <algorithm>
-#include "xenia/app/emulator_window.h"
 #include "xenia/base/png_utils.h"
 #include "xenia/base/system.h"
+#include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"

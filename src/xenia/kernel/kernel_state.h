@@ -382,6 +382,7 @@ class KernelState {
   std::list<std::function<void()>> dispatch_queue_;
 
   uint32_t ke_timestamp_bundle_ptr_ = 0;
+  uint32_t last_thread_sample_ms_ = 0;
   std::unique_ptr<xe::threading::HighResolutionTimer> timestamp_timer_;
   cpu::backend::GuestTrampolineGroup kernel_trampoline_group_;
   // fixed address referenced by dashboards. Data is currently unknown

@@ -16,6 +16,9 @@
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
+#if XE_PLATFORM_ANDROID
+#include "xenia/gpu/vulkan/android_halo_experiment.h"
+#endif
 
 namespace xe {
 namespace gpu {
@@ -28,10 +31,25 @@ bool VulkanPrimitiveProcessor::Initialize() {
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Properties& device_properties =
       vulkan_device->properties();
-  if (!InitializeCommon(
-          device_properties.fullDrawIndexUint32, device_properties.triangleFans,
-          false, device_properties.geometryShader,
-          device_properties.geometryShader, device_properties.geometryShader)) {
+  bool geometry_shaders_usable = device_properties.geometryShader;
+#if XE_PLATFORM_ANDROID
+  // A/B experiment: Halo's fullscreen composite is a rectangle list (and UI
+  // uses point/quad lists), all of which are expanded with geometry shaders
+  // when available. If the device's geometry shaders silently emit nothing,
+  // declaring them unsupported here switches those primitive types to the
+  // vertex-shader-expansion / index-conversion fallbacks.
+  if (GetAndroidHaloExperiment().disable_geometry_shaders) {
+    geometry_shaders_usable = false;
+    XELOGI(
+        "VulkanPrimitiveProcessor: geometry shaders disabled by experiment "
+        "(device geometryShader={})",
+        uint32_t(device_properties.geometryShader));
+  }
+#endif
+  if (!InitializeCommon(device_properties.fullDrawIndexUint32,
+                        device_properties.triangleFans, false,
+                        geometry_shaders_usable, geometry_shaders_usable,
+                        geometry_shaders_usable)) {
     Shutdown();
     return false;
   }

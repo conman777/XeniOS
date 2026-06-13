@@ -873,6 +873,169 @@ void A64Backend::RecordMMIOExceptionForGuestInstruction(void* host_address) {
   }
 }
 
+bool ReadAvGuestU32BE(const ppc::PPCContext* context, uint32_t guest_addr,
+                      uint32_t* value_out) {
+  if (!context || !guest_addr || !value_out) {
+    return false;
+  }
+
+  const uint32_t* data_ptr = context->TranslateVirtual<const uint32_t*>(
+      guest_addr);
+  if (!data_ptr) {
+    return false;
+  }
+
+  xe::memory::PageAccess access;
+  size_t data_length = sizeof(uint32_t);
+  if (!xe::memory::QueryProtect(const_cast<uint32_t*>(data_ptr), data_length,
+                                access) ||
+      access == xe::memory::PageAccess::kNoAccess) {
+    return false;
+  }
+
+  *value_out = xe::load_and_swap<uint32_t>(data_ptr);
+  return true;
+}
+
+bool IsLikelyAvCodeAddress(uint32_t address) {
+  return (address & 3) == 0 && address >= 0x82000000 && address < 0x83000000;
+}
+
+bool IsLikelyAvCallInstruction(uint32_t instruction) {
+  const uint32_t opcode = instruction >> 26;
+  if ((opcode == 18 || opcode == 16) && (instruction & 1)) {
+    return true;
+  }
+
+  return (instruction & 0xFC00FFFF) == 0x4C000421 ||
+         (instruction & 0xFC00FFFF) == 0x4C000021;
+}
+
+void DumpAvGuestDisassembly(const ppc::PPCContext* context, const char* label,
+                            uint32_t center_pc, int before, int after) {
+  if (!context || !center_pc) {
+    return;
+  }
+
+  for (int i = -before; i <= after; ++i) {
+    const uint32_t pc = center_pc + uint32_t(i * 4);
+    const uint32_t* code_ptr = context->TranslateVirtual<const uint32_t*>(pc);
+    if (!code_ptr) {
+      continue;
+    }
+
+    xe::memory::PageAccess access;
+    size_t code_length = sizeof(uint32_t);
+    if (!xe::memory::QueryProtect(const_cast<uint32_t*>(code_ptr), code_length,
+                                  access) ||
+        access == xe::memory::PageAccess::kNoAccess) {
+      continue;
+    }
+
+    const uint32_t instruction = xe::load_and_swap<uint32_t>(code_ptr);
+    StringBuffer disasm;
+    if (cpu::ppc::DisasmPPC(pc, instruction, &disasm)) {
+      XELOGE("A64 AV stack {}{} pc=0x{:08X} 0x{:08X} {}", label,
+             i == 0 ? "*" : " ", pc, instruction, disasm.to_string_view());
+    } else {
+      XELOGE("A64 AV stack {}{} pc=0x{:08X} 0x{:08X}", label,
+             i == 0 ? "*" : " ", pc, instruction);
+    }
+  }
+}
+
+void DumpAvGuestBytes(const ppc::PPCContext* context, const char* label,
+                      uint32_t guest_addr) {
+  if (!context || !guest_addr) {
+    return;
+  }
+
+  const uint8_t* data_ptr = context->TranslateVirtual<const uint8_t*>(
+      guest_addr);
+  if (!data_ptr) {
+    XELOGE("A64 AV bytes {} addr=0x{:08X}: <unreadable>", label, guest_addr);
+    return;
+  }
+
+  xe::memory::PageAccess access;
+  size_t data_length = 128;
+  if (!xe::memory::QueryProtect(const_cast<uint8_t*>(data_ptr), data_length,
+                                access) ||
+      access == xe::memory::PageAccess::kNoAccess) {
+    XELOGE("A64 AV bytes {} addr=0x{:08X}: <unreadable>", label, guest_addr);
+    return;
+  }
+
+  uint8_t bytes[128] = {};
+  std::memcpy(bytes, data_ptr, sizeof(bytes));
+  char ascii[129] = {};
+  for (size_t i = 0; i < sizeof(bytes); ++i) {
+    const uint8_t c = bytes[i];
+    ascii[i] = c >= 32 && c <= 126 ? char(c) : '.';
+  }
+  ascii[sizeof(bytes)] = 0;
+
+  XELOGE(
+      "A64 AV bytes {} addr=0x{:08X}: "
+      "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
+      "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
+      "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
+      "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+      label, guest_addr, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+      bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+      bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17],
+      bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+      bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29],
+      bytes[30], bytes[31]);
+  XELOGE("A64 AV ascii {} addr=0x{:08X}: \"{}\"", label, guest_addr, ascii);
+}
+
+void DumpAvGuestStackBackchain(const ppc::PPCContext* context,
+                               uint32_t stack_pointer) {
+  uint32_t frame = stack_pointer;
+  for (uint32_t depth = 0; depth < 10; ++depth) {
+    uint32_t next_frame = 0;
+    if (!ReadAvGuestU32BE(context, frame, &next_frame)) {
+      XELOGE("A64 AV stack frame={} sp=0x{:08X}: <unreadable>", depth, frame);
+      return;
+    }
+
+    XELOGE("A64 AV stack frame={} sp=0x{:08X} next=0x{:08X}", depth, frame,
+           next_frame);
+
+    for (uint32_t offset = 4; offset < 0x120; offset += 4) {
+      uint32_t candidate = 0;
+      if (!ReadAvGuestU32BE(context, frame + offset, &candidate) ||
+          !IsLikelyAvCodeAddress(candidate)) {
+        continue;
+      }
+
+      uint32_t call_instruction = 0;
+      const bool call_like =
+          candidate >= 4 &&
+          ReadAvGuestU32BE(context, candidate - 4, &call_instruction) &&
+          IsLikelyAvCallInstruction(call_instruction);
+
+      if (!call_like && offset != 0x14 && offset != 0x18 &&
+          offset != 0x38 && offset != 0x44 && offset != 0x58) {
+        continue;
+      }
+
+      XELOGE(
+          "A64 AV stack candidate: frame={} sp=0x{:08X} off=0x{:02X} "
+          "ret=0x{:08X} call_like={} call_insn=0x{:08X}",
+          depth, frame, offset, candidate, call_like, call_instruction);
+      DumpAvGuestDisassembly(context, call_like ? "call" : "addr", candidate,
+                             6, 4);
+    }
+
+    if (!next_frame || next_frame <= frame || next_frame - frame > 0x20000) {
+      return;
+    }
+    frame = next_frame;
+  }
+}
+
 bool A64Backend::ExceptionCallbackThunk(Exception* ex, void* data) {
   auto backend = reinterpret_cast<A64Backend*>(data);
   return backend->ExceptionCallback(ex);
@@ -966,6 +1129,46 @@ bool A64Backend::ExceptionCallback(Exception* ex) {
         const uint32_t sp = static_cast<uint32_t>(ppc_context->r[1]);
         XELOGE("A64 AV: guest=0x{:08X} sp=0x{:08X} sp_to_fault=0x{:X}",
                guest_fault, sp, static_cast<uint32_t>(guest_fault - sp));
+        DumpAvGuestStackBackchain(ppc_context, sp);
+        XELOGE(
+            "A64 AV gprs: r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} "
+            "r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} "
+            "r7=0x{:08X}",
+            uint32_t(ppc_context->r[0]), uint32_t(ppc_context->r[1]),
+            uint32_t(ppc_context->r[2]), uint32_t(ppc_context->r[3]),
+            uint32_t(ppc_context->r[4]), uint32_t(ppc_context->r[5]),
+            uint32_t(ppc_context->r[6]), uint32_t(ppc_context->r[7]));
+        XELOGE(
+            "A64 AV gprs: r8=0x{:08X} r9=0x{:08X} r10=0x{:08X} "
+            "r11=0x{:08X} r12=0x{:08X} r13=0x{:08X} r14=0x{:08X} "
+            "r15=0x{:08X}",
+            uint32_t(ppc_context->r[8]), uint32_t(ppc_context->r[9]),
+            uint32_t(ppc_context->r[10]), uint32_t(ppc_context->r[11]),
+            uint32_t(ppc_context->r[12]), uint32_t(ppc_context->r[13]),
+            uint32_t(ppc_context->r[14]), uint32_t(ppc_context->r[15]));
+        XELOGE(
+            "A64 AV gprs: r16=0x{:08X} r17=0x{:08X} r18=0x{:08X} "
+            "r19=0x{:08X} r20=0x{:08X} r21=0x{:08X} r22=0x{:08X} "
+            "r23=0x{:08X}",
+            uint32_t(ppc_context->r[16]), uint32_t(ppc_context->r[17]),
+            uint32_t(ppc_context->r[18]), uint32_t(ppc_context->r[19]),
+            uint32_t(ppc_context->r[20]), uint32_t(ppc_context->r[21]),
+            uint32_t(ppc_context->r[22]), uint32_t(ppc_context->r[23]));
+        XELOGE(
+            "A64 AV gprs: r24=0x{:08X} r25=0x{:08X} r26=0x{:08X} "
+            "r27=0x{:08X} r28=0x{:08X} r29=0x{:08X} r30=0x{:08X} "
+            "r31=0x{:08X} lr=0x{:08X} ctr=0x{:08X}",
+            uint32_t(ppc_context->r[24]), uint32_t(ppc_context->r[25]),
+            uint32_t(ppc_context->r[26]), uint32_t(ppc_context->r[27]),
+            uint32_t(ppc_context->r[28]), uint32_t(ppc_context->r[29]),
+            uint32_t(ppc_context->r[30]), uint32_t(ppc_context->r[31]),
+            uint32_t(ppc_context->lr), uint32_t(ppc_context->ctr));
+        DumpAvGuestBytes(ppc_context, "r3", uint32_t(ppc_context->r[3]));
+        DumpAvGuestBytes(ppc_context, "r4", uint32_t(ppc_context->r[4]));
+        DumpAvGuestBytes(ppc_context, "r25", uint32_t(ppc_context->r[25]));
+        DumpAvGuestBytes(ppc_context, "fatal_arg_literal", 0x82058860);
+        DumpAvGuestBytes(ppc_context, "fatal_crash_literal", 0x82061DE0);
+        DumpAvGuestDisassembly(ppc_context, "fatal_func", 0x826F5660, 0, 80);
         if (auto* memory = processor()->memory()) {
           if (auto* heap = memory->LookupHeap(guest_fault)) {
             uint32_t protect = 0;

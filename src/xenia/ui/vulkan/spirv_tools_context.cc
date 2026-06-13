@@ -9,9 +9,12 @@
 
 #include "xenia/ui/vulkan/spirv_tools_context.h"
 
+#if !XE_PLATFORM_ANDROID
 #include <cstdlib>
 
 #include <spirv-tools/optimizer.hpp>
+#endif  // !XE_PLATFORM_ANDROID
+
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 
@@ -19,6 +22,39 @@ namespace xe {
 namespace ui {
 namespace vulkan {
 
+#if XE_PLATFORM_ANDROID
+
+bool SpirvToolsContext::Initialize(unsigned int spirv_version) {
+  (void)spirv_version;
+  XELOGW("SPIRV-Tools is disabled on Android builds");
+  return false;
+}
+
+void SpirvToolsContext::Shutdown() { context_ = nullptr; }
+
+spv_result_t SpirvToolsContext::Validate(const uint32_t* words,
+                                         size_t num_words,
+                                         std::string* error) const {
+  (void)words;
+  (void)num_words;
+  if (error) {
+    error->clear();
+  }
+  return SPV_UNSUPPORTED;
+}
+
+spv_result_t SpirvToolsContext::Optimize(const uint32_t* words,
+                                         size_t num_words,
+                                         std::vector<uint32_t>& optimized_words,
+                                         bool performance_passes) {
+  (void)words;
+  (void)num_words;
+  (void)performance_passes;
+  optimized_words.clear();
+  return SPV_UNSUPPORTED;
+}
+
+#else
 bool SpirvToolsContext::Initialize(unsigned int spirv_version) {
   // Determine target environment based on SPIR-V version
   if (spirv_version >= 0x10500) {
@@ -120,6 +156,8 @@ spv_result_t SpirvToolsContext::Optimize(const uint32_t* words,
 
   return SPV_SUCCESS;
 }
+
+#endif  // XE_PLATFORM_ANDROID
 
 }  // namespace vulkan
 }  // namespace ui

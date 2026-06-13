@@ -14,8 +14,6 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
 
-#include <ranges>
-
 namespace xe {
 namespace kernel {
 namespace xam {
@@ -23,15 +21,11 @@ namespace xam {
 const std::vector<const X_XDBF_GPD_TITLE_PLAYED*>
 GpdInfoProfile::GetTitlesInfo() const {
   std::vector<const X_XDBF_GPD_TITLE_PLAYED*> entries;
-
-  auto titles = entries_ | std::views::filter([](const auto& entry) {
-                  return !IsSyncEntry(&entry);
-                }) |
-                std::views::filter([](const auto& entry) {
-                  return IsEntryOfSection(&entry, GpdSection::kTitle);
-                });
-
-  for (const auto& title : titles) {
+  for (const auto& title : entries_) {
+    if (IsSyncEntry(&title) ||
+        !IsEntryOfSection(&title, GpdSection::kTitle)) {
+      continue;
+    }
     entries.push_back(
         reinterpret_cast<const X_XDBF_GPD_TITLE_PLAYED*>(title.data.data()));
   }
@@ -39,21 +33,14 @@ GpdInfoProfile::GetTitlesInfo() const {
 };
 
 X_XDBF_GPD_TITLE_PLAYED* GpdInfoProfile::GetTitleInfo(const uint32_t title_id) {
-  auto title = entries_ | std::views::filter([](const auto& entry) {
-                 return !IsSyncEntry(&entry);
-               }) |
-               std::views::filter([](const auto& entry) {
-                 return IsEntryOfSection(&entry, GpdSection::kTitle);
-               }) |
-               std::views::filter([title_id](const auto& entry) {
-                 return static_cast<uint32_t>(entry.info.id) == title_id;
-               });
-
-  if (title.empty()) {
-    return nullptr;
+  for (auto& title : entries_) {
+    if (IsSyncEntry(&title) || !IsEntryOfSection(&title, GpdSection::kTitle) ||
+        static_cast<uint32_t>(title.info.id) != title_id) {
+      continue;
+    }
+    return reinterpret_cast<X_XDBF_GPD_TITLE_PLAYED*>(title.data.data());
   }
-
-  return reinterpret_cast<X_XDBF_GPD_TITLE_PLAYED*>(title.begin()->data.data());
+  return nullptr;
 }
 
 std::u16string GpdInfoProfile::GetTitleName(const uint32_t title_id) const {

@@ -42,7 +42,15 @@ using WaitItem = TimerQueueWaitItem;
     edit2: (30.12.2024) After uplifting version of MSVC compiler Xenia cannot be
    correctly initialized if you're using proton.
 */
+#if defined(_MSC_VER)
+// The blocking strategy historically miscompiled / misbehaved under MSVC (see
+// notes above); keep the spin strategy there.
 using WaitStrat = dp::spin_wait_strategy;
+#else
+// On clang/Android the perpetual spin thread burns a core and contributes to
+// device-wide unresponsiveness during heavy load; block instead.
+using WaitStrat = dp::blocking_wait_strategy;
+#endif
 
 class TimerQueue {
  public:

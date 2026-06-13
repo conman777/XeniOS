@@ -75,13 +75,11 @@ struct string_key_insensitive : internal::string_key_base {
 
   bool operator==(const string_key_insensitive& other) const {
     return other.view().size() == view().size() &&
-           std::ranges::equal(
-               other.view(), view(), {},
-               [](char ch) {
-                 return std::tolower(static_cast<unsigned char>(ch));
-               },
-               [](char ch) {
-                 return std::tolower(static_cast<unsigned char>(ch));
+           std::equal(
+               other.view().begin(), other.view().end(), view().begin(),
+               [](char lhs, char rhs) {
+                 return std::tolower(static_cast<unsigned char>(lhs)) ==
+                        std::tolower(static_cast<unsigned char>(rhs));
                });
   }
 

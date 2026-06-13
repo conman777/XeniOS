@@ -148,6 +148,12 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
 CommandProcessor::~CommandProcessor() = default;
 
 bool CommandProcessor::Initialize() {
+  // Android may override cvars after construction; make the cached mode match
+  // the effective runtime configuration before any resolve readback decisions.
+  cached_readback_resolve_mode_ = ParseReadbackResolveMode();
+  XELOGI("CommandProcessor readback_resolve initialized as '{}'",
+         cvars::readback_resolve);
+
   // Initialize the gamma ramps to their default (linear) values - taken from
   // what games set when starting with the sRGB (return value 1)
   // VdGetCurrentDisplayGamma.

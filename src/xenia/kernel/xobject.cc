@@ -414,7 +414,10 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state,
         assert_true(success);
         object = sem;
       } break;
-      case 3:   // ProcessObject
+      case 3:  // IoCreateDevice-created device object in this guest path.
+      {
+        object = new XObject(kernel_state, Type::Device);
+      } break;
       case 4:   // QueueObject
       case 6:   // ThreadObject
       case 7:   // GateObject

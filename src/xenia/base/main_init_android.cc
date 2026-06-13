@@ -2,16 +2,11 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2021 Ben Vanik. All rights reserved.                             *
+ * Copyright 2026 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
 
-#include "xenia/base/cvar.h"
-
-// Exists to create a mapping for positional arg on Android activity launches.
-DEFINE_transient_path(target, "", "Specifies the target file to run.",
-                      "General");
-
-// No standalone main entry point is needed on Android - the event loop is
-// driven by the Activity.
+// Android: the Java activity entry point performs process initialization via
+// InitializeAndroidAppFromMainThread, so there is no additional global init
+// work needed in the native main init path.

@@ -10,11 +10,77 @@
 #include "xenia/kernel/xfile.h"
 #include "xenia/vfs/virtual_file_system.h"
 
+#include <cstring>
+#include <string_view>
+#include <vector>
+
 #include "xenia/base/byte_stream.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
+#include "xenia/kernel/kernel_flags.h"
 #include "xenia/kernel/kernel_state.h"
 
 namespace xe {
 namespace kernel {
+
+#if XE_PLATFORM_ANDROID
+namespace {
+
+const char* AndroidPageAccessName(memory::PageAccess access) {
+  switch (access) {
+    case memory::PageAccess::kNoAccess:
+      return "none";
+    case memory::PageAccess::kReadOnly:
+      return "read";
+    case memory::PageAccess::kReadWrite:
+      return "readwrite";
+    case memory::PageAccess::kExecuteReadOnly:
+      return "exec_read";
+    case memory::PageAccess::kExecuteReadWrite:
+      return "exec_readwrite";
+  }
+  return "unknown";
+}
+
+bool ShouldLogAndroidFileReadBuffer(std::string_view path) {
+  return cvars::halo_android_diagnostics &&
+         path.find("\\CACHE0\\maps\\cached_fonts\\font_package.bin") !=
+             std::string_view::npos;
+}
+
+void LogAndroidFileReadBufferRegion(std::string_view label,
+                                    std::string_view path, BaseHeap& heap,
+                                    uint32_t buffer_guest_address,
+                                    uint32_t bytes_read,
+                                    memory::PageAccess range_access) {
+  if (!ShouldLogAndroidFileReadBuffer(path) || !bytes_read) {
+    return;
+  }
+
+  HeapAllocationInfo start_info = {};
+  HeapAllocationInfo end_info = {};
+  const uint32_t buffer_end = buffer_guest_address + bytes_read - 1;
+  const bool have_start = heap.QueryRegionInfo(buffer_guest_address, &start_info);
+  const bool have_end = heap.QueryRegionInfo(buffer_end, &end_info);
+  XELOGI(
+      "XFile::Read AndroidBuffer {} file='{}' buffer=0x{:08X} "
+      "bytes=0x{:X} access={} heap_type={} start_ok={} "
+      "start_alloc=0x{:08X}+0x{:X} start_region=0x{:08X}+0x{:X} "
+      "start_state=0x{:X} start_protect=0x{:X} end_ok={} "
+      "end_alloc=0x{:08X}+0x{:X} end_region=0x{:08X}+0x{:X} "
+      "end_state=0x{:X} end_protect=0x{:X}",
+      label, path, buffer_guest_address, bytes_read,
+      AndroidPageAccessName(range_access), uint32_t(heap.heap_type()),
+      uint32_t(have_start), start_info.allocation_base,
+      start_info.allocation_size, start_info.base_address,
+      start_info.region_size, start_info.state, start_info.protect,
+      uint32_t(have_end), end_info.allocation_base, end_info.allocation_size,
+      end_info.base_address, end_info.region_size, end_info.state,
+      end_info.protect);
+}
+
+}  // namespace
+#endif  // XE_PLATFORM_ANDROID
 
 XFile::XFile(KernelState* kernel_state, vfs::File* file, bool synchronous)
     : XObject(kernel_state, kObjectType),
@@ -101,6 +167,7 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
                              uint32_t buffer_length, uint64_t byte_offset,
                              uint32_t* out_bytes_read, uint32_t apc_context,
                              bool notify_completion) {
+  const bool uses_current_position = byte_offset == uint64_t(-1);
   if (byte_offset == uint64_t(-1)) {
     // Read from current position.
     byte_offset = position_;
@@ -141,21 +208,95 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
             buffer_start_heap->heap_type() == HeapType::kGuestPhysical
                 ? static_cast<xe::PhysicalHeap*>(buffer_start_heap)
                 : nullptr;
+        const auto buffer_access = buffer_start_heap->QueryRangeAccess(
+            buffer_guest_address, buffer_guest_high_address);
         if (buffer_physical_heap &&
-            buffer_physical_heap->QueryRangeAccess(buffer_guest_address,
-                                                   buffer_guest_high_address) !=
-                memory::PageAccess::kReadWrite) {
+            buffer_access != memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
-          result = file_->ReadSync(
-              std::span<uint8_t>(
-                  buffer_physical_heap
-                      ? memory()->TranslatePhysical(
-                            buffer_physical_heap->GetPhysicalAddress(
-                                buffer_guest_address))
-                      : memory()->TranslateVirtual(buffer_guest_address),
-                  buffer_length),
-              size_t(byte_offset), &bytes_read);
+          if (buffer_physical_heap) {
+            result = file_->ReadSync(
+                std::span<uint8_t>(
+                    memory()->TranslatePhysical(
+                        buffer_physical_heap->GetPhysicalAddress(
+                            buffer_guest_address)),
+                    buffer_length),
+                size_t(byte_offset), &bytes_read);
+          } else {
+            std::vector<uint8_t> read_buffer(buffer_length);
+            result = file_->ReadSync(
+                std::span<uint8_t>(read_buffer.data(), read_buffer.size()),
+                size_t(byte_offset), &bytes_read);
+            if (XSUCCEEDED(result) && bytes_read) {
+              const uint32_t bytes_read_u32 = uint32_t(bytes_read);
+              const auto existing_access = buffer_start_heap->QueryRangeAccess(
+                  buffer_guest_address,
+                  buffer_guest_address + bytes_read_u32 - 1);
+              uint32_t old_protect = 0;
+              bool changed_protect = false;
+              bool buffer_writable =
+                  existing_access == memory::PageAccess::kReadWrite;
+#if XE_PLATFORM_ANDROID
+              const auto file_path = file_->entry()->absolute_path();
+              LogAndroidFileReadBufferRegion("before", file_path,
+                                             *buffer_start_heap,
+                                             buffer_guest_address,
+                                             bytes_read_u32, existing_access);
+#endif  // XE_PLATFORM_ANDROID
+              if (!buffer_writable) {
+                changed_protect = buffer_start_heap->Protect(
+                    buffer_guest_address, bytes_read_u32,
+                    kMemoryProtectRead | kMemoryProtectWrite, &old_protect);
+                buffer_writable = changed_protect;
+              }
+              if (!buffer_writable) {
+                const uint32_t page_size = buffer_start_heap->page_size();
+                const uint32_t commit_base =
+                    buffer_guest_address & ~(page_size - 1);
+                const uint32_t commit_end = xe::round_up(
+                    uint32_t(buffer_guest_address + bytes_read_u32), page_size);
+                const uint32_t commit_size = commit_end - commit_base;
+
+                // Android currently reaches Halo: Reach file reads where the
+                // destination is a valid guest virtual range but is not yet
+                // committed in the host page table. Commit it on-demand so the
+                // file read can make forward progress instead of turning into a
+                // black-screen spin.
+                buffer_writable = buffer_start_heap->AllocFixed(
+                    commit_base, commit_size, page_size,
+                    kMemoryAllocationCommit,
+                    kMemoryProtectRead | kMemoryProtectWrite);
+                if (buffer_writable) {
+                  XELOGW(
+                      "XFile::Read committed guest buffer on demand: "
+                      "file='{}' buffer=0x{:08X} bytes=0x{:X} "
+                      "commit=0x{:08X}+0x{:X}",
+                      file_->entry()->absolute_path(), buffer_guest_address,
+                      bytes_read_u32, commit_base, commit_size);
+#if XE_PLATFORM_ANDROID
+                  LogAndroidFileReadBufferRegion(
+                      "after_commit", file_path, *buffer_start_heap,
+                      buffer_guest_address, bytes_read_u32,
+                      buffer_start_heap->QueryRangeAccess(
+                          buffer_guest_address,
+                          buffer_guest_address + bytes_read_u32 - 1));
+#endif  // XE_PLATFORM_ANDROID
+                }
+              }
+
+              if (buffer_writable) {
+                std::memcpy(memory()->TranslateVirtual(buffer_guest_address),
+                            read_buffer.data(), bytes_read);
+                if (changed_protect) {
+                  buffer_start_heap->Protect(buffer_guest_address,
+                                             uint32_t(bytes_read), old_protect);
+                }
+              } else {
+                result = X_STATUS_ACCESS_VIOLATION;
+                bytes_read = 0;
+              }
+            }
+          }
           if (XSUCCEEDED(result)) {
             if (buffer_physical_heap) {
               buffer_physical_heap->TriggerCallbacks(
@@ -163,10 +304,9 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
                   buffer_guest_address, buffer_length, true, true);
             }
 
-            if (byte_offset) {
-              position_ = byte_offset;
+            if (uses_current_position) {
+              position_ += bytes_read;
             }
-            position_ += bytes_read;
           }
         }
       }
@@ -253,6 +393,7 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length,
                       uint64_t byte_offset, uint32_t* out_bytes_written,
                       uint32_t apc_context) {
   std::lock_guard<std::mutex> lock(file_lock_);
+  const bool uses_current_position = byte_offset == uint64_t(-1);
   if (byte_offset == uint64_t(-1)) {
     // Write from current position.
     byte_offset = position_;
@@ -263,8 +404,11 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length,
       std::span<uint8_t>(memory()->TranslateVirtual(buffer_guest_address),
                          buffer_length),
       size_t(byte_offset), &bytes_written);
-  if (XSUCCEEDED(result)) {
+  if (XSUCCEEDED(result) && uses_current_position) {
     position_ += bytes_written;
+  }
+  if (XSUCCEEDED(result) && bytes_written) {
+    file_->entry()->update();
   }
 
   XIOCompletion::IONotification notify;

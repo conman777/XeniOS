@@ -36,7 +36,7 @@ project("xenia-gpu-vulkan")
     "../shaders/bytecode/vulkan_spirv/*.h",
   })
 
-if enableMiscSubprojects then
+if enableMiscSubprojects or os.istarget("android") then
   group("src")
   project("xenia-gpu-vulkan-trace-viewer")
     uuid("86a1dddc-a26a-4885-8c55-cf745225d93e")
@@ -78,8 +78,17 @@ if enableMiscSubprojects then
     })
     files({
       "vulkan_trace_viewer_main.cc",
-      "../../ui/windowed_app_main_qt.cc",
     })
+    filter("platforms:not Android-*")
+      files({
+        "../../ui/windowed_app_main_qt.cc",
+      })
+    filter({})
+    if os.istarget("android") then
+      filter("platforms:Android-*")
+        wholelib("On")
+      filter({})
+    end
 
     filter("architecture:x86_64")
       links({

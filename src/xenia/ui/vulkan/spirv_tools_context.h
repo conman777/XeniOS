@@ -14,9 +14,21 @@
 #include <string>
 #include <vector>
 
+#include "xenia/base/platform.h"
+
+#if XE_PLATFORM_ANDROID
+using spv_result_t = int32_t;
+using spv_context = void*;
+enum spv_target_env {
+  SPV_ENV_UNIVERSAL_1_0 = 0,
+};
+constexpr spv_result_t SPV_SUCCESS = 0;
+constexpr spv_result_t SPV_ERROR_INVALID_BINARY = -1;
+constexpr spv_result_t SPV_UNSUPPORTED = 1;
+#else
 #include <spirv-tools/libspirv.h>
 #include <spirv-tools/optimizer.hpp>
-#include "xenia/base/platform.h"
+#endif  // XE_PLATFORM_ANDROID
 
 namespace xe {
 namespace ui {

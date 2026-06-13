@@ -78,7 +78,12 @@ DEFINE_bool(use_dedicated_xma_thread, kUseDedicatedXmaThreadDefault,
             "APU");
 
 DEFINE_string(
-    xma_decoder, "new",
+    xma_decoder,
+#if XE_PLATFORM_ANDROID
+    "old",
+#else
+    "new",
+#endif
     "Decoder version used to process XMA audio.\n"
     "Use: [fake, master, old, new]\n"
     " fake: \n  No audio will be decoded.\n"

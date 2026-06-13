@@ -179,6 +179,7 @@ bool A64Emitter::Emit(GuestFunction* function, HIRBuilder* builder,
   debug_info_ = debug_info;
   debug_info_flags_ = debug_info_flags;
   trace_data_ = &function->trace_data();
+  current_function_guest_address_ = function->address();
   source_map_arena_.Reset();
 
   // Fill the generator with code.
@@ -286,6 +287,9 @@ bool A64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
   STR(GetContextReg(), SP, StackLayout::GUEST_CTX_HOME);
   STR(X0, SP, StackLayout::GUEST_RET_ADDR);
   STR(XZR, SP, StackLayout::GUEST_CALL_RET_ADDR);
+
+  MOV(W0, current_function_guest_address_);
+  STR(W0, GetContextReg(), offsetof(ppc::PPCContext, last_guest_function));
 
   // Safe now to do some tracing.
   if (debug_info_flags_ & DebugInfoFlags::kDebugInfoTraceFunctions) {
@@ -398,6 +402,9 @@ void A64Emitter::MarkSourceOffset(const Instr* i) {
   entry->guest_address = static_cast<uint32_t>(i->src1.offset);
   entry->hir_offset = uint32_t(i->block->ordinal << 16) | i->ordinal;
   entry->code_offset = static_cast<uint32_t>(offset());
+
+  MOV(W0, entry->guest_address);
+  STR(W0, GetContextReg(), offsetof(ppc::PPCContext, last_guest_pc));
 
   if (cvars::emit_source_annotations) {
     NOP();

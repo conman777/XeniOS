@@ -881,7 +881,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
               static_cast<uint64_t>(wait_ms * 1000000 * 0.90);
           xe::threading::NanoSleep(sleep_ns);
 #else
-          xe::threading::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // Clamp the blind sleep so a satisfied wait isn't overshot by up to
+          // a whole vblank; the loop re-polls the register after waking.
+          xe::threading::Sleep(std::chrono::milliseconds(
+              std::min<uint64_t>(wait / 0x100, 2)));
 #endif
         }
         // Unlimited vblank mode (guest_display_refresh_cap=false) - spin since

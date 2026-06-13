@@ -117,7 +117,8 @@ class VulkanTextureCache final : public TextureCache {
   // Returns the 2D view of the front buffer texture (for fragment shader
   // reading - the barrier will be pushed in the command processor if needed),
   // or VK_NULL_HANDLE in case of failure. May call LoadTextureData.
-  VkImageView RequestSwapTexture(uint32_t& width_scaled_out,
+  VkImageView RequestSwapTexture(uint32_t frontbuffer_ptr,
+                                 uint32_t& width_scaled_out,
                                  uint32_t& height_scaled_out,
                                  xenos::TextureFormat& format_out);
 
@@ -398,6 +399,12 @@ class VulkanTextureCache final : public TextureCache {
   bool Initialize();
 
   const HostFormatPair& GetHostFormatPair(TextureKey key) const;
+  bool ApplyAndroidDirectFrontbufferFill(uint32_t request_index,
+                                         const TextureKey& key,
+                                         const VulkanTexture& texture);
+  bool DumpAndroidCpuSwapTexture(uint32_t request_index, const TextureKey& key,
+                                 const VulkanTexture& texture,
+                                 uint32_t fetch_swizzle);
 
   void GetTextureUsageMasks(VulkanTexture::Usage usage,
                             VkPipelineStageFlags& stage_mask,

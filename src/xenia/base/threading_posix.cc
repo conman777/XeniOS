@@ -179,7 +179,13 @@ uint32_t current_thread_system_id() {
 }
 
 void MaybeYield() {
+#if XE_PLATFORM_ANDROID
+  // Android can stay hot-spinning on sched_yield under guest contention.
+  const timespec sleep_duration = {0, 50 * 1000};
+  nanosleep(&sleep_duration, nullptr);
+#else
   sched_yield();
+#endif
   __sync_synchronize();
 }
 
@@ -231,7 +237,7 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
 class PosixConditionBase {
  public:
   PosixConditionBase() {
-#if !XE_PLATFORM_APPLE
+#if !XE_PLATFORM_APPLE && !XE_PLATFORM_ANDROID
     // Initialize as robust mutex to handle thread termination gracefully.
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -251,7 +257,7 @@ class PosixConditionBase {
   WaitResult Wait(std::chrono::milliseconds timeout) {
     bool executed;
     auto predicate = [this] { return this->signaled(); };
-#if XE_PLATFORM_APPLE
+#if XE_PLATFORM_APPLE || XE_PLATFORM_ANDROID
     // Standard locking on macOS (no robust mutex support).
     std::unique_lock<std::mutex> lock(mutex_);
 #else
@@ -313,7 +319,7 @@ class PosixConditionBase {
       bool all_locked = true;
 
       for (size_t i = 0; i < handles.size(); ++i) {
-#if XE_PLATFORM_APPLE
+#if XE_PLATFORM_APPLE || XE_PLATFORM_ANDROID
         // macOS: no robust mutex support.
         std::unique_lock<std::mutex> lk(handles[i]->mutex_, std::try_to_lock);
         if (!lk.owns_lock()) {
@@ -789,7 +795,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   }
 
 #if XE_PLATFORM_ANDROID
-  void SetAndroidPreApi26Name(const std::string_view name) {
+  void SetAndroidPreApi26Name(const std::string_view name) const {
     if (android_pthread_getname_np_) {
       return;
     }
@@ -1033,7 +1039,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   // Name accessible via name() on Android before API 26 which added
   // pthread_getname_np.
   mutable std::mutex android_pre_api_26_name_mutex_;
-  char android_pre_api_26_name_[16];
+  mutable char android_pre_api_26_name_[16];
 #endif
 };
 

@@ -144,6 +144,9 @@ def import_vs_environment():
         version = version_map.get(internal_version, VSVERSION_MINIMUM)
         install_path = vswhere[0].get("installationPath", None)
 
+    if not version or not install_path:
+        return None
+
     vsdevcmd_path = os.path.join(install_path, "Common7", "Tools", "VsDevCmd.bat")
     if os.access(vsdevcmd_path, os.X_OK):
         env_tool_args = [vsdevcmd_path, "-arch=amd64", "-host_arch=amd64", "&&", "set"]

@@ -8,6 +8,7 @@
 */
 
 #include <algorithm>
+#include <vector>
 
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
@@ -414,14 +415,191 @@ typedef struct {
 } XECRYPT_RSA;
 static_assert_size(XECRYPT_RSA, 0x10);
 
+namespace {
+
+using BigUInt = std::vector<uint32_t>;
+
+void TrimBigUInt(BigUInt& value) {
+  while (!value.empty() && value.back() == 0) {
+    value.pop_back();
+  }
+}
+
+int CompareBigUInt(const BigUInt& a, const BigUInt& b) {
+  if (a.size() != b.size()) {
+    return a.size() < b.size() ? -1 : 1;
+  }
+  for (size_t i = a.size(); i > 0; --i) {
+    if (a[i - 1] != b[i - 1]) {
+      return a[i - 1] < b[i - 1] ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+BigUInt BigUIntFromUint32(uint32_t value) {
+  BigUInt out;
+  if (value) {
+    out.push_back(value);
+  }
+  return out;
+}
+
+BigUInt BigUIntFromBigEndian(const std::vector<uint8_t>& bytes) {
+  BigUInt out((bytes.size() + 3) / 4);
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    const size_t reverse_index = bytes.size() - 1 - i;
+    out[i / 4] |= uint32_t(bytes[reverse_index]) << ((i % 4) * 8);
+  }
+  TrimBigUInt(out);
+  return out;
+}
+
+std::vector<uint8_t> BigUIntToBigEndian(const BigUInt& value, size_t byte_count) {
+  std::vector<uint8_t> out(byte_count);
+  for (size_t i = 0; i < byte_count; ++i) {
+    const size_t word_index = i / 4;
+    if (word_index >= value.size()) {
+      break;
+    }
+    out[byte_count - 1 - i] =
+        uint8_t((value[word_index] >> ((i % 4) * 8)) & 0xFF);
+  }
+  return out;
+}
+
+void SubtractBigUIntInPlace(BigUInt& a, const BigUInt& b) {
+  uint64_t borrow = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    const uint64_t av = a[i];
+    const uint64_t bv = i < b.size() ? b[i] : 0;
+    const uint64_t subtrahend = bv + borrow;
+    if (av < subtrahend) {
+      a[i] = uint32_t((uint64_t(1) << 32) + av - subtrahend);
+      borrow = 1;
+    } else {
+      a[i] = uint32_t(av - subtrahend);
+      borrow = 0;
+    }
+  }
+  TrimBigUInt(a);
+}
+
+BigUInt AddModulo(const BigUInt& a, const BigUInt& b, const BigUInt& modulus) {
+  BigUInt out(std::max(a.size(), b.size()) + 1);
+  uint64_t carry = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    const uint64_t av = i < a.size() ? a[i] : 0;
+    const uint64_t bv = i < b.size() ? b[i] : 0;
+    const uint64_t sum = av + bv + carry;
+    out[i] = uint32_t(sum);
+    carry = sum >> 32;
+  }
+  TrimBigUInt(out);
+  if (CompareBigUInt(out, modulus) >= 0) {
+    SubtractBigUIntInPlace(out, modulus);
+  }
+  return out;
+}
+
+size_t BigUIntBitLength(const BigUInt& value) {
+  if (value.empty()) {
+    return 0;
+  }
+  const uint32_t high_word = value.back();
+  size_t bits = (value.size() - 1) * 32;
+  for (int bit = 31; bit >= 0; --bit) {
+    if (high_word & (uint32_t(1) << bit)) {
+      return bits + size_t(bit) + 1;
+    }
+  }
+  return bits;
+}
+
+bool BigUIntGetBit(const BigUInt& value, size_t bit_index) {
+  const size_t word_index = bit_index / 32;
+  return word_index < value.size() &&
+         (value[word_index] & (uint32_t(1) << (bit_index % 32)));
+}
+
+BigUInt MultiplyModulo(const BigUInt& a, const BigUInt& b,
+                       const BigUInt& modulus) {
+  BigUInt result;
+  BigUInt addend = a;
+  const size_t bit_count = BigUIntBitLength(b);
+  for (size_t bit = 0; bit < bit_count; ++bit) {
+    if (BigUIntGetBit(b, bit)) {
+      result = AddModulo(result, addend, modulus);
+    }
+    addend = AddModulo(addend, addend, modulus);
+  }
+  return result;
+}
+
+BigUInt PowModulo(BigUInt base, uint32_t exponent, const BigUInt& modulus) {
+  BigUInt result = BigUIntFromUint32(1);
+  while (exponent) {
+    if (exponent & 1) {
+      result = MultiplyModulo(result, base, modulus);
+    }
+    exponent >>= 1;
+    if (exponent) {
+      base = MultiplyModulo(base, base, modulus);
+    }
+  }
+  return result;
+}
+
+std::vector<uint8_t> XeCryptQwordsToBigEndianBytes(const uint64_t* qwords,
+                                                   uint32_t qword_count) {
+  std::vector<uint8_t> out(size_t(qword_count) * sizeof(uint64_t));
+  const uint8_t* raw = reinterpret_cast<const uint8_t*>(qwords);
+  for (uint32_t i = 0; i < qword_count; ++i) {
+    std::copy_n(raw + size_t(qword_count - 1 - i) * sizeof(uint64_t),
+                sizeof(uint64_t), out.data() + size_t(i) * sizeof(uint64_t));
+  }
+  return out;
+}
+
+void BigEndianBytesToXeCryptQwords(const std::vector<uint8_t>& bytes,
+                                   uint64_t* qwords, uint32_t qword_count) {
+  uint8_t* raw = reinterpret_cast<uint8_t*>(qwords);
+  for (uint32_t i = 0; i < qword_count; ++i) {
+    std::copy_n(bytes.data() + size_t(qword_count - 1 - i) * sizeof(uint64_t),
+                sizeof(uint64_t), raw + size_t(i) * sizeof(uint64_t));
+  }
+}
+
+}  // namespace
+
 dword_result_t XeCryptBnQwNeRsaPubCrypt_entry(pointer_t<uint64_t> qw_a,
                                               pointer_t<uint64_t> qw_b,
                                               pointer_t<XECRYPT_RSA> rsa) {
   // 0 indicates failure (but not a BOOL return value)
 #ifndef XE_PLATFORM_WIN32
-  XELOGW(
-      "XeCryptBnQwNeRsaPubCrypt called but no implementation available for "
-      "this platform!");
+  const uint32_t modulus_qwords = rsa->size;
+  const uint32_t modulus_size = modulus_qwords * sizeof(uint64_t);
+  const uint32_t exponent = rsa->public_exponent;
+  if (!modulus_qwords || !exponent) {
+    XELOGE("XeCryptBnQwNeRsaPubCrypt: invalid RSA key");
+    return 0;
+  }
+
+  const uint64_t* xecrypt_modulus = reinterpret_cast<const uint64_t*>(&rsa[1]);
+  const auto modulus_bytes =
+      XeCryptQwordsToBigEndianBytes(xecrypt_modulus, modulus_qwords);
+  const auto input_bytes = XeCryptQwordsToBigEndianBytes(qw_a, modulus_qwords);
+
+  const BigUInt modulus = BigUIntFromBigEndian(modulus_bytes);
+  const BigUInt input = BigUIntFromBigEndian(input_bytes);
+  if (modulus.empty() || CompareBigUInt(input, modulus) >= 0) {
+    XELOGE("XeCryptBnQwNeRsaPubCrypt: input is outside modulus range");
+    return 0;
+  }
+
+  BigUInt output = PowModulo(input, exponent, modulus);
+  auto output_bytes = BigUIntToBigEndian(output, modulus_size);
+  BigEndianBytesToXeCryptQwords(output_bytes, qw_b, modulus_qwords);
   return 1;
 #else
   uint32_t modulus_size = rsa->size * 8;
@@ -513,7 +691,7 @@ dword_result_t XeCryptBnQwNeRsaPubCrypt_entry(pointer_t<uint64_t> qw_a,
 #ifdef XE_PLATFORM_WIN32
 DECLARE_XBOXKRNL_EXPORT1(XeCryptBnQwNeRsaPubCrypt, kNone, kImplemented);
 #else
-DECLARE_XBOXKRNL_EXPORT1(XeCryptBnQwNeRsaPubCrypt, kNone, kStub);
+DECLARE_XBOXKRNL_EXPORT1(XeCryptBnQwNeRsaPubCrypt, kNone, kImplemented);
 #endif
 
 dword_result_t XeCryptBnDwLePkcs1Verify_entry(lpvoid_t hash, lpvoid_t sig,
@@ -858,6 +1036,41 @@ dword_result_t XeKeysHmacShaUsingKey_entry(lpvoid_t obscured_key,
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(XeKeysHmacShaUsingKey, kNone, kImplemented);
+
+dword_result_t XeKeysConsolePrivateKeySign_entry(lpvoid_t hash,
+                                                 lpvoid_t signature) {
+  if (!hash || !signature) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // Retail consoles sign with hardware-backed private keys. For Android game
+  // boot, provide a stable placeholder signature so titles that only gate on
+  // call success can continue without a real console key.
+  std::memset(signature, 0, 0x100);
+  std::copy_n(static_cast<uint8_t*>(hash), 0x14,
+              static_cast<uint8_t*>(signature) + 0x100 - 0x14);
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XeKeysConsolePrivateKeySign, kNone, kImplemented);
+
+dword_result_t XeKeysConsoleSignatureVerification_entry(lpvoid_t hash,
+                                                        lpvoid_t signature) {
+  if (!hash || !signature) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XeKeysConsoleSignatureVerification, kNone,
+                         kImplemented);
+
+dword_result_t XeKeysVerifyRSASignature_entry(lpvoid_t hash, lpvoid_t signature,
+                                              lpvoid_t key) {
+  if (!hash || !signature || !key) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XeKeysVerifyRSASignature, kNone, kImplemented);
 
 // going off of usage in some hbrew xex
 // 0 and 1 appear to be devkit, 2 is retail

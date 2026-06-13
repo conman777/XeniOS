@@ -237,8 +237,11 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   frame_limiter_worker_thread_->set_can_debugger_suspend(true);
   frame_limiter_worker_thread_->set_name("GPU Frame limiter");
   frame_limiter_worker_thread_->Create();
+  // This thread drives vblank timing AND executes the guest vblank ISR; at
+  // kLowest it gets starved on loaded mobile CPUs, stretching the vblank
+  // period and quantizing the guest frame rate down the 60Hz ladder.
   frame_limiter_worker_thread_->thread()->set_priority(
-      threading::ThreadPriority::kLowest);
+      threading::ThreadPriority::kNormal);
   if (cvars::trace_gpu_stream) {
     BeginTracing();
   }

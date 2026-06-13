@@ -16,6 +16,9 @@
 #if XE_PLATFORM_APPLE
 #include <sys/mman.h>
 #endif
+#if XE_PLATFORM_ANDROID
+#include <android/log.h>
+#endif
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
@@ -42,6 +45,12 @@ DEFINE_int32(scribble_heap_value, 0,
              "Value used to fill all allocated heap memory. 0 - Random value. "
              "Valid range: [1-255]",
              "Memory");
+#if XE_PLATFORM_ANDROID
+DEFINE_bool(halo_android_disable_high_4k_physical_routing, false,
+            "Disable the Android workaround that routes small 4 KB physical "
+            "allocations to high physical memory.",
+            "Android");
+#endif
 namespace xe {
 uint32_t get_page_count(uint32_t value, uint32_t page_size) {
   return xe::round_up(value, page_size) / page_size;
@@ -250,8 +259,12 @@ bool Memory::Initialize() {
       kMemoryAllocationReserve | kMemoryAllocationCommit,
       !cvars::protect_zero ? kMemoryProtectRead | kMemoryProtectWrite
                            : kMemoryProtectNoAccess);
+#if XE_PLATFORM_ANDROID
+  XELOGI("Android: not reserving final 64KB of physical memory");
+#else
   heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000,
                              kMemoryAllocationReserve, kMemoryProtectNoAccess);
+#endif
 
   // GPU writeback.
   // 0xC... is physical, 0x7F... is virtual. We may need to overlay these.
@@ -281,9 +294,16 @@ bool Memory::Initialize() {
   }
 
   // ?
+  // Android titles such as Halo: Reach request a near-full physical heap block
+  // during startup. Keeping this unclear reservation on Android fragments the
+  // top of the 512 MB physical range enough to make those allocations fail.
+#if XE_PLATFORM_ANDROID
+  XELOGI("Android: skipping unknown 0x340000 physical reservation");
+#else
   uint32_t unk_phys_alloc;
   heaps_.vA0000000.Alloc(0x340000, 64 * 1024, kMemoryAllocationReserve,
                          kMemoryProtectNoAccess, true, &unk_phys_alloc);
+#endif
 
   uint32_t unknown_xex_range;  // Probably hypervisor?
   heaps_.v80000000.Alloc(0x40000, 4 * 1024, kMemoryAllocationCommit,
@@ -1021,6 +1041,25 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
                           uint32_t protect) {
   alignment = xe::round_up(alignment, page_size_);
   size = xe::align(size, alignment);
+  if (heap_type_ == HeapType::kGuestPhysical && heap_base_ == 0x0 &&
+      base_address < 0x01100000) {
+    XELOGI(
+        "BaseHeap::AllocFixed low physical: base=0x{:08X} size=0x{:08X} "
+        "alignment=0x{:08X} allocation_type=0x{:08X} protect=0x{:08X} "
+        "page_size=0x{:08X}",
+        base_address, size, alignment, allocation_type, protect, page_size_);
+  }
+#if XE_PLATFORM_ANDROID
+  if (base_address % alignment != 0) {
+    __android_log_print(
+        ANDROID_LOG_ERROR, "xenia",
+        "BaseHeap::AllocFixed unaligned: heap_type=%u heap_base=0x%08X "
+        "heap_size=0x%08X page_size=0x%08X base=0x%08X size=0x%08X "
+        "alignment=0x%08X allocation_type=0x%08X protect=0x%08X",
+        static_cast<uint32_t>(heap_type_), heap_base_, heap_size_, page_size_,
+        base_address, size, alignment, allocation_type, protect);
+  }
+#endif
   assert_true(base_address % alignment == 0);
   uint32_t page_count = get_page_count(size, page_size_);
   uint32_t start_page_number = (base_address - heap_base_) / page_size_;
@@ -1119,8 +1158,7 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   alignment = xe::round_up(alignment, page_size_);
   uint32_t page_count = get_page_count(size, page_size_);
   low_address = std::max(heap_base_, xe::align(low_address, alignment));
-  high_address = std::min(heap_base_ + (heap_size_ - 1),
-                          xe::align(high_address, alignment));
+  high_address = std::min(heap_base_ + (heap_size_ - 1), high_address);
 
   uint32_t low_page_number = (low_address - heap_base_) >> page_size_shift_;
   uint32_t high_page_number = (high_address - heap_base_) >> page_size_shift_;
@@ -1128,7 +1166,11 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   high_page_number =
       std::min(uint32_t(page_table_.size()) - 1, high_page_number);
 
-  if (page_count > (high_page_number - low_page_number)) {
+  const uint32_t available_page_count =
+      high_page_number >= low_page_number
+          ? (high_page_number - low_page_number + 1)
+          : 0;
+  if (page_count > available_page_count) {
     XELOGE("BaseHeap::Alloc page count too big for requested range");
     return false;
   }
@@ -1143,11 +1185,12 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   uint32_t end_page_number = UINT_MAX;
   // chrispy:todo, page_scan_stride is probably always a power of two...
   uint32_t page_scan_stride = alignment >> page_size_shift_;
-  high_page_number =
-      high_page_number - QuickMod(high_page_number, page_scan_stride);
   if (top_down) {
-    for (int64_t base_page_number =
-             high_page_number - xe::round_up(page_count, page_scan_stride);
+    int64_t base_page_number =
+        int64_t(high_page_number) + 1 - page_count;
+    base_page_number -=
+        QuickMod(uint32_t(base_page_number), page_scan_stride);
+    for (;
          base_page_number >= low_page_number;
          base_page_number -= page_scan_stride) {
       if (page_table_[base_page_number].state != 0) {
@@ -1187,7 +1230,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
     }
   } else {
     for (uint32_t base_page_number = low_page_number;
-         base_page_number <= high_page_number - page_count;
+         base_page_number <= high_page_number &&
+         page_count <= high_page_number - base_page_number + 1;
          base_page_number += page_scan_stride) {
       if (page_table_[base_page_number].state != 0) {
         // Base page not free, skip to next usable page.
@@ -1220,6 +1264,41 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
     // Out of memory.
     XELOGE("BaseHeap::Alloc failed to find contiguous range");
+    if (size >= 0x10000000) {
+      XELOGE(
+          "BaseHeap::Alloc range detail: heap={} base=0x{:08X} size=0x{:08X} "
+          "request=0x{:08X} alignment=0x{:08X} low=0x{:08X} high=0x{:08X} "
+          "low_page=0x{:X} high_page=0x{:X} page_count=0x{:X} "
+          "stride=0x{:X} top_down={}",
+          static_cast<int>(heap_type_), heap_base_, heap_size_, size,
+          alignment, low_address, high_address, low_page_number,
+          high_page_number, page_count, page_scan_stride, top_down);
+      uint32_t logged_ranges = 0;
+      for (uint32_t page_number = low_page_number;
+           page_number <= high_page_number && logged_ranges < 8;) {
+        const auto& page_entry = page_table_[page_number];
+        if (page_entry.state == 0) {
+          ++page_number;
+          continue;
+        }
+        const uint32_t range_start = page_number;
+        const uint32_t state = page_entry.state;
+        const uint32_t protect = page_entry.current_protect;
+        while (page_number <= high_page_number &&
+               page_table_[page_number].state == state &&
+               page_table_[page_number].current_protect == protect) {
+          ++page_number;
+        }
+        XELOGE(
+            "BaseHeap::Alloc occupied range: pages=0x{:X}-0x{:X} "
+            "addr=0x{:08X}-0x{:08X} state=0x{:X} protect=0x{:X}",
+            range_start, page_number - 1,
+            heap_base_ + (range_start << page_size_shift_),
+            heap_base_ + ((page_number << page_size_shift_) - 1), state,
+            protect);
+        ++logged_ranges;
+      }
+    }
     // assert_always("Heap exhausted!");
     return false;
   }
@@ -1262,6 +1341,15 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   }
 
   *out_address = heap_base_ + (start_page_number << page_size_shift_);
+  if (heap_type_ == HeapType::kGuestPhysical && heap_base_ == 0x0 &&
+      *out_address < 0x01100000) {
+    XELOGI(
+        "BaseHeap::AllocRange low physical: address=0x{:08X} size=0x{:08X} "
+        "alignment=0x{:08X} allocation_type=0x{:08X} protect=0x{:08X} "
+        "low=0x{:08X} high=0x{:08X} page_size=0x{:08X}",
+        *out_address, size, alignment, allocation_type, protect, low_address,
+        high_address, page_size_);
+  }
   return true;
 }
 
@@ -1711,15 +1799,51 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment,
   // Allocate from parent heap (gets our physical address in 0-512mb).
   uint32_t parent_heap_start = GetPhysicalAddress(heap_base_);
   uint32_t parent_heap_end = GetPhysicalAddress(heap_base_ + (heap_size_ - 1));
+  uint32_t parent_range_low = parent_heap_start;
+  bool try_high_4k_physical = false;
+#if XE_PLATFORM_ANDROID
+  // Halo: Reach needs almost the full 64 KB physical heap range for mainmenu.
+  // Keep small default 4 KB physical allocations out of that low contiguous
+  // window so they don't fragment the later large-map allocation.
+  if (!cvars::halo_android_disable_high_4k_physical_routing &&
+      heap_base_ >= 0xE0000000 && page_size_ == 0x1000 &&
+      size <= 0x10000 && alignment <= 0x10000 &&
+      parent_heap_start <= 0x00010000 &&
+      parent_heap_end >= 0x1FD00FFF) {
+    XELOGI(
+        "Android: routing small 4K physical alloc high: size=0x{:08X} "
+        "alignment=0x{:08X} parent_low=0x{:08X}->0x1FC00000 "
+        "parent_high=0x{:08X}",
+        size, alignment, parent_heap_start, parent_heap_end);
+    parent_range_low = 0x1FC00000;
+    try_high_4k_physical = true;
+  }
+#endif
   uint32_t parent_address;
-  if (!parent_heap_->AllocRange(parent_heap_start, parent_heap_end, size,
+  if (!parent_heap_->AllocRange(parent_range_low, parent_heap_end, size,
                                 alignment, allocation_type, protect, top_down,
                                 &parent_address)) {
+#if XE_PLATFORM_ANDROID
+    if (try_high_4k_physical) {
+      XELOGW(
+          "Android: high 4K physical alloc route failed, retrying full range: "
+          "size=0x{:08X} alignment=0x{:08X}",
+          size, alignment);
+      if (parent_heap_->AllocRange(parent_heap_start, parent_heap_end, size,
+                                   alignment, allocation_type, protect,
+                                   top_down, &parent_address)) {
+        goto physical_alloc_parent_succeeded;
+      }
+    }
+#endif
     XELOGE(
         "PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
     return false;
   }
 
+#if XE_PLATFORM_ANDROID
+physical_alloc_parent_succeeded:
+#endif
   // Given the address we've reserved in the parent heap, pin that here.
   // Shouldn't be possible for it to be allocated already.
   uint32_t address = heap_base_ + parent_address - parent_heap_start;
@@ -1787,19 +1911,65 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   high_address = std::min(heap_base_ + (heap_size_ - 1), high_address);
   uint32_t parent_low_address = GetPhysicalAddress(low_address);
   uint32_t parent_high_address = GetPhysicalAddress(high_address);
+  uint32_t original_parent_low_address = parent_low_address;
+  bool try_high_4k_physical = false;
+#if XE_PLATFORM_ANDROID
+  // Halo: Reach requests a near-full 64 KB physical block while loading
+  // d:\maps\mainmenu. The 4 KB alias heap can otherwise consume a few pages at
+  // 0x01000000 first, which fragments that request. For only small, broad-range
+  // Android 4 KB physical allocations, use the high alias-only area instead.
+  if (!cvars::halo_android_disable_high_4k_physical_routing &&
+      heap_base_ >= 0xE0000000 && page_size_ == 0x1000 &&
+      size <= 0x10000 && alignment <= 0x10000 &&
+      parent_low_address <= 0x00010000 &&
+      parent_high_address >= 0x1FD00FFF) {
+    XELOGI(
+        "Android: routing small 4K physical range high: size=0x{:08X} "
+        "alignment=0x{:08X} parent_low=0x{:08X}->0x1FC00000 "
+        "parent_high=0x{:08X}",
+        size, alignment, parent_low_address, parent_high_address);
+    parent_low_address = 0x1FC00000;
+    try_high_4k_physical = true;
+  }
+#endif
   uint32_t parent_address;
   if (!parent_heap_->AllocRange(parent_low_address, parent_high_address, size,
                                 alignment, allocation_type, protect, top_down,
                                 &parent_address)) {
+#if XE_PLATFORM_ANDROID
+    if (try_high_4k_physical) {
+      XELOGW(
+          "Android: high 4K physical range route failed, retrying full range: "
+          "size=0x{:08X} alignment=0x{:08X}",
+          size, alignment);
+      if (parent_heap_->AllocRange(original_parent_low_address,
+                                   parent_high_address, size, alignment,
+                                   allocation_type, protect, top_down,
+                                   &parent_address)) {
+        goto physical_alloc_range_parent_succeeded;
+      }
+    }
+#endif
     XELOGE(
         "PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
     return false;
   }
 
+#if XE_PLATFORM_ANDROID
+physical_alloc_range_parent_succeeded:
+#endif
   // Given the address we've reserved in the parent heap, pin that here.
   // Shouldn't be possible for it to be allocated already.
   uint32_t address =
       heap_base_ + parent_address - GetPhysicalAddress(heap_base_);
+  if (size >= 0x10000000) {
+    XELOGI(
+        "PhysicalHeap::AllocRange pin: heap_base=0x{:08X} parent=0x{:08X} "
+        "address=0x{:08X} size=0x{:08X} alignment=0x{:08X} "
+        "allocation_type=0x{:08X} protect=0x{:08X}",
+        heap_base_, parent_address, address, size, alignment, allocation_type,
+        protect);
+  }
   if (!BaseHeap::AllocFixed(address, size, alignment, allocation_type,
                             protect)) {
     XELOGE(

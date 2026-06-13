@@ -32,7 +32,12 @@ DEFINE_bool(guest_display_refresh_cap, true,
             "GPU");
 
 DEFINE_uint64(
-    framerate_limit, 0,
+    framerate_limit,
+#if XE_PLATFORM_ANDROID
+    30,
+#else
+    0,
+#endif
     "Host frame rate limit in FPS. 0 = unlimited.\n"
     "Throttles presentation without affecting guest vblank timing.\n"
     "Guest vblanks are controlled by use_50Hz_mode (50Hz PAL, 60Hz NTSC).",
@@ -227,7 +232,12 @@ DEFINE_bool(no_discard_stencil_in_transfer_pipelines, false,
             "GPU");
 
 DEFINE_bool(
-    async_shader_compilation, true,
+    async_shader_compilation,
+#if XE_PLATFORM_ANDROID
+    false,
+#else
+    true,
+#endif
     "Compile shaders and create pipelines asynchronously in background "
     "threads. "
     "Eliminates shader compilation stutter but may cause brief rendering "

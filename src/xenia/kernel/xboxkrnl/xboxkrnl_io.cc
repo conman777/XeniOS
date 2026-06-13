@@ -7,7 +7,15 @@
  ******************************************************************************
  */
 
+#include <algorithm>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/utf8.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -20,9 +28,151 @@
 #include "xenia/vfs/device.h"
 #include "xenia/xbox.h"
 
+DECLARE_bool(halo_android_diagnostics);
+DECLARE_bool(halo_android_io_verbose);
+DECLARE_uint32(halo_android_io_summary_ms);
+
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
+
+namespace {
+
+bool ShouldLogHaloIoPath(std::string_view path) {
+  return xe::utf8::find_first_of_case(path, "maps") != std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "mainmenu") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "bink") != std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "cache") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "webcache") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "harddisk") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "partition") !=
+         std::string_view::npos;
+}
+
+struct HaloIoStats {
+  uint64_t reads = 0;
+  uint64_t read_bytes = 0;
+  uint64_t writes = 0;
+  uint64_t write_bytes = 0;
+  uint64_t read_failures = 0;
+  uint64_t write_failures = 0;
+  uint64_t short_reads = 0;
+  uint64_t zero_reads = 0;
+  uint64_t max_read_end = 0;
+  uint64_t last_read_offset = 0;
+  uint64_t last_write_offset = 0;
+  uint32_t last_read_request = 0;
+  uint32_t last_write_request = 0;
+  uint32_t last_read_status = 0;
+  uint32_t last_write_status = 0;
+  uint32_t last_emit_ms = 0;
+  uint64_t emitted_reads = 0;
+  uint64_t emitted_writes = 0;
+  uint64_t emitted_read_bytes = 0;
+  uint64_t emitted_write_bytes = 0;
+};
+
+std::mutex& HaloIoStatsMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, HaloIoStats>& HaloIoStatsByPath() {
+  static std::unordered_map<std::string, HaloIoStats> stats;
+  return stats;
+}
+
+uint32_t HaloIoSummaryIntervalMs() {
+  return cvars::halo_android_io_summary_ms ? cvars::halo_android_io_summary_ms
+                                           : 5000;
+}
+
+void MaybeLogHaloIoSummaryLocked(std::string_view path, HaloIoStats& stats,
+                                 uint32_t uptime_ms) {
+  if (!stats.last_emit_ms) {
+    stats.last_emit_ms = uptime_ms;
+    return;
+  }
+  if (uptime_ms - stats.last_emit_ms < HaloIoSummaryIntervalMs()) {
+    return;
+  }
+
+  XELOGI(
+      "HaloReach IOSummary path='{}' dt_ms={} reads={} (+{}) "
+      "read_bytes=0x{:X} (+0x{:X}) writes={} (+{}) "
+      "write_bytes=0x{:X} (+0x{:X}) read_fail={} write_fail={} "
+      "short_reads={} zero_reads={} max_read_end=0x{:X} "
+      "last_read=0x{:X}/0x{:X}/0x{:08X} "
+      "last_write=0x{:X}/0x{:X}/0x{:08X}",
+      path, uptime_ms - stats.last_emit_ms, stats.reads,
+      stats.reads - stats.emitted_reads, stats.read_bytes,
+      stats.read_bytes - stats.emitted_read_bytes, stats.writes,
+      stats.writes - stats.emitted_writes, stats.write_bytes,
+      stats.write_bytes - stats.emitted_write_bytes, stats.read_failures,
+      stats.write_failures, stats.short_reads, stats.zero_reads,
+      stats.max_read_end, stats.last_read_offset, stats.last_read_request,
+      stats.last_read_status, stats.last_write_offset,
+      stats.last_write_request, stats.last_write_status);
+
+  stats.last_emit_ms = uptime_ms;
+  stats.emitted_reads = stats.reads;
+  stats.emitted_writes = stats.writes;
+  stats.emitted_read_bytes = stats.read_bytes;
+  stats.emitted_write_bytes = stats.write_bytes;
+}
+
+void TrackHaloRead(std::string_view path, X_STATUS result, uint64_t offset,
+                   uint32_t request, uint32_t bytes_read) {
+  if (!cvars::halo_android_diagnostics || !ShouldLogHaloIoPath(path)) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(HaloIoStatsMutex());
+  auto& stats = HaloIoStatsByPath()[std::string(path)];
+  ++stats.reads;
+  stats.read_bytes += bytes_read;
+  stats.last_read_offset = offset;
+  stats.last_read_request = request;
+  stats.last_read_status = static_cast<uint32_t>(result);
+  if (XFAILED(result)) {
+    ++stats.read_failures;
+  }
+  if (bytes_read == 0) {
+    ++stats.zero_reads;
+  }
+  if (bytes_read < request) {
+    ++stats.short_reads;
+  }
+  if (offset != uint64_t(-1)) {
+    stats.max_read_end = std::max(stats.max_read_end, offset + bytes_read);
+  }
+  MaybeLogHaloIoSummaryLocked(path, stats, Clock::QueryGuestUptimeMillis());
+}
+
+void TrackHaloWrite(std::string_view path, X_STATUS result, uint64_t offset,
+                    uint32_t request, uint32_t bytes_written) {
+  if (!cvars::halo_android_diagnostics || !ShouldLogHaloIoPath(path)) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(HaloIoStatsMutex());
+  auto& stats = HaloIoStatsByPath()[std::string(path)];
+  ++stats.writes;
+  stats.write_bytes += bytes_written;
+  stats.last_write_offset = offset;
+  stats.last_write_request = request;
+  stats.last_write_status = static_cast<uint32_t>(result);
+  if (XFAILED(result)) {
+    ++stats.write_failures;
+  }
+  MaybeLogHaloIoSummaryLocked(path, stats, Clock::QueryGuestUptimeMillis());
+}
+
+}  // namespace
 
 struct CreateOptions {
   // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
@@ -78,8 +228,8 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   }
 
   // Attempt open (or create).
-  vfs::File* vfs_file;
-  vfs::FileAction file_action;
+  vfs::File* vfs_file = nullptr;
+  vfs::FileAction file_action = vfs::FileAction::kDoesNotExist;
   X_STATUS result = kernel_state()->file_system()->OpenFile(
       root_entry, target_path,
       vfs::FileDisposition((uint32_t)creation_disposition), desired_access,
@@ -106,6 +256,22 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   }
 
   *handle_out = handle;
+
+  if (ShouldLogHaloIoPath(target_path) ||
+      (vfs_file && ShouldLogHaloIoPath(vfs_file->entry()->absolute_path()))) {
+    XELOGI(
+        "HaloReach NtCreateFile path='{}' result=0x{:08X} handle=0x{:08X} "
+        "action={} entry='{}' size=0x{:X} attrs=0x{:08X} access=0x{:08X} "
+        "options=0x{:08X} disposition={}",
+        target_path, static_cast<uint32_t>(result), handle,
+        static_cast<uint32_t>(file_action),
+        vfs_file ? vfs_file->entry()->absolute_path() : "",
+        vfs_file ? vfs_file->entry()->size() : 0,
+        vfs_file ? vfs_file->entry()->attributes() : 0,
+        static_cast<uint32_t>(desired_access),
+        static_cast<uint32_t>(create_options),
+        static_cast<uint32_t>(creation_disposition));
+  }
 
   return result;
 }
@@ -144,10 +310,33 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;
+      const bool has_byte_offset = byte_offset_ptr;
+      const uint64_t requested_offset =
+          has_byte_offset ? static_cast<uint64_t>(*byte_offset_ptr)
+                          : uint64_t(-1);
+      const uint64_t position_before = file->position();
       result = file->Read(
-          buffer.guest_address(), buffer_length,
-          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-          &bytes_read, apc_context);
+          buffer.guest_address(), buffer_length, requested_offset, &bytes_read,
+          apc_context);
+      const uint64_t position_after = file->position();
+      const auto file_path = file ? file->entry()->absolute_path() : "";
+      if (file) {
+        TrackHaloRead(file_path, result, requested_offset,
+                      static_cast<uint32_t>(buffer_length), bytes_read);
+      }
+      if (file && ShouldLogHaloIoPath(file_path) &&
+          (cvars::halo_android_io_verbose || XFAILED(result) ||
+           bytes_read == 0 ||
+           bytes_read < static_cast<uint32_t>(buffer_length))) {
+        XELOGI(
+            "HaloReach NtReadFile path='{}' result=0x{:08X} "
+            "has_offset={} offset=0x{:X} buffer=0x{:08X} request=0x{:X} "
+            "bytes=0x{:X} pos=0x{:X}->0x{:X} size=0x{:X}",
+            file->entry()->absolute_path(), static_cast<uint32_t>(result),
+            has_byte_offset, requested_offset, buffer.guest_address(),
+            static_cast<uint32_t>(buffer_length), bytes_read, position_before,
+            position_after, file->entry()->size());
+      }
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
@@ -227,10 +416,30 @@ dword_result_t NtReadFileScatter_entry(
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;
+      const bool has_byte_offset = byte_offset_ptr;
+      const uint64_t requested_offset =
+          has_byte_offset ? static_cast<uint64_t>(*byte_offset_ptr)
+                          : uint64_t(-1);
+      const uint64_t position_before = file->position();
       result = file->ReadScatter(
-          segment_array.guest_address(), length,
-          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-          &bytes_read, apc_context);
+          segment_array.guest_address(), length, requested_offset, &bytes_read,
+          apc_context);
+      const uint64_t position_after = file->position();
+      if (file) {
+        TrackHaloRead(file->entry()->absolute_path(), result, requested_offset,
+                      static_cast<uint32_t>(length), bytes_read);
+      }
+      if (file && ShouldLogHaloIoPath(file->entry()->absolute_path()) &&
+          (cvars::halo_android_io_verbose || XFAILED(result) ||
+           bytes_read == 0 || bytes_read < static_cast<uint32_t>(length))) {
+        XELOGI(
+            "HaloReach NtReadFileScatter path='{}' result=0x{:08X} "
+            "has_offset={} offset=0x{:X} length=0x{:X} bytes=0x{:X} "
+            "pos=0x{:X}->0x{:X} size=0x{:X}",
+            file->entry()->absolute_path(), static_cast<uint32_t>(result),
+            has_byte_offset, requested_offset, static_cast<uint32_t>(length),
+            bytes_read, position_before, position_after, file->entry()->size());
+      }
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
@@ -318,10 +527,31 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
     if (true || file->is_synchronous()) {
       // Synchronous request.
       uint32_t bytes_written = 0;
+      const bool has_byte_offset = byte_offset_ptr;
+      const uint64_t requested_offset =
+          has_byte_offset ? static_cast<uint64_t>(*byte_offset_ptr)
+                          : uint64_t(-1);
+      const uint64_t position_before = file->position();
       result = file->Write(
-          buffer.guest_address(), buffer_length,
-          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
+          buffer.guest_address(), buffer_length, requested_offset,
           &bytes_written, apc_context);
+      const uint64_t position_after = file->position();
+      if (file) {
+        TrackHaloWrite(file->entry()->absolute_path(), result, requested_offset,
+                       static_cast<uint32_t>(buffer_length), bytes_written);
+      }
+      if (file && ShouldLogHaloIoPath(file->entry()->absolute_path()) &&
+          (cvars::halo_android_io_verbose || XFAILED(result) ||
+           bytes_written < static_cast<uint32_t>(buffer_length))) {
+        XELOGI(
+            "HaloReach NtWriteFile path='{}' result=0x{:08X} "
+            "has_offset={} offset=0x{:X} buffer=0x{:08X} request=0x{:X} "
+            "bytes=0x{:X} pos=0x{:X}->0x{:X} size=0x{:X}",
+            file->entry()->absolute_path(), static_cast<uint32_t>(result),
+            has_byte_offset, requested_offset, buffer.guest_address(),
+            static_cast<uint32_t>(buffer_length), bytes_written,
+            position_before, position_after, file->entry()->size());
+      }
 
       if (io_status_block) {
         io_status_block->status = result;
@@ -469,6 +699,14 @@ dword_result_t NtQueryFullAttributesFile_entry(
   // Resolve the file using the virtual file system.
   auto entry = kernel_state()->file_system()->ResolvePath(target_path);
   if (entry) {
+    if (ShouldLogHaloIoPath(target_path) ||
+        ShouldLogHaloIoPath(entry->absolute_path())) {
+      XELOGI(
+          "HaloReach NtQueryFullAttributesFile path='{}' -> entry='{}' "
+          "size=0x{:X} attrs=0x{:08X}",
+          target_path, entry->absolute_path(), entry->size(),
+          entry->attributes());
+    }
     // Found.
     file_info->creation_time = entry->create_timestamp();
     file_info->last_access_time = entry->access_timestamp();
@@ -481,6 +719,10 @@ dword_result_t NtQueryFullAttributesFile_entry(
     return X_STATUS_SUCCESS;
   }
 
+  if (ShouldLogHaloIoPath(target_path)) {
+    XELOGI("HaloReach NtQueryFullAttributesFile path='{}' -> not found",
+           target_path);
+  }
   return X_STATUS_NO_SUCH_FILE;
 }
 DECLARE_XBOXKRNL_EXPORT1(NtQueryFullAttributesFile, kFileSystem, kImplemented);
@@ -512,8 +754,23 @@ dword_result_t NtQueryDirectoryFile_entry(
     if (XSUCCEEDED(result)) {
       info = length;
     }
+    if (ShouldLogHaloIoPath(name) ||
+        ShouldLogHaloIoPath(file->entry()->absolute_path())) {
+      XELOGI(
+          "HaloReach NtQueryDirectoryFile dir='{}' pattern='{}' "
+          "restart={} result=0x{:08X} info=0x{:X}",
+          file->entry()->absolute_path(), name,
+          static_cast<uint32_t>(restart_scan),
+          static_cast<uint32_t>(result), info);
+    }
   } else {
     result = X_STATUS_NO_SUCH_FILE;
+    if (ShouldLogHaloIoPath(name)) {
+      XELOGI(
+          "HaloReach NtQueryDirectoryFile missing handle pattern='{}' "
+          "result=0x{:08X}",
+          name, static_cast<uint32_t>(result));
+    }
   }
 
   if (XFAILED(result)) {
@@ -619,6 +876,19 @@ dword_result_t NtDeviceIoControlFile_entry(
     dword_t apc_context, pointer_t<X_IO_STATUS_BLOCK> io_status_block,
     dword_t io_control_code, lpvoid_t input_buffer, dword_t input_buffer_len,
     lpvoid_t output_buffer, dword_t output_buffer_len) {
+  auto file = kernel_state()->object_table()->LookupObject<XFile>(handle);
+  auto log_result = [&](X_STATUS status) {
+    if (file && ShouldLogHaloIoPath(file->entry()->absolute_path())) {
+      XELOGI(
+          "HaloReach NtDeviceIoControlFile path='{}' ioctl=0x{:08X} "
+          "result=0x{:08X} in=0x{:X} out=0x{:X}",
+          file->entry()->absolute_path(), static_cast<uint32_t>(io_control_code),
+          static_cast<uint32_t>(status), static_cast<uint32_t>(input_buffer_len),
+          static_cast<uint32_t>(output_buffer_len));
+    }
+    return status;
+  };
+
   // Called by XMountUtilityDrive cache-mounting code
   // (checks if the returned values look valid, values below seem to pass the
   // checks)
@@ -627,14 +897,14 @@ dword_result_t NtDeviceIoControlFile_entry(
   if (io_control_code == X_IOCTL_DISK_GET_DRIVE_GEOMETRY) {
     if (output_buffer_len < 0x8) {
       assert_always();
-      return X_STATUS_BUFFER_TOO_SMALL;
+      return log_result(X_STATUS_BUFFER_TOO_SMALL);
     }
     xe::store_and_swap<uint32_t>(output_buffer, cache_size / 512);
     xe::store_and_swap<uint32_t>(output_buffer + 4, 512);
   } else if (io_control_code == X_IOCTL_DISK_GET_PARTITION_INFO) {
     if (output_buffer_len < 0x10) {
       assert_always();
-      return X_STATUS_BUFFER_TOO_SMALL;
+      return log_result(X_STATUS_BUFFER_TOO_SMALL);
     }
     xe::store_and_swap<uint64_t>(output_buffer, 0);
     xe::store_and_swap<uint64_t>(output_buffer + 8, cache_size);
@@ -642,10 +912,10 @@ dword_result_t NtDeviceIoControlFile_entry(
     XELOGD("NtDeviceIoControlFile(0x{:X}) - unhandled IOCTL!",
            uint32_t(io_control_code));
     assert_always();
-    return X_STATUS_INVALID_PARAMETER;
+    return log_result(X_STATUS_INVALID_PARAMETER);
   }
 
-  return X_STATUS_SUCCESS;
+  return log_result(X_STATUS_SUCCESS);
 }
 DECLARE_XBOXKRNL_EXPORT1(NtDeviceIoControlFile, kFileSystem, kStub);
 // device_extension_size = additional bytes of data (aligned up to 8 byte
@@ -731,6 +1001,22 @@ void IoDeleteDevice_entry(dword_t device_ptr, const ppc_context_t& ctx) {
 }
 
 DECLARE_XBOXKRNL_EXPORT1(IoDeleteDevice, kFileSystem, kStub);
+
+dword_result_t IoDismountVolume_entry(dword_t device_object) {
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolume, kFileSystem, kStub);
+
+dword_result_t IoDismountVolumeByFileHandle_entry(dword_t file_handle) {
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolumeByFileHandle, kFileSystem, kStub);
+
+dword_result_t IoDismountVolumeByName_entry(
+    pointer_t<X_ANSI_STRING> device_name) {
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolumeByName, kFileSystem, kStub);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

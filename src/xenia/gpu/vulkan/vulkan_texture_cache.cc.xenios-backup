@@ -12,12 +12,10 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <utility>
-#include <vector>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -29,64 +27,15 @@
 #include "xenia/gpu/texture_util.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
-#if XE_PLATFORM_ANDROID
-#include "xenia/gpu/vulkan/android_halo_experiment.h"
-#endif
 #include "xenia/ui/vulkan/ui_samplers.h"
 #include "xenia/ui/vulkan/vulkan_mem_alloc.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
 DECLARE_bool(tiled_shared_memory);
 
-DEFINE_bool(halo_android_diag_direct_fb_fill_linear, false,
-            "Fill the Android Halo swap texture guest range as linear 32bpp "
-            "before texture-cache upload.",
-            "Android");
-DEFINE_bool(halo_android_diag_direct_fb_fill_tiled, false,
-            "Fill the Android Halo swap texture guest range as tiled 32bpp "
-            "before texture-cache upload.",
-            "Android");
-DEFINE_bool(halo_android_diag_linear_to_tiled_frontbuffer, false,
-            "Rewrite the Android Halo swap texture guest range from linear "
-            "32bpp to tiled 32bpp before texture-cache upload.",
-            "Android");
-DEFINE_bool(halo_android_diag_force_null_textures, false,
-            "Bind null images for guest draw texture descriptors on Android.",
-            "Android");
-DEFINE_bool(halo_android_diag_log_texture_bindings, false,
-            "Log guest draw texture bindings on Android.",
-            "Android");
-DEFINE_uint32(halo_android_diag_swap_base_page_override, 0,
-              "Override the Android Halo swap texture base 4 KB page for "
-              "frontbuffer address diagnostics. 0 disables.",
-              "Android");
-
-DECLARE_bool(halo_android_gpu_frame_dumps);
-DECLARE_bool(halo_android_compat_linear_to_tiled_frontbuffer);
-
 namespace xe {
 namespace gpu {
 namespace vulkan {
-
-#if XE_PLATFORM_ANDROID
-bool AndroidHaloIsDxtEndianTestFormat(xenos::TextureFormat format) {
-  switch (format) {
-    case xenos::TextureFormat::k_DXT1:
-    case xenos::TextureFormat::k_DXT2_3:
-    case xenos::TextureFormat::k_DXT4_5:
-    case xenos::TextureFormat::k_DXN:
-    case xenos::TextureFormat::k_DXT1_AS_16_16_16_16:
-    case xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16:
-    case xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16:
-    case xenos::TextureFormat::k_DXT3A:
-    case xenos::TextureFormat::k_DXT5A:
-    case xenos::TextureFormat::k_DXT3A_AS_1_1_1_1:
-      return true;
-    default:
-      return false;
-  }
-}
-#endif
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -660,34 +609,8 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
 VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
     uint32_t fetch_constant_index, xenos::FetchOpDimension dimension,
     bool is_signed) {
-#if XE_PLATFORM_ANDROID
-  static uint32_t android_texture_binding_log_count = 0;
-#endif
   VkImageView image_view = VK_NULL_HANDLE;
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
-  if (binding && AreDimensionsCompatible(dimension, binding->key.dimension)) {
-#if XE_PLATFORM_ANDROID
-    if (cvars::halo_android_diag_log_texture_bindings &&
-        android_texture_binding_log_count < 512) {
-      const TextureKey& key = binding->key;
-      XELOGI(
-          "Android texture binding {}: slot={} request_dim={} key_dim={} "
-          "signed={} base=0x{:08X} mip=0x{:08X} size={}x{}x{} pitch={} "
-          "tiled={} format={} endian={} packed={} swizzle=0x{:03X}",
-          android_texture_binding_log_count, fetch_constant_index,
-          uint32_t(dimension), uint32_t(key.dimension), uint32_t(is_signed),
-          uint32_t(key.base_page << 12), uint32_t(key.mip_page << 12),
-          key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
-          uint32_t(key.pitch), uint32_t(key.tiled), uint32_t(key.format),
-          uint32_t(key.endianness), uint32_t(key.packed_mips),
-          uint32_t(binding->host_swizzle));
-      ++android_texture_binding_log_count;
-    }
-    if (cvars::halo_android_diag_force_null_textures) {
-      binding = nullptr;
-    }
-#endif
-  }
   if (binding && AreDimensionsCompatible(dimension, binding->key.dimension)) {
     // Check for 3D texture sampled as 2D.
     bool force_special_view =
@@ -1002,194 +925,11 @@ uint64_t VulkanTextureCache::GetSubmissionToAwaitOnSamplerOverflow(
   return sampler_used->second.last_usage_submission;
 }
 
-bool VulkanTextureCache::ApplyAndroidDirectFrontbufferFill(
-    uint32_t request_index, const TextureKey& key,
-    const VulkanTexture& texture) {
-#if XE_PLATFORM_ANDROID
-  const bool fill_tiled = cvars::halo_android_diag_direct_fb_fill_tiled;
-  const bool fill_linear =
-      cvars::halo_android_diag_direct_fb_fill_linear && !fill_tiled;
-  // The linear->tiled retiling assumed the compat hacks wrote LINEAR data
-  // into the frontbuffer; the resolve path writes TILED data, so this remap
-  // SCRAMBLES every presented frame (and burns ~20% of total CPU re-tiling
-  // 830k pixels per swap - top hotspot in profiling 2026-06-10). Gated off by
-  // default via the experiment file.
-  const bool compat_linear_to_tiled =
-      GetAndroidHaloExperiment().linear_to_tiled_frontbuffer &&
-      cvars::halo_android_compat_linear_to_tiled_frontbuffer && !fill_tiled &&
-      !fill_linear && key.GetWidth() == 1152 && key.GetHeight() == 720 &&
-      key.format == xenos::TextureFormat::k_8_8_8_8 && key.tiled;
-  const bool linear_to_tiled =
-      (cvars::halo_android_diag_linear_to_tiled_frontbuffer ||
-       compat_linear_to_tiled) &&
-      !fill_tiled && !fill_linear;
-  if (!fill_tiled && !fill_linear && !linear_to_tiled) {
-    return false;
-  }
-  if (key.format != xenos::TextureFormat::k_8_8_8_8 ||
-      key.dimension != xenos::DataDimension::k2DOrStacked) {
-    return false;
-  }
-
-  const FormatInfo* format_info = FormatInfo::Get(key.format);
-  if (!format_info || format_info->bytes_per_block() != 4) {
-    return false;
-  }
-
-  const uint32_t width = key.GetWidth();
-  const uint32_t height = key.GetHeight();
-  const uint32_t base_size = texture.GetGuestBaseSize();
-  if (!width || !height || !base_size) {
-    return false;
-  }
-
-  const auto& layout = texture.guest_layout();
-  const uint32_t bytes_per_block = format_info->bytes_per_block();
-  const uint32_t pitch_blocks = layout.base.row_pitch_bytes / bytes_per_block;
-  if (!pitch_blocks || pitch_blocks < width) {
-    return false;
-  }
-
-  VulkanSharedMemory& vulkan_shared_memory =
-      static_cast<VulkanSharedMemory&>(shared_memory());
-  const uint32_t base_address = key.base_page << 12;
-  Memory& memory = vulkan_shared_memory.guest_memory_for_diagnostics();
-  uint8_t* base =
-      reinterpret_cast<uint8_t*>(memory.TranslatePhysical(base_address));
-  if (!base) {
-    XELOGW("Android direct FB fill {} has null guest pointer at 0x{:08X}",
-           request_index, base_address);
-    return false;
-  }
-
-  const uint32_t bytes_per_block_log2 = xe::log2_floor(bytes_per_block);
-  if (linear_to_tiled) {
-    if (!key.tiled) {
-      return false;
-    }
-
-    const size_t visible_bytes =
-        size_t(width) * size_t(height) * size_t(bytes_per_block);
-    std::vector<uint8_t> linear_pixels(visible_bytes);
-    for (uint32_t y = 0; y < height; ++y) {
-      for (uint32_t x = 0; x < width; ++x) {
-        const uint32_t source_offset =
-            (y * pitch_blocks + x) * bytes_per_block;
-        const size_t linear_offset =
-            (size_t(y) * size_t(width) + size_t(x)) * bytes_per_block;
-        if (source_offset + bytes_per_block > base_size) {
-          continue;
-        }
-        for (uint32_t i = 0; i < bytes_per_block; ++i) {
-          linear_pixels[linear_offset + i] = base[source_offset + i];
-        }
-      }
-    }
-
-    shared_memory().MemoryInvalidationCallback(base_address, base_size, true);
-
-    uint32_t pixels_written = 0;
-    for (uint32_t y = 0; y < height; ++y) {
-      for (uint32_t x = 0; x < width; ++x) {
-        const uint32_t tiled_offset = uint32_t(texture_util::GetTiledOffset2D(
-            int32_t(x), int32_t(y), pitch_blocks, bytes_per_block_log2));
-        const size_t linear_offset =
-            (size_t(y) * size_t(width) + size_t(x)) * bytes_per_block;
-        if (tiled_offset + bytes_per_block > base_size) {
-          continue;
-        }
-        for (uint32_t i = 0; i < bytes_per_block; ++i) {
-          base[tiled_offset + i] = linear_pixels[linear_offset + i];
-        }
-        ++pixels_written;
-      }
-    }
-
-    if (request_index <= 16 || request_index == 30 || request_index == 90 ||
-        request_index == 180 || request_index == 600 ||
-        (request_index % 1800) == 0) {
-      XELOGI(
-          "Android linear->tiled FB transform {}: addr=0x{:08X} key={}x{} "
-          "pitch_blocks={} row_pitch_bytes={} base_size=0x{:X} "
-          "pixels_written={} visible_bytes=0x{:X}",
-          request_index, base_address, width, height, pitch_blocks,
-          layout.base.row_pitch_bytes, base_size, pixels_written,
-          uint32_t(visible_bytes));
-    }
-    return true;
-  }
-
-  shared_memory().MemoryInvalidationCallback(base_address, base_size, true);
-
-  for (uint32_t offset = 0; offset + 3 < base_size; offset += 4) {
-    base[offset + 0] = 0x20;
-    base[offset + 1] = 0x00;
-    base[offset + 2] = 0x70;
-    base[offset + 3] = 0xFF;
-  }
-
-  uint32_t pixels_written = 0;
-  for (uint32_t y = 0; y < height; ++y) {
-    for (uint32_t x = 0; x < width; ++x) {
-      const uint32_t offset_bytes =
-          fill_tiled ? uint32_t(texture_util::GetTiledOffset2D(
-                           int32_t(x), int32_t(y), pitch_blocks,
-                           bytes_per_block_log2))
-                     : (y * pitch_blocks + x) * bytes_per_block;
-      if (offset_bytes + bytes_per_block > base_size) {
-        continue;
-      }
-
-      uint8_t r = uint8_t((uint64_t(x) * 255) / std::max(width - 1, 1u));
-      uint8_t g = uint8_t((uint64_t(y) * 255) / std::max(height - 1, 1u));
-      uint8_t b = ((x / 80) ^ (y / 16)) & 1 ? 255 : 32;
-
-      const bool x_marker = x == 0 || x == 79 || x == 80 || x == 1119 ||
-                            x == 1120 || x + 1 == width;
-      const bool y_marker = y == 0 || y == 15 || y == 16 || y + 1 == height;
-      if (x_marker || y_marker) {
-        r = x_marker ? 255 : 0;
-        g = y_marker ? 255 : 0;
-        b = (x_marker && y_marker) ? 255 : 0;
-      }
-
-      base[offset_bytes + 0] = r;
-      base[offset_bytes + 1] = g;
-      base[offset_bytes + 2] = b;
-      base[offset_bytes + 3] = 0xFF;
-      ++pixels_written;
-    }
-  }
-
-  if (request_index <= 16 || request_index == 30 || request_index == 90 ||
-      request_index == 180 || request_index == 600 ||
-      (request_index % 1800) == 0) {
-    XELOGI(
-        "Android direct FB fill {}: mode={} addr=0x{:08X} key={}x{} "
-        "pitch_blocks={} row_pitch_bytes={} tiled_key={} base_size=0x{:X} "
-        "pixels_written={} visible_bytes=0x{:X}",
-        request_index, fill_tiled ? "tiled" : "linear", base_address, width,
-        height, pitch_blocks, layout.base.row_pitch_bytes, uint32_t(key.tiled),
-        base_size, pixels_written, width * height * bytes_per_block);
-  }
-  return true;
-#else
-  (void)request_index;
-  (void)key;
-  (void)texture;
-  return false;
-#endif
-}
-
 VkImageView VulkanTextureCache::RequestSwapTexture(
-    uint32_t frontbuffer_ptr, uint32_t& width_scaled_out,
-    uint32_t& height_scaled_out,
+    uint32_t& width_scaled_out, uint32_t& height_scaled_out,
     xenos::TextureFormat& format_out) {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
-#if !XE_PLATFORM_ANDROID
-  (void)frontbuffer_ptr;
-#endif
 #if XE_PLATFORM_ANDROID
   static uint32_t android_swap_texture_request_index = 0;
   uint32_t android_request_index = ++android_swap_texture_request_index;
@@ -1201,60 +941,18 @@ VkImageView VulkanTextureCache::RequestSwapTexture(
 #endif
   TextureKey key;
   BindingInfoFromFetchConstant(fetch, key, nullptr);
-#if XE_PLATFORM_ANDROID
-  const uint32_t android_pm4_frontbuffer_page = frontbuffer_ptr >> 12;
-  const bool android_pm4_frontbuffer_usable =
-      frontbuffer_ptr && !(frontbuffer_ptr & 0xFFF) &&
-      android_pm4_frontbuffer_page != 0;
-  if (key.is_valid && android_pm4_frontbuffer_usable &&
-      key.dimension == xenos::DataDimension::k2DOrStacked &&
-      key.GetWidth() == 1152 && key.GetHeight() == 720 &&
-      key.format == xenos::TextureFormat::k_8_8_8_8 && key.tiled &&
-      key.base_page != android_pm4_frontbuffer_page) {
-    if (android_log_swap_texture) {
-      XELOGI(
-          "Android swap texture {} using PM4 frontbuffer page 0x{:X} over "
-          "fetch page 0x{:X} for Halo-sized swap",
-          android_request_index, android_pm4_frontbuffer_page,
-          uint32_t(key.base_page));
-    }
-    key.base_page = android_pm4_frontbuffer_page;
-  }
-
-  // The experiment-file override is the reliable path; the cvar is kept as a
-  // secondary source for old profiles.
-  uint32_t android_swap_base_page_override =
-      GetAndroidHaloExperiment().swap_base_page_override;
-  if (!android_swap_base_page_override) {
-    android_swap_base_page_override =
-        cvars::halo_android_diag_swap_base_page_override;
-  }
-  if (android_swap_base_page_override && key.is_valid &&
-      key.dimension == xenos::DataDimension::k2DOrStacked &&
-      key.GetWidth() == 1152 && key.GetHeight() == 720 &&
-      key.format == xenos::TextureFormat::k_8_8_8_8) {
-    if (android_log_swap_texture) {
-      XELOGI(
-          "Android swap texture {} overriding base_page 0x{:X} -> 0x{:X}",
-          android_request_index, uint32_t(key.base_page),
-          android_swap_base_page_override);
-    }
-    key.base_page = android_swap_base_page_override;
-  }
-#endif
   if (!key.is_valid || key.base_page == 0 ||
       key.dimension != xenos::DataDimension::k2DOrStacked) {
 #if XE_PLATFORM_ANDROID
     if (android_log_swap_texture) {
       XELOGI(
           "Android swap texture {} rejected: valid={} base_page=0x{:X} "
-          "dimension={} pm4_fb=0x{:08X} fetch_dwords={:08X} {:08X} "
-          "{:08X} {:08X} {:08X} {:08X}",
+          "dimension={} fetch_dwords={:08X} {:08X} {:08X} {:08X} {:08X} "
+          "{:08X}",
           android_request_index, uint32_t(key.is_valid),
           uint32_t(key.base_page),
-          uint32_t(key.dimension), frontbuffer_ptr, fetch.dword_0,
-          fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
-          fetch.dword_5);
+          uint32_t(key.dimension), fetch.dword_0, fetch.dword_1,
+          fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
     }
 #endif
     return nullptr;
@@ -1264,25 +962,9 @@ VkImageView VulkanTextureCache::RequestSwapTexture(
   if (!texture) {
     return VK_NULL_HANDLE;
   }
-#if XE_PLATFORM_ANDROID
-  ApplyAndroidDirectFrontbufferFill(android_request_index, key, *texture);
-  // Channel-order A/B: allow the experiment file to replace the game's fetch
-  // swizzle for the presented frontbuffer (config-only color permutation).
-  uint32_t android_swap_fetch_swizzle = fetch.swizzle;
-  if (GetAndroidHaloExperiment().swap_swizzle_override) {
-    android_swap_fetch_swizzle =
-        GetAndroidHaloExperiment().swap_swizzle_override;
-  }
-  VkImageView texture_view = texture->GetView(
-      false,
-      GuestToHostSwizzle(android_swap_fetch_swizzle,
-                         GetHostFormatSwizzle(key)),
-      false);
-#else
   VkImageView texture_view = texture->GetView(
       false, GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key)),
       false);
-#endif
   if (texture_view == VK_NULL_HANDLE) {
     return VK_NULL_HANDLE;
   }
@@ -1324,17 +1006,17 @@ VkImageView VulkanTextureCache::RequestSwapTexture(
     XELOGI(
         "Android swap texture {}: key={}x{} scaled={} pitch={} tiled={} "
         "packed_mips={} base_page=0x{:X} mip_page=0x{:X} format={} "
-        "endian={} host_unsigned={} swizzle=0x{:03X} pm4_fb=0x{:08X} "
-        "fetch_base=0x{:X} fetch_pitch={} fetch_tiled={} fetch_format={} "
-        "fetch_endian={} fetch_size={}x{} fetch_dwords={:08X} {:08X} "
-        "{:08X} {:08X} {:08X} {:08X}",
+        "endian={} host_unsigned={} swizzle=0x{:03X} fetch_base=0x{:X} "
+        "fetch_pitch={} fetch_tiled={} fetch_format={} fetch_endian={} "
+        "fetch_size={}x{} fetch_dwords={:08X} {:08X} {:08X} {:08X} {:08X} "
+        "{:08X}",
         android_request_index, key.GetWidth(), key.GetHeight(),
         uint32_t(key.scaled_resolve), uint32_t(key.pitch),
         uint32_t(key.tiled), uint32_t(key.packed_mips),
         uint32_t(key.base_page), uint32_t(key.mip_page),
         uint32_t(key.format), uint32_t(key.endianness),
         uint32_t(host_format_pair.format_unsigned.format),
-        uint32_t(fetch.swizzle), frontbuffer_ptr, uint32_t(fetch.base_address),
+        uint32_t(fetch.swizzle), uint32_t(fetch.base_address),
         uint32_t(fetch.pitch), uint32_t(fetch.tiled),
         uint32_t(fetch.format), uint32_t(fetch.endianness),
         uint32_t(fetch.size_2d.width) + 1,
@@ -1356,10 +1038,8 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
     uint32_t request_index, const TextureKey& key,
     const VulkanTexture& texture, uint32_t fetch_swizzle) {
 #if XE_PLATFORM_ANDROID
-  // Fire at the early checkpoints, then every 300 swaps forever so dumps can
-  // be captured at any later game state (menus, difficulty screen, gameplay).
-  if (request_index != 120 && request_index != 240 && request_index != 360 &&
-      request_index != 480 && (request_index % 300) != 0) {
+  if (request_index != 600 && request_index != 1200 &&
+      request_index != 1800) {
     return false;
   }
   if (key.format != xenos::TextureFormat::k_8_8_8_8 ||
@@ -1408,9 +1088,6 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
     uint8_t max[3] = {};
     uint64_t sum[3] = {};
     uint32_t nonblack = 0;
-    // FNV-1a64 over the output RGB stream - byte-identical content across
-    // frames/runs is visible from logcat alone, no file pull needed.
-    uint64_t hash = 14695981039346656037ull;
   };
 
   struct Variant {
@@ -1435,7 +1112,6 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
       "/sdcard/Android/data/jp.xenios.emulator.github.debug/files/diagnostics",
       "/sdcard/Android/data/jp.xenios.emulator.github/files/diagnostics",
   };
-  constexpr uint32_t kRawDumpMaxBytes = 0x400000;
 
   for (const char* diagnostic_root : kDiagnosticRoots) {
     std::error_code ignored_error;
@@ -1459,11 +1135,12 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
       std::array<uint8_t, 3> rgb = {};
       for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
-          uint32_t offset_bytes =
+          uint32_t offset_blocks =
               key.tiled ? uint32_t(texture_util::GetTiledOffset2D(
                               int32_t(x), int32_t(y), pitch_blocks,
                               bytes_per_block_log2))
-                        : (y * pitch_blocks + x) * bytes_per_block;
+                        : y * pitch_blocks + x;
+          uint32_t offset_bytes = offset_blocks * bytes_per_block;
           std::array<uint8_t, 4> pixel = {};
           if (offset_bytes + bytes_per_block <= base_size) {
             const uint8_t* source_pixel = base + offset_bytes;
@@ -1493,7 +1170,6 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
             stats.max[c] = std::max(stats.max[c], rgb[c]);
             stats.sum[c] += rgb[c];
             nonblack |= rgb[c] != 0;
-            stats.hash = (stats.hash ^ rgb[c]) * 1099511628211ull;
           }
           if (nonblack) {
             ++stats.nonblack;
@@ -1508,12 +1184,10 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
             pixel_count ? static_cast<double>(pixel_count) : 1.0;
         XELOGI(
             "Android CPU swap texture stats frame={} variant={} path={} "
-            "base_page=0x{:X} hash=0x{:016X} "
             "fetch_swizzle=0x{:03X} sampled_swizzle=0x{:03X} "
             "nonblack={}/{} min_rgb={},{},{} max_rgb={},{},{} "
             "mean_rgb={:.2f},{:.2f},{:.2f}",
-            request_index, variant.name, path.string(),
-            uint32_t(key.base_page), stats.hash, fetch_swizzle,
+            request_index, variant.name, path.string(), fetch_swizzle,
             sampled_swizzle, stats.nonblack, pixel_count,
             uint32_t(stats.min[0]), uint32_t(stats.min[1]),
             uint32_t(stats.min[2]), uint32_t(stats.max[0]),
@@ -1524,109 +1198,12 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
     }
 
     if (wrote_any) {
-      std::filesystem::path raw_swap_path =
-          std::filesystem::path(diagnostic_root) /
-          ("raw_frame_" + std::to_string(request_index) + "_swap.bin");
-      std::ofstream raw_swap_file(raw_swap_path, std::ios::binary);
-      if (raw_swap_file) {
-        const uint32_t raw_swap_bytes =
-            std::min<uint32_t>(base_size, kRawDumpMaxBytes);
-        raw_swap_file.write(reinterpret_cast<const char*>(base),
-                            raw_swap_bytes);
-        if (raw_swap_file.good()) {
-          XELOGI("RAWDUMP frame={} target=swap bytes={} path={}",
-                 request_index, raw_swap_bytes, raw_swap_path.string());
-        }
-      }
-
       XELOGI(
           "Android CPU swap texture wrote variants root={} base_page=0x{:X} "
           "size={} pitch_blocks={} tiled={} fetch_swizzle=0x{:03X} "
           "sampled_swizzle=0x{:03X}",
           diagnostic_root, uint32_t(key.base_page), base_size, pitch_blocks,
           uint32_t(key.tiled), fetch_swizzle, sampled_swizzle);
-      // Ground-truth dumps of the intermediate resolve destinations (raw
-      // guest RAM, de-tiled as 1152x720 k_8_8_8_8). One run localizes where
-      // the chain (scene resolve -> postprocess -> composite -> final
-      // resolve) turns to garbage.
-      const AndroidHaloExperiment& experiment = GetAndroidHaloExperiment();
-      for (uint32_t address_index = 0;
-           address_index < experiment.dump_address_count; ++address_index) {
-        const uint32_t guest_address =
-            experiment.dump_addresses[address_index];
-        const uint8_t* guest_base = reinterpret_cast<const uint8_t*>(
-            memory.TranslatePhysical(guest_address));
-        if (!guest_base) {
-          continue;
-        }
-        constexpr uint32_t kGuestDumpWidth = 1152;
-        constexpr uint32_t kGuestDumpHeight = 720;
-        constexpr uint32_t kGuestDumpPitch = 1152;
-        char guest_filename[64];
-        std::snprintf(guest_filename, sizeof(guest_filename),
-                      "guest_buffer_frame_%u_0x%08X.ppm", request_index,
-                      guest_address);
-        std::filesystem::path guest_path =
-            std::filesystem::path(diagnostic_root) / guest_filename;
-        std::ofstream guest_file(guest_path, std::ios::binary);
-        if (!guest_file) {
-          continue;
-        }
-        guest_file << "P6\n"
-                   << kGuestDumpWidth << " " << kGuestDumpHeight << "\n255\n";
-        VariantStats guest_stats;
-        std::array<uint8_t, 3> guest_rgb = {};
-        for (uint32_t y = 0; y < kGuestDumpHeight; ++y) {
-          for (uint32_t x = 0; x < kGuestDumpWidth; ++x) {
-            uint32_t offset_bytes = uint32_t(texture_util::GetTiledOffset2D(
-                int32_t(x), int32_t(y), kGuestDumpPitch, 2));
-            const uint8_t* source_pixel = guest_base + offset_bytes;
-            bool nonblack = false;
-            for (uint32_t c = 0; c < 3; ++c) {
-              guest_rgb[c] = source_pixel[c];
-              guest_stats.min[c] = std::min(guest_stats.min[c], guest_rgb[c]);
-              guest_stats.max[c] = std::max(guest_stats.max[c], guest_rgb[c]);
-              guest_stats.sum[c] += guest_rgb[c];
-              nonblack |= guest_rgb[c] != 0;
-              guest_stats.hash =
-                  (guest_stats.hash ^ guest_rgb[c]) * 1099511628211ull;
-            }
-            if (nonblack) {
-              ++guest_stats.nonblack;
-            }
-            guest_file.write(reinterpret_cast<const char*>(guest_rgb.data()),
-                             guest_rgb.size());
-          }
-        }
-        const uint64_t guest_pixel_count =
-            uint64_t(kGuestDumpWidth) * kGuestDumpHeight;
-        const double guest_divisor = double(guest_pixel_count);
-        char guest_raw_filename[64];
-        std::snprintf(guest_raw_filename, sizeof(guest_raw_filename),
-                      "raw_frame_%u_0x%08X.bin", request_index,
-                      guest_address);
-        std::filesystem::path guest_raw_path =
-            std::filesystem::path(diagnostic_root) / guest_raw_filename;
-        std::ofstream guest_raw_file(guest_raw_path, std::ios::binary);
-        if (guest_raw_file) {
-          guest_raw_file.write(reinterpret_cast<const char*>(guest_base),
-                               kRawDumpMaxBytes);
-          if (guest_raw_file.good()) {
-            XELOGI("RAWDUMP frame={} addr=0x{:08X} bytes={} path={}",
-                   request_index, guest_address, kRawDumpMaxBytes,
-                   guest_raw_path.string());
-          }
-        }
-        XELOGI(
-            "GUESTDUMP frame={} addr=0x{:08X} hash=0x{:016X} nonblack={}/{} "
-            "max_rgb={},{},{} mean_rgb={:.2f},{:.2f},{:.2f} path={}",
-            request_index, guest_address, guest_stats.hash,
-            guest_stats.nonblack, guest_pixel_count,
-            uint32_t(guest_stats.max[0]), uint32_t(guest_stats.max[1]),
-            uint32_t(guest_stats.max[2]), guest_stats.sum[0] / guest_divisor,
-            guest_stats.sum[1] / guest_divisor,
-            guest_stats.sum[2] / guest_divisor, guest_path.string());
-      }
       return true;
     }
   }
@@ -2140,38 +1717,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   VkDescriptorSet descriptor_set_source_current = VK_NULL_HANDLE;
 
   LoadConstants load_constants;
-  xenos::Endian texture_load_endianness = texture_key.endianness;
-#if XE_PLATFORM_ANDROID
-  const uint32_t android_tex_endian_mode =
-      GetAndroidHaloExperiment().tex_endian_mode;
-  if (android_tex_endian_mode != 0 &&
-      AndroidHaloIsDxtEndianTestFormat(texture_key.format)) {
-    const xenos::Endian original_endianness = texture_load_endianness;
-    texture_load_endianness = android_tex_endian_mode == 1
-                                  ? xenos::Endian::k8in16
-                                  : xenos::Endian::kNone;
-    static uint32_t android_tex_endian_override_log_count = 0;
-    if (android_tex_endian_override_log_count < 96) {
-      XELOGI(
-          "Android tex_endian override {}: mode={} format={} size={}x{}x{} "
-          "base_page=0x{:X} mip_page=0x{:X} tiled={} endian {} -> {} "
-          "load_shader={} host_format={} block_compressed={}",
-          android_tex_endian_override_log_count, android_tex_endian_mode,
-          uint32_t(texture_key.format), width, height, depth_or_array_size,
-          uint32_t(texture_key.base_page), uint32_t(texture_key.mip_page),
-          uint32_t(texture_key.tiled), uint32_t(original_endianness),
-          uint32_t(texture_load_endianness), uint32_t(load_shader),
-          uint32_t(host_format.format), uint32_t(host_format.block_compressed));
-      ++android_tex_endian_override_log_count;
-    }
-  }
-#endif
   // 3 bits for each.
   assert_true(texture_resolution_scale_x <= 7);
   assert_true(texture_resolution_scale_y <= 7);
   load_constants.is_tiled_3d_endian_scale =
       uint32_t(texture_key.tiled) | (uint32_t(is_3d_tiling) << 1) |
-      (uint32_t(texture_load_endianness) << 2) |
+      (uint32_t(texture_key.endianness) << 2) |
       (texture_resolution_scale_x << 4) | (texture_resolution_scale_y << 7);
 
   uint32_t guest_x_blocks_per_group_log2 =

@@ -512,12 +512,24 @@ uint32_t xeMmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t region_size,
                         adjusted_alignment, allocation_type, protect, top_down,
                         &base_address)) {
     // Failed - assume no memory available.
-    XELOGW("MmAllocatePhysicalMemoryEx: Allocation failed: {:08X} Size: {:08X}",
-           base_address, adjusted_size);
+    XELOGW(
+        "MmAllocatePhysicalMemoryEx: Allocation failed: {:08X} Size: {:08X} "
+        "flags={:08X} protect_bits={:08X} min={:08X} max={:08X} "
+        "alignment={:08X} adjusted_alignment={:08X} page_size={:08X} "
+        "heap_min={:08X} heap_max={:08X}",
+        base_address, adjusted_size, flags, protect_bits, min_addr_range,
+        max_addr_range, alignment, adjusted_alignment, page_size, heap_min_addr,
+        heap_max_addr);
     return 0;
   }
-  XELOGD("MmAllocatePhysicalMemoryEx = {:08X} Size: {:08X}", base_address,
-         adjusted_size);
+  XELOGI(
+      "MmAllocatePhysicalMemoryEx: Allocation succeeded: {:08X} Size: {:08X} "
+      "flags={:08X} protect_bits={:08X} min={:08X} max={:08X} "
+      "alignment={:08X} adjusted_alignment={:08X} page_size={:08X} "
+      "heap_min={:08X} heap_max={:08X}",
+      base_address, adjusted_size, flags, protect_bits, min_addr_range,
+      max_addr_range, alignment, adjusted_alignment, page_size, heap_min_addr,
+      heap_max_addr);
 
   return base_address;
 }

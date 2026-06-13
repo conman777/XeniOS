@@ -7,8 +7,7 @@
  ******************************************************************************
  */
 
-#include <ranges>
-
+#include <algorithm>
 #include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -644,15 +643,19 @@ dword_result_t XamUserCreateAchievementEnumerator_entry(
       kernel_state()->achievement_manager()->GetTitleAchievements(
           requester_xuid, title_id_);
 
-  const auto requested_achievements = user_title_achievements |
-                                      std::views::drop(offset) |
-                                      std::views::take(count);
-
-  if (requested_achievements.empty()) {
+  if (offset >= user_title_achievements.size()) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  for (const auto& entry : requested_achievements) {
+  const size_t begin_index = offset;
+  const size_t end_index =
+      std::min<size_t>(user_title_achievements.size(), begin_index + count);
+  if (begin_index >= end_index) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  for (size_t i = begin_index; i < end_index; ++i) {
+    const auto& entry = user_title_achievements[i];
     auto unlock_time = X_FILETIME();
     if (entry.IsUnlocked() && entry.unlock_time.is_valid()) {
       unlock_time = entry.unlock_time;

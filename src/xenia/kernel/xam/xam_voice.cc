@@ -49,6 +49,42 @@ dword_result_t XamVoiceGetMicArrayStatus_entry() {
 }
 DECLARE_XAM_EXPORT1(XamVoiceGetMicArrayStatus, kNone, kStub);
 
+dword_result_t XamVoiceSetMicArrayIdleUsers_entry() {
+  // No microphone array is exposed by this port, so accept the request as a
+  // no-op. This keeps titles that dynamically query voice exports moving.
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamVoiceSetMicArrayIdleUsers, kNone, kStub);
+
+dword_result_t XamVoiceMuteMicArray_entry() { return X_ERROR_SUCCESS; }
+DECLARE_XAM_EXPORT1(XamVoiceMuteMicArray, kNone, kStub);
+
+dword_result_t XamVoiceGetMicArrayUnderrunStatus_entry() { return 0; }
+DECLARE_XAM_EXPORT1(XamVoiceGetMicArrayUnderrunStatus, kNone, kStub);
+
+dword_result_t XamVoiceGetMicArrayAudio_entry() {
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamVoiceGetMicArrayAudio, kNone, kStub);
+
+dword_result_t XamVoiceGetMicArrayAudioEx_entry() {
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamVoiceGetMicArrayAudioEx, kNone, kStub);
+
+dword_result_t XamVoiceDisableMicArray_entry() { return X_ERROR_SUCCESS; }
+DECLARE_XAM_EXPORT1(XamVoiceDisableMicArray, kNone, kStub);
+
+dword_result_t XamVoiceSetMicArrayBeamAngle_entry() {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamVoiceSetMicArrayBeamAngle, kNone, kStub);
+
+dword_result_t XamVoiceGetMicArrayFilenameDesc_entry() {
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamVoiceGetMicArrayFilenameDesc, kNone, kStub);
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace xe

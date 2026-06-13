@@ -7,12 +7,17 @@
  ******************************************************************************
  */
 
-#include <ranges>
-
 #include "xenia/kernel/kernel_state.h"
+
+#include <array>
+#include <string>
+#include <string_view>
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
+#include "xenia/cpu/function.h"
+#include "xenia/cpu/module.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/user_module.h"
@@ -39,11 +44,75 @@ DEFINE_uint32(kernel_build_version, 1888, "Define current kernel version",
               "Kernel");
 
 DECLARE_string(cl);
+DECLARE_bool(halo_android_diagnostics);
+DECLARE_bool(halo_android_thread_verbose);
+DECLARE_uint32(halo_android_thread_sample_ms);
 
 namespace xe {
 namespace kernel {
 
 constexpr std::chrono::milliseconds kDeferredOverlappedDelayMillis(25);
+
+namespace {
+
+bool IsCommonHaloWaitPc(uint32_t pc) {
+  switch (pc) {
+    case 0x829EB8DC:
+    case 0x829EBC4C:
+    case 0x829EBCFC:
+      return true;
+    default:
+      return false;
+  }
+}
+
+struct HaloActiveThreadSample {
+  uint32_t id = 0;
+  uint32_t handle = 0;
+  std::string name;
+  uint32_t fn = 0;
+  uint32_t pc = 0;
+  uint32_t lr = 0;
+  uint32_t ctr = 0;
+  uint32_t r1 = 0;
+  uint32_t r3 = 0;
+  uint32_t r4 = 0;
+  uint32_t r31 = 0;
+};
+
+std::string FormatHaloFunctionName(cpu::Processor* processor,
+                                   uint32_t fn_address, uint32_t pc) {
+  if (!processor) {
+    return {};
+  }
+
+  cpu::Function* function =
+      fn_address ? processor->QueryFunction(fn_address) : nullptr;
+  if (!function && pc) {
+    auto functions = processor->FindFunctionsWithAddress(pc);
+    if (!functions.empty()) {
+      function = functions.front();
+    }
+  }
+  if (!function) {
+    auto* module = processor->LookupModule(pc ? pc : fn_address);
+    return module ? fmt::format("{}!0x{:08X}", module->name(),
+                                pc ? pc : fn_address)
+                  : std::string();
+  }
+
+  std::string name = function->name();
+  if (name.empty()) {
+    name = fmt::format("sub_{:08X}", function->address());
+  }
+  const uint32_t offset =
+      pc >= function->address() ? pc - function->address() : 0;
+  auto* module = function->module();
+  return fmt::format("{}!{}+0x{:X}", module ? module->name() : "?", name,
+                     offset);
+}
+
+}  // namespace
 
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
@@ -388,6 +457,12 @@ object_ref<XModule> KernelState::GetModule(const std::string_view name,
     }
   }
 
+  for (auto user_module : user_modules_) {
+    if (user_module->Matches(name)) {
+      return retain_object(user_module.get());
+    }
+  }
+
   auto path(name);
 
   // Resolve the path to an absolute path.
@@ -584,6 +659,9 @@ object_ref<UserModule> KernelState::LoadUserModule(
 
     // See if we've already loaded it
     for (auto& existing_module : user_modules_) {
+      if (existing_module->Matches(raw_name)) {
+        return existing_module;
+      }
       if (existing_module->Matches(path)) {
         return existing_module;
       }
@@ -594,6 +672,10 @@ object_ref<UserModule> KernelState::LoadUserModule(
     // Module wasn't loaded, so load it.
     module = object_ref<UserModule>(new UserModule(this));
     X_STATUS status = module->LoadFromFile(path);
+    if (XFAILED(status) && name.find('.') == std::string::npos) {
+      const auto dll_path = path + ".dll";
+      status = module->LoadFromFile(dll_path);
+    }
     if (XFAILED(status)) {
       object_table()->ReleaseHandle(module->handle());
       return nullptr;
@@ -1016,14 +1098,11 @@ object_ref<XThread> KernelState::GetThreadByID(uint32_t thread_id) {
 
 std::vector<uint32_t> KernelState::GetAllThreadIDs() {
   auto global_lock = global_critical_region_.Acquire();
-
-  auto thread_ids_view =
-      threads_by_id_ |
-      std::views::transform([](const auto& pair) { return pair.first; });
-
-  std::vector<std::uint32_t> thread_ids(thread_ids_view.begin(),
-                                        thread_ids_view.end());
-
+  std::vector<uint32_t> thread_ids;
+  thread_ids.reserve(threads_by_id_.size());
+  for (const auto& pair : threads_by_id_) {
+    thread_ids.push_back(pair.first);
+  }
   return thread_ids;
 }
 
@@ -1262,6 +1341,102 @@ void KernelState::UpdateKeTimestampBundle() {
   xe::store_and_swap<uint64_t>(&lpKeTimeStampBundle->system_time,
                                Clock::QueryGuestSystemTime());
   xe::store_and_swap<uint32_t>(&lpKeTimeStampBundle->tick_count, uptime_ms);
+
+  const uint32_t sample_interval_ms =
+      cvars::halo_android_thread_sample_ms
+          ? cvars::halo_android_thread_sample_ms
+          : 5000;
+  if (!cvars::halo_android_diagnostics || !executable_module_ ||
+      uptime_ms - last_thread_sample_ms_ < sample_interval_ms) {
+    return;
+  }
+  last_thread_sample_ms_ = uptime_ms;
+
+  uint32_t guest_threads = 0;
+  uint32_t running_threads = 0;
+  uint32_t wait_threads = 0;
+  std::array<HaloActiveThreadSample, 8> active_samples;
+  size_t active_sample_count = 0;
+
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    for (const auto& pair : threads_by_id_) {
+      XThread* thread = pair.second;
+      if (!thread || !thread->is_guest_thread() || !thread->thread_state()) {
+        continue;
+      }
+
+      const auto* context = thread->thread_state()->context();
+      const auto* kthread = thread->guest_object<X_KTHREAD>();
+      const uint32_t last_fn = context ? context->last_guest_function : 0;
+      const uint32_t last_pc = context ? context->last_guest_pc : 0;
+      const uint32_t lr = context ? static_cast<uint32_t>(context->lr) : 0;
+      const uint32_t ctr = context ? static_cast<uint32_t>(context->ctr) : 0;
+      const uint32_t r1 = context ? static_cast<uint32_t>(context->r[1]) : 0;
+      const uint32_t r3 = context ? static_cast<uint32_t>(context->r[3]) : 0;
+      const uint32_t r4 = context ? static_cast<uint32_t>(context->r[4]) : 0;
+      const uint32_t r30 = context ? static_cast<uint32_t>(context->r[30]) : 0;
+      const uint32_t r31 = context ? static_cast<uint32_t>(context->r[31]) : 0;
+      const bool running = thread->is_running();
+
+      ++guest_threads;
+      if (running) {
+        ++running_threads;
+      }
+      if (IsCommonHaloWaitPc(last_pc)) {
+        ++wait_threads;
+      } else if (active_sample_count < active_samples.size()) {
+        auto& sample = active_samples[active_sample_count++];
+        sample.id = thread->thread_id();
+        sample.handle = thread->handle();
+        sample.name = thread->thread_name();
+        sample.fn = last_fn;
+        sample.pc = last_pc;
+        sample.lr = lr;
+        sample.ctr = ctr;
+        sample.r1 = r1;
+        sample.r3 = r3;
+        sample.r4 = r4;
+        sample.r31 = r31;
+      }
+
+      if (cvars::halo_android_thread_verbose) {
+        XELOGI(
+            "HaloReach ThreadSample uptime_ms={} id={} handle=0x{:08X} "
+            "name='{}' running={} state={} suspend={} cpu={} start=0x{:08X} "
+            "last_fn=0x{:08X} last_pc=0x{:08X} lr=0x{:08X} ctr=0x{:08X} "
+            "r1=0x{:08X} r3=0x{:08X} r4=0x{:08X} r30=0x{:08X} r31=0x{:08X}",
+            uptime_ms, thread->thread_id(), thread->handle(),
+            thread->thread_name(), running,
+            kthread ? kthread->thread_state : 0,
+            kthread ? kthread->suspend_count : 0,
+            kthread ? kthread->current_cpu : 0,
+            kthread ? static_cast<uint32_t>(kthread->start_address) : 0,
+            last_fn, last_pc, lr, ctr, r1, r3, r4, r30, r31);
+      }
+    }
+  }
+
+  if (!cvars::halo_android_thread_verbose) {
+    XELOGI(
+        "HaloReach ThreadSummary uptime_ms={} guest_threads={} running={} "
+        "common_wait={} active={} sample_interval_ms={}",
+        uptime_ms, guest_threads, running_threads, wait_threads,
+        guest_threads - wait_threads, sample_interval_ms);
+    for (size_t i = 0; i < active_sample_count; ++i) {
+      const auto& sample = active_samples[i];
+      const std::string fn_name =
+          FormatHaloFunctionName(processor_, sample.fn, sample.pc);
+      XELOGI(
+          "HaloReach ActiveThread uptime_ms={} id={} handle=0x{:08X} "
+          "name='{}' last_fn=0x{:08X} last_pc=0x{:08X} lr=0x{:08X} "
+          "ctr=0x{:08X} r1=0x{:08X} r3=0x{:08X} r4=0x{:08X} r31=0x{:08X} "
+          "fn='{}'",
+          uptime_ms, sample.id, sample.handle, sample.name, sample.fn,
+          sample.pc, sample.lr, sample.ctr, sample.r1, sample.r3, sample.r4,
+          sample.r31, fn_name);
+    }
+  }
 }
 
 uint32_t KernelState::GetKeTimestampBundle() {

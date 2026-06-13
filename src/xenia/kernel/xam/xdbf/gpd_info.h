@@ -12,6 +12,7 @@
 
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "xenia/base/byte_order.h"
@@ -120,31 +121,24 @@ inline AchievementTypeFlags constexpr GetAchievementType(const uint32_t flags) {
       flags & static_cast<uint32_t>(AchievementFlags::kTypeMask));
 }
 
-inline std::string constexpr GetAchievementTypeName(
+constexpr inline std::string_view GetAchievementTypeName(
     const AchievementTypeFlags type) {
   switch (type) {
     case AchievementTypeFlags::kCompletion:
       return "Completion";
-      break;
     case AchievementTypeFlags::kLeveling:
       return "Leveling";
-      break;
     case AchievementTypeFlags::kUnlock:
       return "Unlock";
-      break;
     case AchievementTypeFlags::kEvent:
       return "Event";
-      break;
     case AchievementTypeFlags::kTournament:
       return "Tournament";
-      break;
     case AchievementTypeFlags::kCheckpoint:
       return "Checkpoint";
-      break;
     case AchievementTypeFlags::kOther:
     default:
       return "Other";
-      break;
   }
 }
 

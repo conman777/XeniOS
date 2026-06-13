@@ -60,6 +60,9 @@
 #include "xenia/gpu/null/null_graphics_system.h"
 #if !XE_PLATFORM_APPLE
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
+#if XE_PLATFORM_ANDROID
+#include "xenia/gpu/vulkan/android_halo_experiment.h"
+#endif
 #endif  // !XE_PLATFORM_APPLE
 #if XE_PLATFORM_WIN32
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
@@ -177,9 +180,16 @@ DECLARE_int32(vulkan_pipeline_creation_threads);
 DECLARE_string(xma_decoder);
 DECLARE_uint64(framerate_limit);
 DECLARE_string(render_target_path);
+DECLARE_string(render_target_path_vulkan);
 DECLARE_string(readback_resolve);
 DECLARE_bool(readback_memexport);
 DECLARE_bool(readback_memexport_fast);
+DECLARE_bool(guest_display_refresh_cap);
+DECLARE_bool(halo_android_compat_presentable_color_shadow);
+DECLARE_bool(halo_android_compat_skip_depth_to_color_alias);
+DECLARE_bool(halo_android_compat_direct_presentable_resolve);
+DECLARE_bool(halo_android_compat_linear_to_tiled_frontbuffer);
+DECLARE_bool(halo_android_gpu_frame_dumps);
 DECLARE_bool(mrt_edram_used_range_clamp_to_min);
 DECLARE_bool(native_2x_msaa);
 DECLARE_bool(vulkan_dynamic_rendering);
@@ -424,7 +434,7 @@ void OverrideAndroidConfigVar(const char* name, T value) {
   }
   auto* config_var = dynamic_cast<cvar::ConfigVar<T>*>(it->second);
   if (config_var) {
-    config_var->OverrideConfigValue(std::move(value));
+    config_var->SetCommandLineValue(std::move(value));
   }
 }
 
@@ -546,6 +556,9 @@ bool ApplyAndroidProfileOverride(const std::string& name,
       name == "halo_android_diag_depth_to_color_zero_stencil" ||
       name == "halo_android_diag_force_d32s8_depth_format" ||
       name == "halo_android_compat_presentable_color_shadow" ||
+      name == "halo_android_compat_skip_depth_to_color_alias" ||
+      name == "halo_android_compat_direct_presentable_resolve" ||
+      name == "halo_android_compat_linear_to_tiled_frontbuffer" ||
       name == "halo_android_disable_high_4k_physical_routing") {
     bool parsed_value = false;
     if (!ParseAndroidProfileBool(value, parsed_value)) {
@@ -586,6 +599,26 @@ bool ApplyAndroidProfileOverride(const std::string& name,
   }
 
   return false;
+}
+
+void ApplyAndroidCompatPresentationDefaults() {
+  OverrideAndroidConfigVar<bool>(
+      "halo_android_compat_presentable_color_shadow", true);
+  OverrideAndroidConfigVar<bool>(
+      "halo_android_compat_skip_depth_to_color_alias", true);
+  OverrideAndroidConfigVar<bool>(
+      "halo_android_compat_direct_presentable_resolve", true);
+  OverrideAndroidConfigVar<bool>(
+      "halo_android_compat_linear_to_tiled_frontbuffer", true);
+  // Per-draw / per-binding logging served its diagnostic purpose; the volume
+  // (thousands of logd lines/sec during mission load) contributes to
+  // device-wide unresponsiveness and watchdog kills. Off by default.
+  OverrideAndroidConfigVar<bool>("halo_android_diag_log_draws", false);
+  OverrideAndroidConfigVar<bool>("halo_android_diag_log_texture_bindings",
+                                 false);
+  OverrideAndroidConfigVar<bool>("halo_android_gpu_frame_dumps", false);
+  OverrideAndroidConfigVar<bool>("readback_memexport", true);
+  OverrideAndroidConfigVar<bool>("readback_memexport_fast", true);
 }
 
 void ApplyAndroidProfileFileOverrides(
@@ -917,15 +950,35 @@ bool EmulatorApp::OnInitialize() {
   // Saved config files can override Android launch/default values. Keep the
   // mobile profile deterministic for compatibility and battery/thermal limits.
   OVERRIDE_bool(discord, false);
-  OverrideAndroidConfigVar<bool>("async_shader_compilation", false);
-  OverrideAndroidConfigVar<int32_t>("vulkan_pipeline_creation_threads", 1);
+  // Async compilation keeps the frame loop alive through FSI's much larger
+  // pipeline compilations (sync stalls there starve the watchdog into killing
+  // the app). Off on the FBO path where sync compiles are short and
+  // placeholders would muddy diagnostics.
+  if (xe::gpu::vulkan::GetAndroidHaloExperiment().force_fsi) {
+    OverrideAndroidConfigVar<bool>("async_shader_compilation", true);
+    OverrideAndroidConfigVar<int32_t>("vulkan_pipeline_creation_threads", 2);
+  } else {
+    OverrideAndroidConfigVar<bool>("async_shader_compilation", false);
+    OverrideAndroidConfigVar<int32_t>("vulkan_pipeline_creation_threads", 1);
+  }
   OverrideAndroidConfigVar<std::string>("xma_decoder", "old");
   OverrideAndroidConfigVar<uint64_t>("framerate_limit", 30);
-  OverrideAndroidConfigVar<std::string>("render_target_path", "accuracy");
-  OverrideAndroidConfigVar<std::string>("render_target_path_vulkan", "fsi");
-  OverrideAndroidConfigVar<std::string>("readback_resolve", "full");
-  OverrideAndroidConfigVar<bool>("readback_memexport", true);
-  OverrideAndroidConfigVar<bool>("readback_memexport_fast", true);
+  OverrideAndroidConfigVar<std::string>("render_target_path", "performance");
+  OverrideAndroidConfigVar<std::string>("render_target_path_vulkan", "");
+  // readback_resolve=full stalls the GPU on every resolve (the dominant cost
+  // at ~8 resolves/frame) but keeps CPU-visible guest memory authoritative
+  // for the diagnostics dumps. Experiment-switchable for perf A/B runs.
+  if (xe::gpu::vulkan::GetAndroidHaloExperiment().readback_resolve_full) {
+    OverrideAndroidConfigVar<std::string>("readback_resolve", "full");
+  }
+  if (xe::gpu::vulkan::GetAndroidHaloExperiment().vblank_uncapped) {
+    OverrideAndroidConfigVar<bool>("guest_display_refresh_cap", false);
+  }
+  if (xe::gpu::vulkan::GetAndroidHaloExperiment().quiet_logs) {
+    OverrideAndroidConfigVar<int32_t>("log_level", 1);
+  } else {
+    OverrideAndroidConfigVar<int32_t>("log_level", 2);
+  }
   OverrideAndroidConfigVar<bool>("vulkan_dynamic_rendering", false);
   OverrideAndroidConfigVar<bool>("vulkan_sparse_shared_memory", true);
   OverrideAndroidConfigVar<bool>("tiled_shared_memory", true);
@@ -933,24 +986,35 @@ bool EmulatorApp::OnInitialize() {
   OverrideAndroidConfigVar<std::string>("postprocess_scaling_and_sharpening",
                                         "");
   OverrideAndroidConfigVar<bool>("postprocess_dither", false);
+  ApplyAndroidCompatPresentationDefaults();
   ApplyAndroidProfileFileOverrides(storage_root);
   XELOGI(
       "Android forced profile: discord={} async_shader_compilation={} "
       "vulkan_pipeline_creation_threads={} xma_decoder={} framerate_limit={} "
-      "render_target_path={} readback_resolve={} readback_memexport={} "
-      "readback_memexport_fast={} vulkan_dynamic_rendering={} "
-      "vulkan_sparse_shared_memory={} tiled_shared_memory={} "
-      "mrt_edram_used_range_clamp_to_min={} native_2x_msaa={} "
-      "postprocess_antialiasing={} postprocess_scaling_and_sharpening={} "
-      "postprocess_dither={}",
+      "render_target_path={} render_target_path_vulkan={} readback_resolve={} "
+      "guest_display_refresh_cap={} "
+      "readback_memexport={} readback_memexport_fast={} "
+      "halo_android_compat_presentable_color_shadow={} "
+      "halo_android_compat_skip_depth_to_color_alias={} "
+      "halo_android_compat_direct_presentable_resolve={} "
+      "halo_android_compat_linear_to_tiled_frontbuffer={} "
+      "vulkan_dynamic_rendering={} vulkan_sparse_shared_memory={} "
+      "tiled_shared_memory={} mrt_edram_used_range_clamp_to_min={} "
+      "native_2x_msaa={} postprocess_antialiasing={} "
+      "postprocess_scaling_and_sharpening={} postprocess_dither={}",
       cvars::discord, cvars::async_shader_compilation,
       cvars::vulkan_pipeline_creation_threads, cvars::xma_decoder,
       cvars::framerate_limit, cvars::render_target_path,
-      cvars::readback_resolve, cvars::readback_memexport,
-      cvars::readback_memexport_fast, cvars::vulkan_dynamic_rendering,
-      cvars::vulkan_sparse_shared_memory, cvars::tiled_shared_memory,
-      cvars::mrt_edram_used_range_clamp_to_min, cvars::native_2x_msaa,
-      cvars::postprocess_antialiasing,
+      cvars::render_target_path_vulkan, cvars::readback_resolve,
+      cvars::guest_display_refresh_cap,
+      cvars::readback_memexport, cvars::readback_memexport_fast,
+      cvars::halo_android_compat_presentable_color_shadow,
+      cvars::halo_android_compat_skip_depth_to_color_alias,
+      cvars::halo_android_compat_direct_presentable_resolve,
+      cvars::halo_android_compat_linear_to_tiled_frontbuffer,
+      cvars::vulkan_dynamic_rendering, cvars::vulkan_sparse_shared_memory,
+      cvars::tiled_shared_memory, cvars::mrt_edram_used_range_clamp_to_min,
+      cvars::native_2x_msaa, cvars::postprocess_antialiasing,
       cvars::postprocess_scaling_and_sharpening, cvars::postprocess_dither);
 #endif
 

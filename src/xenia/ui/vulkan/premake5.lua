@@ -44,7 +44,7 @@ project("xenia-ui-vulkan")
     "../shaders/bytecode/vulkan_spirv/*.h",
   })
 
-if enableMiscSubprojects then
+if enableMiscSubprojects or os.istarget("android") then
   group("demos")
   project("xenia-ui-window-vulkan-demo")
     uuid("97598f13-3177-454c-8e58-c59e2b6ede27")
@@ -81,11 +81,20 @@ if enableMiscSubprojects then
     files({
       "../window_demo.cc",
       "vulkan_window_demo.cc",
-      project_root.."/src/xenia/ui/windowed_app_main_qt.cc",
     })
+    filter("platforms:not Android-*")
+      files({
+        project_root.."/src/xenia/ui/windowed_app_main_qt.cc",
+      })
+    filter({})
     resincludedirs({
       project_root,
     })
+    if os.istarget("android") then
+      filter("platforms:Android-*")
+        wholelib("On")
+      filter({})
+    end
 
     filter("architecture:x86_64")
       links({

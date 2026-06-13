@@ -418,7 +418,16 @@ void Shader::GatherVertexFetchInformation(
     }
   }
   if (!attrib) {
+#if XE_PLATFORM_ANDROID
+    if (!fetch_instr.attributes.stride) {
+      XELOGW(
+          "Shader::GatherVertexFetchInformation: allowing zero vertex stride "
+          "for fetch constant {}",
+          op.fetch_constant_index());
+    }
+#else
     assert_not_zero(fetch_instr.attributes.stride);
+#endif
     VertexBinding vertex_binding;
     vertex_binding.binding_index = int(vertex_bindings_.size());
     vertex_binding.fetch_constant = op.fetch_constant_index();

@@ -36,8 +36,11 @@ DEFINE_int32(
     "opaquely to the game.\n"
     "See draw_resolution_scale_x for more information.",
     "GPU");
+// Android fork: defaults tightened from desktop's 384/30/768 - mission loads
+// on a unified-memory 8GB device were driving the OS into swap thrash and
+// watchdog kills ("device is not responding") while textures streamed in.
 DEFINE_uint32(
-    texture_cache_memory_limit_soft, 384,
+    texture_cache_memory_limit_soft, 192,
     "Maximum host texture memory usage (in megabytes) above which old textures "
     "will be destroyed.",
     "GPU");
@@ -47,7 +50,7 @@ DEFINE_uint32(
     "deleted if texture memory usage exceeds texture_cache_memory_limit_soft.",
     "GPU");
 DEFINE_uint32(
-    texture_cache_memory_limit_hard, 768,
+    texture_cache_memory_limit_hard, 320,
     "Maximum host texture memory usage (in megabytes) above which textures "
     "will be destroyed as soon as possible.",
     "GPU");

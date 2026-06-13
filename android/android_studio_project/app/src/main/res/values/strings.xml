@@ -4,6 +4,10 @@
     <string name="activity_label_gpu_trace_viewer">GPU Trace Viewer</string>
     <string name="activity_label_window_demo">Window Demo</string>
     <string name="launcher_button_rescan">Rescan Game Storage</string>
+    <string name="launcher_button_pick_game">Pick Game File</string>
+    <string name="launcher_import_success">Game copied to %1$s</string>
+    <string name="launcher_import_failed">Could not import the selected game file.</string>
+    <string name="launcher_import_failed_with_reason">Could not import game: %1$s</string>
     <string name="launcher_status_emulator_warning">Android Emulator is still experimental for this port. A real Vulkan Android device is more likely to work.</string>
     <string name="launcher_status_missing_game">No Xbox 360 image was found yet.</string>
     <string name="launcher_status_ready">A launchable Xbox 360 image was detected.</string>

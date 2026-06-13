@@ -8,6 +8,9 @@
  */
 
 #include "xenia/vfs/virtual_file_system.h"
+
+#include <string_view>
+
 #include "xenia/kernel/xam/content_manager.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 
@@ -21,6 +24,25 @@ namespace xe {
 namespace vfs {
 
 using namespace xe::literals;
+
+namespace {
+
+bool ShouldLogHaloVfsPath(std::string_view path) {
+  return xe::utf8::find_first_of_case(path, "maps") != std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "mainmenu") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "bink") != std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "cache") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "webcache") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "harddisk") !=
+             std::string_view::npos ||
+         xe::utf8::find_first_of_case(path, "partition") !=
+             std::string_view::npos;
+}
+
+}  // namespace
 
 VirtualFileSystem::VirtualFileSystem() {}
 
@@ -147,6 +169,13 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
 
   const auto& device = *it;
   auto relative_path = normalized_path.substr(device->mount_path().size());
+  if (ShouldLogHaloVfsPath(path) || ShouldLogHaloVfsPath(normalized_path) ||
+      ShouldLogHaloVfsPath(device->mount_path())) {
+    XELOGI(
+        "HaloReach VFS resolve path='{}' normalized='{}' device='{}' "
+        "relative='{}'",
+        path, normalized_path, device->mount_path(), relative_path);
+  }
   return device->ResolvePath(relative_path);
 }
 
@@ -211,6 +240,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
   if (desired_access & FileAccess::kGenericAll) {
     desired_access |= FileAccess::kFileReadData | FileAccess::kFileWriteData;
   }
+  const bool log_halo_file = ShouldLogHaloVfsPath(path);
 
   // Lookup host device/parent path.
   // If no device or parent, fail.
@@ -223,6 +253,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
                                : root_entry->ResolvePath(base_path);
     if (!parent_entry) {
       *out_action = FileAction::kDoesNotExist;
+      if (log_halo_file) {
+        XELOGI("HaloReach VFS open path='{}' failed: missing parent '{}'",
+               path, base_path);
+      }
       return X_STATUS_NO_SUCH_FILE;
     }
 
@@ -261,6 +295,12 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
       // Must exist.
       if (!entry) {
         *out_action = FileAction::kDoesNotExist;
+        if (log_halo_file) {
+          XELOGI(
+              "HaloReach VFS open path='{}' failed: missing entry "
+              "base='{}'",
+              path, base_path);
+        }
         return X_STATUS_NO_SUCH_FILE;
       }
       break;
@@ -338,6 +378,14 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
   auto result = entry->Open(desired_access, out_file);
   if (XFAILED(result)) {
     *out_action = FileAction::kDoesNotExist;
+  }
+  if (log_halo_file || (entry && ShouldLogHaloVfsPath(entry->absolute_path()))) {
+    XELOGI(
+        "HaloReach VFS open path='{}' result=0x{:08X} action={} "
+        "entry='{}' size=0x{:X} attrs=0x{:08X} access=0x{:08X}",
+        path, static_cast<uint32_t>(result), static_cast<uint32_t>(*out_action),
+        entry ? entry->absolute_path() : "", entry ? entry->size() : 0,
+        entry ? entry->attributes() : 0, desired_access);
   }
   return result;
 }
