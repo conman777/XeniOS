@@ -195,6 +195,14 @@ DECLARE_bool(native_2x_msaa);
 DECLARE_bool(vulkan_dynamic_rendering);
 DECLARE_bool(vulkan_sparse_shared_memory);
 DECLARE_bool(tiled_shared_memory);
+DECLARE_uint32(vulkan_render_target_memory_limit_mb);
+DECLARE_uint32(vulkan_memory_limit_mb);
+DECLARE_uint32(vulkan_kgsl_memory_limit_mb);
+DECLARE_uint32(vulkan_texture_memory_limit_mb);
+DECLARE_uint32(texture_cache_memory_limit_soft);
+DECLARE_uint32(texture_cache_memory_limit_soft_lifetime);
+DECLARE_uint32(texture_cache_memory_limit_hard);
+DECLARE_uint32(texture_cache_memory_limit_render_to_texture);
 DECLARE_string(postprocess_antialiasing);
 DECLARE_string(postprocess_scaling_and_sharpening);
 DECLARE_bool(postprocess_dither);
@@ -287,6 +295,9 @@ class EmulatorApp final : public xe::ui::WindowedApp {
 
  protected:
   void OnDestroy() override;
+#if XE_PLATFORM_ANDROID
+  void OnMemoryPressure(int32_t level) override;
+#endif
 
  private:
   template <typename T, typename... Args>
@@ -517,6 +528,12 @@ bool ParseAndroidProfileUint64(std::string value, uint64_t& parsed_value) {
 
 bool ApplyAndroidProfileOverride(const std::string& name,
                                  const std::string& value) {
+  if (name == "dump_shaders") {
+    OverrideAndroidConfigVar<std::filesystem::path>(
+        name.c_str(), std::filesystem::path(UnquoteAndroidProfileValue(value)));
+    return true;
+  }
+
   if (name == "render_target_path" || name == "render_target_path_vulkan" ||
       name == "readback_resolve" || name == "xma_decoder" ||
       name == "postprocess_antialiasing" ||
@@ -526,7 +543,7 @@ bool ApplyAndroidProfileOverride(const std::string& name,
     return true;
   }
 
-  if (name == "async_shader_compilation" ||
+  if (name == "mount_cache" || name == "async_shader_compilation" ||
       name == "vulkan_dynamic_rendering" ||
       name == "vulkan_sparse_shared_memory" ||
       name == "tiled_shared_memory" || name == "postprocess_dither" ||
@@ -580,7 +597,15 @@ bool ApplyAndroidProfileOverride(const std::string& name,
   }
 
   if (name == "halo_android_gpu_summary_ms" ||
-      name == "halo_android_diag_swap_base_page_override") {
+      name == "halo_android_diag_swap_base_page_override" ||
+      name == "vulkan_render_target_memory_limit_mb" ||
+      name == "vulkan_memory_limit_mb" ||
+      name == "vulkan_kgsl_memory_limit_mb" ||
+      name == "vulkan_texture_memory_limit_mb" ||
+      name == "texture_cache_memory_limit_soft" ||
+      name == "texture_cache_memory_limit_soft_lifetime" ||
+      name == "texture_cache_memory_limit_hard" ||
+      name == "texture_cache_memory_limit_render_to_texture") {
     uint32_t parsed_value = 0;
     if (!ParseAndroidProfileUint32(value, parsed_value)) {
       return false;
@@ -950,6 +975,11 @@ bool EmulatorApp::OnInitialize() {
   // Saved config files can override Android launch/default values. Keep the
   // mobile profile deterministic for compatibility and battery/thermal limits.
   OVERRIDE_bool(discord, false);
+  // Reach rewrites multi-gigabyte cache partition files during campaign load.
+  // On Android those mapped writes consume unified memory until the process is
+  // killed. The cache mount is optional and is already a Halo compatibility
+  // toggle on other mobile platforms.
+  OVERRIDE_bool(mount_cache, false);
   // Async compilation keeps the frame loop alive through FSI's much larger
   // pipeline compilations (sync stalls there starve the watchdog into killing
   // the app). Off on the FBO path where sync compiles are short and
@@ -982,6 +1012,20 @@ bool EmulatorApp::OnInitialize() {
   OverrideAndroidConfigVar<bool>("vulkan_dynamic_rendering", false);
   OverrideAndroidConfigVar<bool>("vulkan_sparse_shared_memory", true);
   OverrideAndroidConfigVar<bool>("tiled_shared_memory", true);
+  OverrideAndroidConfigVar<uint32_t>("vulkan_render_target_memory_limit_mb",
+                                     384);
+  OverrideAndroidConfigVar<uint32_t>("vulkan_memory_limit_mb", 2048);
+  OverrideAndroidConfigVar<uint32_t>("vulkan_kgsl_memory_limit_mb", 2048);
+  OverrideAndroidConfigVar<uint32_t>("vulkan_texture_memory_limit_mb", 768);
+  // Keep enough headroom for guest RAM, render targets, and driver-managed
+  // allocations on unified-memory Android devices. Profile files may override
+  // these defaults below.
+  OverrideAndroidConfigVar<uint32_t>("texture_cache_memory_limit_soft", 96);
+  OverrideAndroidConfigVar<uint32_t>(
+      "texture_cache_memory_limit_soft_lifetime", 5);
+  OverrideAndroidConfigVar<uint32_t>("texture_cache_memory_limit_hard", 160);
+  OverrideAndroidConfigVar<uint32_t>(
+      "texture_cache_memory_limit_render_to_texture", 24);
   OverrideAndroidConfigVar<std::string>("postprocess_antialiasing", "");
   OverrideAndroidConfigVar<std::string>("postprocess_scaling_and_sharpening",
                                         "");
@@ -989,7 +1033,8 @@ bool EmulatorApp::OnInitialize() {
   ApplyAndroidCompatPresentationDefaults();
   ApplyAndroidProfileFileOverrides(storage_root);
   XELOGI(
-      "Android forced profile: discord={} async_shader_compilation={} "
+      "Android forced profile: discord={} mount_cache={} "
+      "async_shader_compilation={} "
       "vulkan_pipeline_creation_threads={} xma_decoder={} framerate_limit={} "
       "render_target_path={} render_target_path_vulkan={} readback_resolve={} "
       "guest_display_refresh_cap={} "
@@ -999,10 +1044,18 @@ bool EmulatorApp::OnInitialize() {
       "halo_android_compat_direct_presentable_resolve={} "
       "halo_android_compat_linear_to_tiled_frontbuffer={} "
       "vulkan_dynamic_rendering={} vulkan_sparse_shared_memory={} "
-      "tiled_shared_memory={} mrt_edram_used_range_clamp_to_min={} "
+      "tiled_shared_memory={} vulkan_render_target_memory_limit_mb={} "
+      "vulkan_memory_limit_mb={} "
+      "vulkan_kgsl_memory_limit_mb={} "
+      "vulkan_texture_memory_limit_mb={} "
+      "mrt_edram_used_range_clamp_to_min={} "
+      "texture_cache_memory_limit_soft={} "
+      "texture_cache_memory_limit_soft_lifetime={} "
+      "texture_cache_memory_limit_hard={} "
+      "texture_cache_memory_limit_render_to_texture={} "
       "native_2x_msaa={} postprocess_antialiasing={} "
       "postprocess_scaling_and_sharpening={} postprocess_dither={}",
-      cvars::discord, cvars::async_shader_compilation,
+      cvars::discord, cvars::mount_cache, cvars::async_shader_compilation,
       cvars::vulkan_pipeline_creation_threads, cvars::xma_decoder,
       cvars::framerate_limit, cvars::render_target_path,
       cvars::render_target_path_vulkan, cvars::readback_resolve,
@@ -1013,7 +1066,16 @@ bool EmulatorApp::OnInitialize() {
       cvars::halo_android_compat_direct_presentable_resolve,
       cvars::halo_android_compat_linear_to_tiled_frontbuffer,
       cvars::vulkan_dynamic_rendering, cvars::vulkan_sparse_shared_memory,
-      cvars::tiled_shared_memory, cvars::mrt_edram_used_range_clamp_to_min,
+      cvars::tiled_shared_memory,
+      cvars::vulkan_render_target_memory_limit_mb,
+      cvars::vulkan_memory_limit_mb,
+      cvars::vulkan_kgsl_memory_limit_mb,
+      cvars::vulkan_texture_memory_limit_mb,
+      cvars::mrt_edram_used_range_clamp_to_min,
+      cvars::texture_cache_memory_limit_soft,
+      cvars::texture_cache_memory_limit_soft_lifetime,
+      cvars::texture_cache_memory_limit_hard,
+      cvars::texture_cache_memory_limit_render_to_texture,
       cvars::native_2x_msaa, cvars::postprocess_antialiasing,
       cvars::postprocess_scaling_and_sharpening, cvars::postprocess_dither);
 #endif
@@ -1130,6 +1192,23 @@ void EmulatorApp::OnDestroy() {
   xe::FlushLog();
   std::quick_exit(EXIT_SUCCESS);
 }
+
+#if XE_PLATFORM_ANDROID
+void EmulatorApp::OnMemoryPressure(int32_t level) {
+  // ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE is 5. Start reclaiming
+  // here so the deferred Vulkan cleanup can finish before a critical kill.
+  if (level < 5 || !emulator_ || !emulator_->graphics_system()) {
+    return;
+  }
+  XELOGW("Android memory pressure level {}: clearing GPU caches", level);
+  gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
+  graphics_system->ClearCaches();
+  graphics_system->InvalidateGpuMemory();
+  graphics_system->command_processor()->CallInThread([graphics_system]() {
+    graphics_system->command_processor()->ClearReadbackBuffers();
+  });
+}
+#endif
 
 void EmulatorApp::EmulatorThread(bool is_game_process) {
   assert_not_null(emulator_thread_event_);

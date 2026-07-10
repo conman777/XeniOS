@@ -1,0 +1,64 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2026 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#include "texture_load.xesli"
+
+byte_buffer_align4_wo_declare_xe(xe_texture_load_dest, set=0, binding=0, u0,
+                                 space0)
+byte_buffer_align4_declare_xe(xe_texture_load_source, set=1, binding=0, t0,
+                              space0)
+
+void StoreRGBA16PatternPixel(const XeTextureLoadInfo load_info,
+                             const uint3_xe block_index,
+                             const uint block_offset_host) {
+  float2_xe uv = (float2_xe(block_index.xy) + 0.5f) /
+                 float2_xe(load_info.size_blocks.xy);
+  float checker = float(((block_index.x >> 5u) ^
+                         (block_index.y >> 5u)) & 1u);
+  byte_buffer_align4_store4_xe(
+      xe_texture_load_dest, block_offset_host,
+      pack_half_2x16_xe(uv));
+  byte_buffer_align4_store4_xe(
+      xe_texture_load_dest, block_offset_host + 4u,
+      pack_half_2x16_xe(float2_xe(checker, 1.0f)));
+}
+
+entry_bindings_begin_compute_xe
+  XE_TEXTURE_LOAD_PUSH_CONST_BINDING
+  entry_binding_next_xe
+  byte_buffer_wo_binding_xe(xe_texture_load_dest, buffer(1))
+  entry_binding_next_xe
+  byte_buffer_binding_xe(xe_texture_load_source, buffer(2))
+entry_bindings_end_inputs_begin_compute_xe
+  entry_in_global_thread_id_xe
+entry_inputs_end_code_begin_compute_xe
+{
+  XeTextureLoadInfo load_info = XeTextureLoadGetInfo(pass_push_consts_xe);
+  uint3_xe block_index = in_global_thread_id_xe << uint3_xe(2u, 0u, 0u);
+  dont_flatten_xe
+  if (any(greater_than_equal_xe(block_index.xy, load_info.size_blocks.xy))) {
+    return;
+  }
+
+  uint block_offset_host =
+      load_info.host_offset +
+      uint(XeTextureHostLinearOffset(int3_xe(block_index), load_info.host_pitch,
+                                     load_info.size_blocks.y, 8u));
+  StoreRGBA16PatternPixel(load_info, block_index, block_offset_host);
+  StoreRGBA16PatternPixel(load_info,
+                          block_index + uint3_xe(1u, 0u, 0u),
+                          block_offset_host + 8u);
+  StoreRGBA16PatternPixel(load_info,
+                          block_index + uint3_xe(2u, 0u, 0u),
+                          block_offset_host + 16u);
+  StoreRGBA16PatternPixel(load_info,
+                          block_index + uint3_xe(3u, 0u, 0u),
+                          block_offset_host + 24u);
+}
+entry_code_end_compute_xe

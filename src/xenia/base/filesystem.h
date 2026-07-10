@@ -96,6 +96,10 @@ class FileHandle {
   virtual bool Read(size_t file_offset, void* buffer, size_t buffer_length,
                     size_t* out_bytes_read) = 0;
 
+  // Hints that data in this range is no longer needed in the host file cache.
+  // Platforms that don't support this may ignore the request.
+  virtual void DiscardCachedData(size_t file_offset, size_t length) {}
+
   // Writes the given buffer to the file starting at the given offset.
   // The total number of bytes written is returned only if the complete
   // write succeeds.

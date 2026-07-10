@@ -69,6 +69,7 @@ push_const_end_xe
 struct XeTextureLoadInfo {
   bool is_tiled;
   bool is_3d;
+  bool diagnostic_pattern;
   uint endian_32;
   uint2_xe resolution_scale;
   uint guest_offset;
@@ -92,6 +93,8 @@ XeTextureLoadInfo XeTextureLoadGetInfo(param_push_consts_xe) {
     load_info.is_tiled = (is_tiled_3d_endian_scale & 1u) != 0u;
   #endif
   load_info.is_3d = (is_tiled_3d_endian_scale & (1u << 1u)) != 0u;
+  load_info.diagnostic_pattern =
+      (is_tiled_3d_endian_scale & (1u << 31u)) != 0u;
   load_info.endian_32 = (is_tiled_3d_endian_scale >> 2u) & 3u;
   #ifdef XE_TEXTURE_LOAD_RESOLUTION_SCALED
     load_info.resolution_scale =
@@ -154,6 +157,40 @@ uint XeTextureLoadSourceAddress(const XeTextureLoadInfo load_info,
 #endif
   address += load_info.guest_offset;
   return address;
+}
+
+// Equivalent to XenosTextureTiledAddress2D, but keeps all intermediate values
+// unsigned. This avoids signed shift and bitwise integer operations in the
+// Adreno-safe scalar loaders.
+uint XeTextureLoadSourceAddressUnsigned2D(
+    const XeTextureLoadInfo load_info, const uint3_xe guest_position,
+    const uint bytes_per_block_log2) {
+  if (!load_info.is_tiled || load_info.is_3d) {
+    return XeTextureLoadSourceAddress(load_info, guest_position,
+                                      bytes_per_block_log2);
+  }
+
+  uint outer_blocks =
+      (((guest_position.y >> XENOS_TEXTURE_MACRO_TILE_HEIGHT_2D_LOG2) *
+            (load_info.guest_pitch_aligned >>
+             XENOS_TEXTURE_MACRO_TILE_WIDTH_LOG2) +
+        (guest_position.x >> XENOS_TEXTURE_MACRO_TILE_WIDTH_LOG2))
+       << 6u);
+  uint inner_blocks = (((guest_position.y >> 1u) & 7u) << 3u) |
+                      (guest_position.x & 7u);
+  uint outer_inner_bytes =
+      (outer_blocks | inner_blocks) << bytes_per_block_log2;
+  uint bank = (guest_position.y >> 4u) & 1u;
+  uint pipe = ((guest_position.x >> 3u) & 3u) ^
+              (((guest_position.y >> 3u) & 1u) << 1u);
+  uint address = (guest_position.y & 1u) << 4u;
+  address |= pipe << 6u;
+  address |= bank << 11u;
+  address |= outer_inner_bytes & 0xFu;
+  address |= ((outer_inner_bytes >> 4u) & 1u) << 5u;
+  address |= ((outer_inner_bytes >> 5u) & 7u) << 8u;
+  address |= (outer_inner_bytes >> 8u) << 12u;
+  return load_info.guest_offset + address;
 }
 
 // XOR to apply to the byte address to flip the bits corresponding to the given

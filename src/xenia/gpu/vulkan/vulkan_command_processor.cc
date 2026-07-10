@@ -21,7 +21,12 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
+
+#if XE_PLATFORM_ANDROID
+#include <unistd.h>
+#endif
 
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
@@ -51,10 +56,13 @@
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(gpu_debug_markers);
 DECLARE_bool(halo_android_diagnostics);
+DECLARE_bool(halo_android_diag_log_texture_bindings);
 DECLARE_uint32(halo_android_gpu_summary_ms);
 DECLARE_bool(occlusion_query_enable);
 DECLARE_bool(readback_memexport_fast);
 DECLARE_bool(submit_on_primary_buffer_end);
+DECLARE_uint32(vulkan_memory_limit_mb);
+DECLARE_uint32(vulkan_texture_memory_limit_mb);
 
 DEFINE_bool(
     vulkan_dynamic_rendering, true,
@@ -74,6 +82,12 @@ DEFINE_bool(halo_android_diag_log_draws, false,
 DEFINE_bool(halo_android_diag_skip_draws_to_base_1350, false,
             "Skip Android guest draws that target color RT base tile 1350.",
             "Android");
+DEFINE_uint32(
+    vulkan_kgsl_memory_limit_mb, 0,
+    "Maximum process GPU allocation bytes reported by Qualcomm KGSL, in MiB. "
+    "0 disables KGSL-level reclamation or is used when KGSL debug data is "
+    "unavailable.",
+    "Android");
 
 namespace xe {
 namespace gpu {
@@ -81,6 +95,27 @@ namespace vulkan {
 
 #if XE_PLATFORM_ANDROID
 namespace {
+
+uint64_t ReadAndroidKgslProcessMemoryUsage() {
+  std::ifstream memory_file("/d/kgsl/proc/" + std::to_string(getpid()) +
+                            "/mem");
+  if (!memory_file) {
+    return 0;
+  }
+  uint64_t total_bytes = 0;
+  std::string line;
+  std::getline(memory_file, line);
+  while (std::getline(memory_file, line)) {
+    std::istringstream line_stream(line);
+    std::string gpu_address;
+    std::string user_address;
+    uint64_t size = 0;
+    if (line_stream >> gpu_address >> user_address >> size) {
+      total_bytes += size;
+    }
+  }
+  return total_bytes;
+}
 
 struct AndroidRawImageStats {
   uint8_t min[3] = {std::numeric_limits<uint8_t>::max(),
@@ -515,8 +550,42 @@ void VulkanCommandProcessor::InvalidateGpuMemory() {
 }
 
 void VulkanCommandProcessor::ClearReadbackBuffers() {
-  readback_buffers_.clear();
-  memexport_readback_buffers_.clear();
+  if (readback_buffers_.empty() && memexport_readback_buffers_.empty() &&
+      memexport_readback_buffer_ == VK_NULL_HANDLE) {
+    return;
+  }
+  if (!AwaitAllQueueOperationsCompletion()) {
+    XELOGE("VulkanCommandProcessor: Failed to wait before clearing readback "
+           "buffers");
+    return;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  auto destroy_buffer_map = [&](auto& buffer_map) {
+    for (auto& pair : buffer_map) {
+      ReadbackBuffer& readback_buffer = pair.second;
+      for (uint32_t i = 0; i < 2; ++i) {
+        if (readback_buffer.mapped_data[i] != nullptr) {
+          dfn.vkUnmapMemory(device, readback_buffer.memories[i]);
+        }
+        ui::vulkan::util::DestroyAndNullHandle(
+            dfn.vkDestroyBuffer, device, readback_buffer.buffers[i]);
+        ui::vulkan::util::DestroyAndNullHandle(
+            dfn.vkFreeMemory, device, readback_buffer.memories[i]);
+      }
+    }
+    buffer_map.clear();
+  };
+  destroy_buffer_map(readback_buffers_);
+  destroy_buffer_map(memexport_readback_buffers_);
+
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         memexport_readback_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         memexport_readback_buffer_memory_);
+  memexport_readback_buffer_size_ = 0;
 }
 
 void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr,
@@ -3417,6 +3486,110 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     return IssueCopy();
   }
 
+#if XE_PLATFORM_ANDROID
+  // Reach can load hundreds of megabytes of textures without closing a frame.
+  // Texture eviction is submission-completion based, and VMA block bytes may
+  // greatly exceed the sum of live allocation bytes on Adreno. Split at this
+  // safe pre-draw boundary. The previous draw is fully encoded here, and the
+  // next draw hasn't acquired texture pointers.
+  VulkanTextureCache::AllocatorMemoryUsage texture_allocator_usage;
+  const VkDeviceSize texture_allocator_limit =
+      VkDeviceSize(cvars::vulkan_texture_memory_limit_mb) << 20;
+  const VkDeviceSize vulkan_heap_limit =
+      VkDeviceSize(cvars::vulkan_memory_limit_mb) << 20;
+  const uint64_t android_kgsl_limit =
+      uint64_t(cvars::vulkan_kgsl_memory_limit_mb) << 20;
+  static uint64_t android_kgsl_last_check_millis = 0;
+  static uint64_t android_kgsl_last_reclaim_millis = 0;
+  static uint64_t android_kgsl_usage = 0;
+  const uint64_t android_kgsl_now_millis =
+      xe::Clock::QueryHostUptimeMillis();
+  if (android_kgsl_limit &&
+      android_kgsl_now_millis >= android_kgsl_last_check_millis + 500) {
+    android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
+    android_kgsl_last_check_millis = android_kgsl_now_millis;
+  }
+  if (texture_cache_) {
+    texture_allocator_usage = texture_cache_->GetAllocatorMemoryUsage();
+  }
+  const bool texture_allocator_limit_exceeded =
+      texture_allocator_limit &&
+      texture_allocator_usage.block_bytes > texture_allocator_limit;
+  const bool vulkan_heap_limit_exceeded =
+      vulkan_heap_limit &&
+      texture_allocator_usage.heap_usage_bytes > vulkan_heap_limit;
+  const bool android_kgsl_limit_exceeded =
+      android_kgsl_limit && android_kgsl_usage > android_kgsl_limit &&
+      android_kgsl_now_millis >= android_kgsl_last_reclaim_millis + 3000;
+  if (texture_cache_ &&
+      (texture_cache_->IsHostMemoryUsageAboveHardLimit() ||
+       texture_allocator_limit_exceeded || vulkan_heap_limit_exceeded ||
+       android_kgsl_limit_exceeded)) {
+    const uint64_t usage_before = texture_cache_->GetTotalHostMemoryUsage();
+    XELOGW(
+        "Android Vulkan texture cache pressure: payload={} MB (hard limit {} "
+        "MB) VMA blocks={} MB allocations={} MB blocks={} allocations={} "
+        "Vulkan heap={} / {} MB KGSL={} MB; "
+        "submitting before the next draw",
+        (usage_before + ((UINT64_C(1) << 20) - 1)) >> 20,
+        texture_cache_->GetHostMemoryHardLimitMB(),
+        (texture_allocator_usage.block_bytes +
+         ((VkDeviceSize(1) << 20) - 1)) >>
+            20,
+        (texture_allocator_usage.allocation_bytes +
+         ((VkDeviceSize(1) << 20) - 1)) >>
+            20,
+        texture_allocator_usage.block_count,
+        texture_allocator_usage.allocation_count,
+        (texture_allocator_usage.heap_usage_bytes +
+         ((VkDeviceSize(1) << 20) - 1)) >>
+            20,
+        texture_allocator_usage.heap_budget_bytes >> 20,
+        (android_kgsl_usage + ((UINT64_C(1) << 20) - 1)) >> 20);
+    if (!EndSubmission(false) || !AwaitAllQueueOperationsCompletion()) {
+      XELOGE("Android Vulkan texture cache reclamation submission failed");
+      return false;
+    }
+    VulkanTextureCache::AllocatorMemoryUsage texture_allocator_after =
+        texture_cache_->GetAllocatorMemoryUsage();
+    if (texture_allocator_limit &&
+        texture_allocator_after.block_bytes > texture_allocator_limit) {
+      texture_cache_->ClearCache();
+      texture_allocator_after = texture_cache_->GetAllocatorMemoryUsage();
+    }
+    if ((vulkan_heap_limit &&
+         texture_allocator_after.heap_usage_bytes > vulkan_heap_limit) ||
+        android_kgsl_limit_exceeded) {
+      texture_cache_->ClearCache();
+      pipeline_cache_->ClearCache();
+      render_target_cache_->ClearCache();
+      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+      current_guest_graphics_pipeline_layout_ = nullptr;
+      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+      current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+      texture_allocator_after = texture_cache_->GetAllocatorMemoryUsage();
+    }
+    if (android_kgsl_limit_exceeded) {
+      android_kgsl_last_reclaim_millis = android_kgsl_now_millis;
+      android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
+      android_kgsl_last_check_millis = android_kgsl_now_millis;
+    }
+    const uint64_t usage_after = texture_cache_->GetTotalHostMemoryUsage();
+    XELOGW(
+        "Android Vulkan texture cache reclaimed {} MB payload; {} MB payload "
+        "and {} MB VMA blocks retained; Vulkan heap={} MB KGSL={} MB",
+        (usage_before - usage_after) >> 20,
+        (usage_after + ((UINT64_C(1) << 20) - 1)) >> 20,
+        (texture_allocator_after.block_bytes +
+         ((VkDeviceSize(1) << 20) - 1)) >>
+            20,
+        (texture_allocator_after.heap_usage_bytes +
+         ((VkDeviceSize(1) << 20) - 1)) >>
+            20,
+        (android_kgsl_usage + ((UINT64_C(1) << 20) - 1)) >> 20);
+  }
+#endif
+
   const ui::vulkan::VulkanDevice::Properties& device_properties =
       GetVulkanDevice()->properties();
 
@@ -3644,6 +3817,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
 #if XE_PLATFORM_ANDROID
   bool android_targets_base_1350 = false;
   bool android_logged_rt_draw = false;
+  android_base1350_draw_context_ = {};
+  uint32_t android_base1350_draw_sequence = 0;
+  uint32_t android_base1350_target_base = 0;
+  uint32_t android_base1350_target_pitch = 0;
+  uint32_t android_base1350_target_format = 0;
+  uint32_t android_base1350_target_msaa = 0;
+  uint32_t android_base1350_target_width = 0;
   if (render_target_cache_->GetPath() ==
       RenderTargetCache::Path::kHostRenderTargets) {
     auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
@@ -3655,22 +3835,121 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       }
       auto rb_color_info = regs.Get<reg::RB_COLOR_INFO>(
           reg::RB_COLOR_INFO::rt_register_indices[rt_index]);
-      android_targets_base_1350 |= rb_color_info.color_base == 1350;
-      if (cvars::halo_android_diag_log_draws) {
+      const bool android_targets_this_base_1350 =
+          rb_color_info.color_base == 1350;
+      android_targets_base_1350 |= android_targets_this_base_1350;
+      bool is_64bpp = xenos::IsColorRenderTargetFormat64bpp(
+          rb_color_info.color_format);
+      const uint32_t android_target_pitch = xenos::GetSurfacePitchTiles(
+          rb_surface_info.surface_pitch, rb_surface_info.msaa_samples,
+          is_64bpp);
+      const bool android_tracks_menu_opaque_source =
+          GetAndroidHaloExperiment().log_texture_bindings &&
+          rb_color_info.color_base == 0 && android_target_pitch == 29 &&
+          rb_surface_info.msaa_samples == xenos::MsaaSamples::k1X &&
+          rb_color_info.color_format ==
+              xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+          prim_type == xenos::PrimitiveType::kRectangleList &&
+          vertex_shader->ucode_data_hash() == UINT64_C(0x1E6883FCCDE1F688) &&
+          pixel_shader &&
+          pixel_shader->ucode_data_hash() == UINT64_C(0xA4A965C189287B99);
+      const bool android_tracks_base1350_source =
+          android_targets_this_base_1350 &&
+          !GetAndroidHaloExperiment().menu_transfer_in_draw_pass;
+      if (android_tracks_base1350_source ||
+          android_tracks_menu_opaque_source) {
+        android_base1350_target_base = rb_color_info.color_base;
+        android_base1350_target_pitch = android_target_pitch;
+        android_base1350_target_format = uint32_t(rb_color_info.color_format);
+        android_base1350_target_msaa = uint32_t(rb_surface_info.msaa_samples);
+        android_base1350_target_width = rb_surface_info.surface_pitch;
+        if (GetAndroidHaloExperiment().log_texture_bindings) {
+          static uint32_t android_base1350_draw_counter = 0;
+          android_base1350_draw_sequence = ++android_base1350_draw_counter;
+          if (android_tracks_menu_opaque_source &&
+              android_base1350_draw_sequence <= 128) {
+            XELOGI(
+                "MENU_OPAQUE_SOURCE_TRACE draw={} base={} pitch={} vs=0x{:016X} "
+                "ps=0x{:016X}",
+                android_base1350_draw_sequence,
+                android_base1350_target_base,
+                android_base1350_target_pitch,
+                vertex_shader->ucode_data_hash(),
+                pixel_shader->ucode_data_hash());
+          }
+        }
+        android_base1350_draw_context_.valid = true;
+        android_base1350_draw_context_.draw_sequence =
+            android_base1350_draw_sequence;
+        android_base1350_draw_context_.target_base =
+            android_base1350_target_base;
+        android_base1350_draw_context_.target_pitch =
+            android_base1350_target_pitch;
+        android_base1350_draw_context_.target_format =
+            android_base1350_target_format;
+        android_base1350_draw_context_.target_msaa =
+            android_base1350_target_msaa;
+        android_base1350_draw_context_.target_width =
+            android_base1350_target_width;
+      }
+      if (GetAndroidHaloExperiment().log_draws ||
+          (GetAndroidHaloExperiment().log_base675_draw_state &&
+           rb_color_info.color_base == 675) ||
+          (GetAndroidHaloExperiment().log_base0_draw_state &&
+           rb_color_info.color_base == 0)) {
         static uint32_t android_draw_log_count = 0;
-        if (android_draw_log_count < 768 &&
-            (rb_color_info.color_base == 1350 || android_draw_log_count < 96)) {
+        static uint32_t android_base675_draw_log_count = 0;
+        static uint32_t android_base0_draw_log_count = 0;
+        // Narrow to the specific 64bpp F16 format (fmt=7) - base 675 is a
+        // reused scratch address hit by many unrelated passes (menus, UI,
+        // LUTs) first; without this filter a flat counter cap exhausts long
+        // before real gameplay's F16 scene draws are ever reached.
+        bool android_want_base675_log =
+            GetAndroidHaloExperiment().log_base675_draw_state &&
+            rb_color_info.color_base == 675 &&
+            rb_color_info.color_format ==
+                xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT &&
+            android_base675_draw_log_count < 4096;
+        bool android_want_base0_log =
+            GetAndroidHaloExperiment().log_base0_draw_state &&
+            rb_color_info.color_base == 0 &&
+            android_base0_draw_log_count < 4096;
+        bool android_want_general_log =
+            GetAndroidHaloExperiment().log_draws && android_draw_log_count < 768 &&
+            (rb_color_info.color_base == 1350 || android_draw_log_count < 96);
+        if (android_want_general_log || android_want_base675_log ||
+            android_want_base0_log) {
           bool is_64bpp =
               xenos::IsColorRenderTargetFormat64bpp(rb_color_info.color_format);
           uint32_t pitch_tiles = xenos::GetSurfacePitchTiles(
               rb_surface_info.surface_pitch, rb_surface_info.msaa_samples,
               is_64bpp);
+          // WO26 Probe A: also log the guest blend-control fields for this RT
+          // slot so a write-mask-vs-blend mismatch (or blend silently
+          // disabling B/A) is visible directly, not just inferred from the
+          // write mask value.
+          auto blend_control = regs.Get<reg::RB_BLENDCONTROL>(
+              reg::RB_BLENDCONTROL::rt_register_indices[rt_index]);
+          bool android_blend_enabled =
+              rt_write_mask != 0 &&
+              (uint32_t(blend_control.color_srcblend) != 1 /* kOne */ ||
+               uint32_t(blend_control.color_destblend) != 0 /* kZero */ ||
+               uint32_t(blend_control.color_comb_fcn) != 0 /* kAdd */ ||
+               uint32_t(blend_control.alpha_srcblend) != 1 ||
+               uint32_t(blend_control.alpha_destblend) != 0 ||
+               uint32_t(blend_control.alpha_comb_fcn) != 0);
           XELOGI(
               "Android draw {}: prim={} index_count={} host_vertices={} "
               "edram_mode={} raster={} color_mask=0x{:X} rt{} write=0x{:X} "
               "base={} pitch={} msaa={} fmt={} surface_pitch={} "
-              "surface_msaa={} vs=0x{:016X} ps=0x{:016X}",
-              android_draw_log_count, uint32_t(prim_type), index_count,
+              "surface_msaa={} blend_enabled={} color_srcblend={} "
+              "color_destblend={} color_comb_fcn={} alpha_srcblend={} "
+              "alpha_destblend={} alpha_comb_fcn={} vs=0x{:016X} ps=0x{:016X}",
+              android_want_base0_log
+                  ? android_base0_draw_log_count
+                  : (android_want_base675_log ? android_base675_draw_log_count
+                                              : android_draw_log_count),
+              uint32_t(prim_type), index_count,
               primitive_processing_result.host_draw_vertex_count,
               uint32_t(edram_mode), uint32_t(is_rasterization_done),
               normalized_color_mask, rt_index, rt_write_mask,
@@ -3679,15 +3958,75 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
               uint32_t(rb_color_info.color_format),
               uint32_t(rb_surface_info.surface_pitch),
               uint32_t(rb_surface_info.msaa_samples),
+              uint32_t(android_blend_enabled),
+              uint32_t(blend_control.color_srcblend),
+              uint32_t(blend_control.color_destblend),
+              uint32_t(blend_control.color_comb_fcn),
+              uint32_t(blend_control.alpha_srcblend),
+              uint32_t(blend_control.alpha_destblend),
+              uint32_t(blend_control.alpha_comb_fcn),
               vertex_shader->ucode_data_hash(),
               pixel_shader ? pixel_shader->ucode_data_hash() : 0);
-          ++android_draw_log_count;
+          if (android_want_general_log) {
+            ++android_draw_log_count;
+          }
+          if (android_want_base675_log) {
+            ++android_base675_draw_log_count;
+          }
+          if (android_want_base0_log) {
+            ++android_base0_draw_log_count;
+          }
           android_logged_rt_draw = true;
         }
       }
+      const bool android_menu_base0_draw =
+          rb_color_info.color_base == 0 &&
+          rb_color_info.color_format ==
+              xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+          rb_surface_info.surface_pitch == 2320 &&
+          rb_surface_info.msaa_samples == xenos::MsaaSamples::k1X;
+      const bool android_skip_menu_rectangle =
+          android_menu_base0_draw &&
+          GetAndroidHaloExperiment().menu_skip_base0_rectangle_draw &&
+          prim_type == xenos::PrimitiveType::kRectangleList &&
+          vertex_shader->ucode_data_hash() == UINT64_C(0x1E6883FCCDE1F688) &&
+          pixel_shader &&
+          pixel_shader->ucode_data_hash() == UINT64_C(0xA4A965C189287B99);
+      const bool android_skip_menu_triangle_fan =
+          android_menu_base0_draw &&
+          GetAndroidHaloExperiment().menu_skip_base0_triangle_fan_draw &&
+          prim_type == xenos::PrimitiveType::kTriangleFan &&
+          vertex_shader->ucode_data_hash() == UINT64_C(0x4523FA4C99DD7CFE) &&
+          pixel_shader &&
+          pixel_shader->ucode_data_hash() == UINT64_C(0xA19EF9B63E802A8D);
+      const bool android_skip_menu_triangle_list =
+          android_menu_base0_draw &&
+          GetAndroidHaloExperiment().menu_skip_base0_triangle_list_draw &&
+          prim_type == xenos::PrimitiveType::kTriangleList &&
+          vertex_shader->ucode_data_hash() == UINT64_C(0x29E9E186F0CAA289) &&
+          pixel_shader &&
+          pixel_shader->ucode_data_hash() == UINT64_C(0x45B7CB85DB8D0CCE);
+      if (android_skip_menu_rectangle || android_skip_menu_triangle_fan ||
+          android_skip_menu_triangle_list) {
+        static uint32_t android_menu_draw_skip_log_count = 0;
+        if (android_menu_draw_skip_log_count++ < 128) {
+          const char* skip_type = android_skip_menu_rectangle
+                                      ? "rectangle"
+                                  : android_skip_menu_triangle_fan
+                                      ? "triangle_fan"
+                                      : "triangle_list";
+          XELOGI(
+              "MENU_DRAW_SKIP type={} prim={} indices={} vs=0x{:016X} "
+              "ps=0x{:016X}",
+              skip_type, uint32_t(prim_type), index_count,
+              vertex_shader->ucode_data_hash(),
+              pixel_shader->ucode_data_hash());
+        }
+        return true;
+      }
     }
   }
-  if (cvars::halo_android_diag_log_draws) {
+  if (GetAndroidHaloExperiment().log_draws) {
     static uint64_t android_drawstat_frame = 0;
     static uint32_t android_drawstat_total_draws = 0;
     static uint32_t android_drawstat_base1350_draws = 0;
@@ -3710,7 +4049,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       ++android_drawstat_base1350_draws;
     }
   }
-  if (cvars::halo_android_diag_log_draws && !android_logged_rt_draw) {
+  if (GetAndroidHaloExperiment().log_draws && !android_logged_rt_draw) {
     static uint32_t android_non_rt_draw_log_count = 0;
     if (android_non_rt_draw_log_count < 32) {
       auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
@@ -3786,51 +4125,48 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
            : 0);
   texture_cache_->RequestTextures(used_texture_mask);
 
-  // Update the graphics pipeline, and if the new graphics pipeline has a
-  // different layout, invalidate incompatible descriptor sets before updating
-  // current_guest_graphics_pipeline_layout_.
-  // The pipeline may be not ready yet if created asynchronously.
-  // EndSubmission must be called before submitting the command buffer to
-  // await its creation.
-  if (current_guest_graphics_pipeline_ != current_pipeline) {
-    deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                               current_pipeline);
-    current_guest_graphics_pipeline_ = current_pipeline;
-    current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-  }
   auto pipeline_layout =
       static_cast<const PipelineLayout*>(pipeline->pipeline_layout);
-  if (current_guest_graphics_pipeline_layout_ != pipeline_layout) {
-    if (current_guest_graphics_pipeline_layout_) {
-      // Keep descriptor set layouts for which the new pipeline layout is
-      // compatible with the previous one (pipeline layouts are compatible for
-      // set N if set layouts 0 through N are compatible).
-      uint32_t descriptor_sets_kept =
-          uint32_t(SpirvShaderTranslator::kDescriptorSetCount);
-      if (current_guest_graphics_pipeline_layout_
-              ->descriptor_set_layout_textures_vertex_ref() !=
-          pipeline_layout->descriptor_set_layout_textures_vertex_ref()) {
-        descriptor_sets_kept = std::min(
-            descriptor_sets_kept,
-            uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesVertex));
-      }
-      if (current_guest_graphics_pipeline_layout_
-              ->descriptor_set_layout_textures_pixel_ref() !=
-          pipeline_layout->descriptor_set_layout_textures_pixel_ref()) {
-        descriptor_sets_kept = std::min(
-            descriptor_sets_kept,
-            uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
-      }
-      // Invalidate descriptor set bindings for incompatible sets.
-      current_graphics_descriptor_sets_bound_up_to_date_ &=
-          (UINT32_C(1) << descriptor_sets_kept) - 1;
-    } else {
-      // No or unknown pipeline layout previously bound - all bindings are in an
-      // indeterminate state.
-      current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+  auto bind_guest_graphics_pipeline = [&]() {
+    // Transfer draws bind an external pipeline inside the guest render pass,
+    // so this must be reusable immediately before the actual guest draw.
+    if (current_guest_graphics_pipeline_ != current_pipeline) {
+      deferred_command_buffer_.CmdVkBindPipeline(
+          VK_PIPELINE_BIND_POINT_GRAPHICS, current_pipeline);
+      current_guest_graphics_pipeline_ = current_pipeline;
+      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
     }
-    current_guest_graphics_pipeline_layout_ = pipeline_layout;
-  }
+    if (current_guest_graphics_pipeline_layout_ != pipeline_layout) {
+      if (current_guest_graphics_pipeline_layout_) {
+        // Keep descriptor set layouts for which the new pipeline layout is
+        // compatible with the previous one.
+        uint32_t descriptor_sets_kept =
+            uint32_t(SpirvShaderTranslator::kDescriptorSetCount);
+        if (current_guest_graphics_pipeline_layout_
+                ->descriptor_set_layout_textures_vertex_ref() !=
+            pipeline_layout->descriptor_set_layout_textures_vertex_ref()) {
+          descriptor_sets_kept = std::min(
+              descriptor_sets_kept,
+              uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesVertex));
+        }
+        if (current_guest_graphics_pipeline_layout_
+                ->descriptor_set_layout_textures_pixel_ref() !=
+            pipeline_layout->descriptor_set_layout_textures_pixel_ref()) {
+          descriptor_sets_kept = std::min(
+              descriptor_sets_kept,
+              uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+        }
+        current_graphics_descriptor_sets_bound_up_to_date_ &=
+            (UINT32_C(1) << descriptor_sets_kept) - 1;
+      } else {
+        current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+      }
+      current_guest_graphics_pipeline_layout_ = pipeline_layout;
+    }
+  };
+
+  // Update the graphics pipeline and its compatible descriptor-set state.
+  bind_guest_graphics_pipeline();
 
   bool host_render_targets_used = render_target_cache_->GetPath() ==
                                   RenderTargetCache::Path::kHostRenderTargets;
@@ -4030,6 +4366,24 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+
+  if (render_target_cache_->HasPendingDrawPassTransfers()) {
+    if (!render_target_cache_->EncodePendingDrawPassTransfers()) {
+      if (!render_target_cache_->FlushPendingDrawPassTransfers()) {
+        return false;
+      }
+      SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+          render_target_cache_->last_update_render_pass(),
+          render_target_cache_->last_update_framebuffer());
+    }
+    bind_guest_graphics_pipeline();
+    UpdateDynamicState(viewport_info, primitive_polygonal,
+                       normalized_depth_control, draw_resolution_scale_x,
+                       draw_resolution_scale_y);
+    if (!UpdateBindings(vertex_shader, pixel_shader)) {
+      return false;
+    }
+  }
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -6248,6 +6602,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
 
+      ClearReadbackBuffers();
+
       DestroyScratchBuffer();
 
       assert_true(command_buffers_submitted_.empty());
@@ -6732,6 +7088,20 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     system_constants_.vertex_index_load_address =
         primitive_processing_result.guest_index_base;
   }
+
+  // VS expansion creates more host vertices than the guest supplied. Bound
+  // shared-memory index loads by the original guest count so rectangle and
+  // point expansion lanes cannot read unrelated indices.
+  const bool is_vs_expansion_draw =
+      primitive_processing_result.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
+      primitive_processing_result.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kRectangleListAsTriangleStrip;
+  const uint32_t vertex_index_count =
+      is_vs_expansion_draw ? primitive_processing_result.guest_draw_vertex_count
+                           : primitive_processing_result.host_draw_vertex_count;
+  dirty |= system_constants_.vertex_index_count != vertex_index_count;
+  system_constants_.vertex_index_count = vertex_index_count;
 
   // Index or tessellation edge factor buffer endianness.
   dirty |= system_constants_.vertex_index_endian !=
@@ -7373,6 +7743,47 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
+#if XE_PLATFORM_ANDROID
+  if (android_base1350_draw_context_.valid &&
+      GetAndroidHaloExperiment().log_texture_bindings) {
+    if (android_base1350_draw_context_.draw_sequence >
+        GetAndroidHaloExperiment().log_texture_binding_skip_draws) {
+      uint32_t texture_binding_index = 0;
+      for (const VulkanShader::TextureBinding& texture_binding :
+           textures_vertex) {
+        texture_cache_->LogActiveTextureBindingForAndroidDraw(
+            "VS", android_base1350_draw_context_.draw_sequence,
+            android_base1350_draw_context_.target_base,
+            android_base1350_draw_context_.target_pitch,
+            android_base1350_draw_context_.target_format,
+            android_base1350_draw_context_.target_msaa,
+            android_base1350_draw_context_.target_width,
+            vertex_shader->ucode_data_hash(),
+            pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+            texture_binding_index++,
+            texture_binding.fetch_constant, texture_binding.dimension,
+            bool(texture_binding.is_signed));
+      }
+      if (textures_pixel) {
+        texture_binding_index = 0;
+        for (const VulkanShader::TextureBinding& texture_binding :
+             *textures_pixel) {
+          texture_cache_->LogActiveTextureBindingForAndroidDraw(
+              "PS", android_base1350_draw_context_.draw_sequence,
+              android_base1350_draw_context_.target_base,
+              android_base1350_draw_context_.target_pitch,
+              android_base1350_draw_context_.target_format,
+              android_base1350_draw_context_.target_msaa,
+              android_base1350_draw_context_.target_width,
+              vertex_shader->ucode_data_hash(), pixel_shader->ucode_data_hash(),
+              texture_binding_index++,
+              texture_binding.fetch_constant, texture_binding.dimension,
+              bool(texture_binding.is_signed));
+        }
+      }
+    }
+  }
+#endif
   // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
   current_graphics_descriptor_set_values_up_to_date_ &=
       ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |

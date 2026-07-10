@@ -16,6 +16,7 @@
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/utf8.h"
 #include "xenia/vfs/devices/disc_image_entry.h"
 #include "xenia/vfs/gdfx_util.h"
@@ -43,9 +44,11 @@ DiscImageDevice::DiscImageDevice(const std::string_view mount_path,
 DiscImageDevice::~DiscImageDevice() = default;
 
 bool DiscImageDevice::Initialize() {
+#if !XE_PLATFORM_ANDROID
   mmap_ = MappedMemory::Open(host_path_, MappedMemory::Mode::kRead);
+#endif
   if (!mmap_) {
-#if XE_PLATFORM_IOS
+#if XE_PLATFORM_IOS || XE_PLATFORM_ANDROID
     file_handle_ = xe::filesystem::FileHandle::OpenExisting(
         host_path_, xe::filesystem::FileAccess::kGenericRead);
     auto file_info = xe::filesystem::GetInfo(host_path_);
@@ -56,13 +59,13 @@ bool DiscImageDevice::Initialize() {
     }
     image_size_ = file_info->total_size;
     XELOGW(
-        "Disc image mmap unavailable, using iOS fallback file reads "
+        "Disc image mmap disabled or unavailable, using streamed file reads "
         "(size=0x{:X})",
         image_size_);
 #else
     XELOGE("Disc image could not be mapped");
     return false;
-#endif  // XE_PLATFORM_IOS
+#endif  // XE_PLATFORM_IOS || XE_PLATFORM_ANDROID
   } else {
     image_size_ = mmap_->size();
     XELOGFS("DiscImageDevice::Initialize");
@@ -304,7 +307,13 @@ bool DiscImageDevice::ReadImage(size_t offset, void* buffer,
   if (!file_handle_->Read(offset, buffer, length, &bytes_read)) {
     return false;
   }
-  return bytes_read == length;
+  if (bytes_read != length) {
+    return false;
+  }
+#if XE_PLATFORM_ANDROID
+  file_handle_->DiscardCachedData(offset, length);
+#endif
+  return true;
 }
 
 }  // namespace vfs

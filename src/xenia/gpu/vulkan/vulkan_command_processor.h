@@ -504,6 +504,19 @@ class VulkanCommandProcessor final : public CommandProcessor {
       const VkDescriptorImageInfo* sampler_image_info,
       VkWriteDescriptorSet* descriptor_set_writes_out);
 
+#if XE_PLATFORM_ANDROID
+  struct AndroidBase1350DrawContext {
+    bool valid = false;
+    uint32_t draw_sequence = 0;
+    uint32_t target_base = 0;
+    uint32_t target_pitch = 0;
+    uint32_t target_format = 0;
+    uint32_t target_msaa = 0;
+    uint32_t target_width = 0;
+  };
+  AndroidBase1350DrawContext android_base1350_draw_context_;
+#endif
+
   bool device_lost_ = false;
 
   bool cache_clear_requested_ = false;

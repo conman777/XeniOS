@@ -117,6 +117,8 @@ class VulkanPipelineCache {
   void ShutdownShaderStorage();
 
   void EndSubmission();
+  void ClearCache();
+  size_t pipeline_count() const { return pipelines_.size(); }
   bool IsCreatingPipelines();
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type,

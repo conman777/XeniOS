@@ -21,6 +21,12 @@
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/xenos.h"
 
+#if XE_PLATFORM_ANDROID
+#include <unordered_map>
+
+#include "xenia/gpu/vulkan/android_halo_experiment.h"
+#endif
+
 DEFINE_bool(
     depth_transfer_not_equal_test, true,
     "When transferring data between depth render targets, use the \"not "
@@ -1620,6 +1626,46 @@ void RenderTargetCache::ChangeOwnership(
           }
         }
       }
+#if XE_PLATFORM_ANDROID
+      {
+        const vulkan::AndroidHaloExperiment& android_experiment =
+            vulkan::GetAndroidHaloExperiment();
+        if (android_experiment.log_ownership_changes &&
+            it->first < android_experiment.ownership_watch_end_tiles &&
+            it->second.end_tiles >
+                android_experiment.ownership_watch_start_tiles) {
+          // Dedupe by (previous owner, new owner) pair; log the first
+          // occurrence in full and count milestones after (WO26 lesson: no
+          // flat caps on search logging).
+          const RenderTargetKey& prev_owner = it->second.render_target;
+          static std::unordered_map<uint64_t, uint32_t> transition_counts;
+          static uint32_t claim_sequence = 0;
+          ++claim_sequence;
+          uint64_t pair_key =
+              (uint64_t(prev_owner.key) << 32) | uint64_t(dest.key);
+          uint32_t& count = transition_counts[pair_key];
+          ++count;
+          if (count == 1 || !(count & (count - 1))) {  // 1,2,4,8,... powers
+            XELOGI(
+                "OWNCHG seq={} count={} tiles=[{},{}) prev_key=0x{:08X} "
+                "prev_base={} prev_pitch32={} prev_msaa={} prev_depth={} "
+                "prev_fmt={} -> dest_key=0x{:08X} dest_base={} dest_pitch32={} "
+                "dest_msaa={} dest_depth={} dest_fmt={} dest_64bpp={} "
+                "transfers_requested={}",
+                claim_sequence, count, it->first, it->second.end_tiles,
+                prev_owner.key, uint32_t(prev_owner.base_tiles),
+                uint32_t(prev_owner.pitch_tiles_at_32bpp),
+                UINT32_C(1) << uint32_t(prev_owner.msaa_samples),
+                uint32_t(prev_owner.is_depth),
+                uint32_t(prev_owner.resource_format), dest.key,
+                uint32_t(dest.base_tiles), uint32_t(dest.pitch_tiles_at_32bpp),
+                UINT32_C(1) << uint32_t(dest.msaa_samples),
+                uint32_t(dest.is_depth), uint32_t(dest.resource_format),
+                uint32_t(dest_is_64bpp), uint32_t(transfers_append_out != nullptr));
+          }
+        }
+      }
+#endif
       // Claim the current range.
       it->second.render_target = dest;
       if (host_depth_encoding_different) {
@@ -1665,6 +1711,67 @@ void RenderTargetCache::ChangeOwnership(
         0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles));
   }
 }
+
+#if XE_PLATFORM_ANDROID
+void RenderTargetCache::AndroidLogEdramOwnershipSnapshot(
+    uint32_t watch_start_tiles, uint32_t watch_end_tiles,
+    uint32_t context_dest) {
+  static uint32_t snapshot_sequence = 0;
+  static uint64_t last_snapshot_hash = 0;
+  static uint32_t unchanged_count = 0;
+  // Hash all overlapping ranges first so consecutive identical snapshots
+  // collapse into a counter instead of re-listing every frame.
+  uint64_t hash = 1099511628211ull;
+  auto it_hash = ownership_ranges_.lower_bound(watch_start_tiles);
+  if (it_hash != ownership_ranges_.begin()) {
+    auto it_pre = std::prev(it_hash);
+    if (it_pre->second.end_tiles > watch_start_tiles) {
+      it_hash = it_pre;
+    }
+  }
+  for (auto it = it_hash;
+       it != ownership_ranges_.end() && it->first < watch_end_tiles; ++it) {
+    hash ^= (uint64_t(it->first) << 40) ^ (uint64_t(it->second.end_tiles) << 20)
+            ^ it->second.render_target.key;
+    hash *= 1099511628211ull;
+  }
+  ++snapshot_sequence;
+  if (hash == last_snapshot_hash) {
+    ++unchanged_count;
+    // Still make unchanged snapshots visible (cheaply) so absence of change
+    // is itself recorded evidence.
+    if (!(unchanged_count & (unchanged_count - 1))) {  // powers of two
+      XELOGI("OWNSNAP seq={} dest=0x{:08X} unchanged_count={} hash=0x{:016X}",
+             snapshot_sequence, context_dest, unchanged_count, hash);
+    }
+    return;
+  }
+  last_snapshot_hash = hash;
+  unchanged_count = 0;
+  uint32_t lines = 0;
+  for (auto it = it_hash;
+       it != ownership_ranges_.end() && it->first < watch_end_tiles; ++it) {
+    const RenderTargetKey& owner = it->second.render_target;
+    // Cap defensively; the watched window is small so this should never hit.
+    if (++lines > 48) {
+      XELOGI("OWNSNAP seq={} dest=0x{:08X} ... truncated at 48 ranges",
+             snapshot_sequence, context_dest);
+      break;
+    }
+    XELOGI(
+        "OWNSNAP seq={} dest=0x{:08X} tiles=[{},{}) owner_key=0x{:08X} "
+        "owner_base={} owner_pitch32={} owner_msaa={} owner_depth={} "
+        "owner_fmt={} owner_64bpp={}{}",
+        snapshot_sequence, context_dest, it->first, it->second.end_tiles,
+        owner.key, uint32_t(owner.base_tiles),
+        uint32_t(owner.pitch_tiles_at_32bpp),
+        UINT32_C(1) << uint32_t(owner.msaa_samples), uint32_t(owner.is_depth),
+        uint32_t(owner.resource_format),
+        owner.IsEmpty() ? 0u : uint32_t(owner.Is64bpp()),
+        owner.IsEmpty() ? " (EMPTY/never used)" : "");
+  }
+}
+#endif
 
 }  // namespace gpu
 }  // namespace xe

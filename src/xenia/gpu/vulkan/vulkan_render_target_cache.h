@@ -20,6 +20,7 @@
 #include "xenia/base/hash.h"
 #include "xenia/base/xxhash.h"
 #include "xenia/gpu/render_target_cache.h"
+#include "xenia/gpu/vulkan/android_halo_experiment.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
 #include "xenia/gpu/xenos.h"
@@ -135,6 +136,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   const Framebuffer* last_update_framebuffer() const {
     return last_update_framebuffer_;
   }
+  bool HasPendingDrawPassTransfers() const {
+    return pending_draw_pass_transfer_mask_ != 0;
+  }
+  bool EncodePendingDrawPassTransfers();
+  bool FlushPendingDrawPassTransfers();
 
   // For VK_KHR_dynamic_rendering: fills in attachment info structures.
   // Returns the number of color attachments (may be less than max if trailing
@@ -149,15 +155,25 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Using R16G16[B16A16]_SNORM, which are -1...1, not the needed -32...32.
   // Persistent data doesn't depend on this, so can be overriden by per-game
   // configuration.
+  bool IsSnorm16RenderTargetFullRangeEnabled() const {
+#if XE_PLATFORM_ANDROID
+    const int32_t override_value =
+        GetAndroidHaloExperiment().snorm16_render_target_full_range;
+    if (override_value >= 0) {
+      return override_value != 0;
+    }
+#endif
+    return cvars::snorm16_render_target_full_range;
+  }
   bool IsFixedRG16TruncatedToMinus1To1() const {
     // TODO(Triang3l): Not float16 condition.
     return GetPath() == Path::kHostRenderTargets &&
-           !cvars::snorm16_render_target_full_range;
+           !IsSnorm16RenderTargetFullRangeEnabled();
   }
   bool IsFixedRGBA16TruncatedToMinus1To1() const {
     // TODO(Triang3l): Not float16 condition.
     return GetPath() == Path::kHostRenderTargets &&
-           !cvars::snorm16_render_target_full_range;
+           !IsSnorm16RenderTargetFullRangeEnabled();
   }
 
   bool depth_unorm24_vulkan_format_supported() const {
@@ -348,6 +364,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     VulkanRenderTarget(RenderTargetKey key,
                        VulkanRenderTargetCache& render_target_cache,
                        VkImage image, VkDeviceMemory memory,
+                       VkDeviceSize memory_size,
                        VkImageView view_depth_color,
                        VkImageView view_depth_stencil, VkImageView view_stencil,
                        VkImageView view_color_transfer_separate,
@@ -356,6 +373,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
           render_target_cache_(render_target_cache),
           image_(image),
           memory_(memory),
+          memory_size_(memory_size),
           view_depth_color_(view_depth_color),
           view_depth_stencil_(view_depth_stencil),
           view_stencil_(view_stencil),
@@ -426,6 +444,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     VkImage image_;
     VkDeviceMemory memory_;
+    VkDeviceSize memory_size_;
 
     // TODO(Triang3l): Per-format drawing views for mutable formats with EDRAM
     // aliasing without transfers.
@@ -598,6 +617,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // accidentally reuse the normal cached transfer shader.
       uint32_t android_depth_to_color_diag_mode : 4;
       uint32_t android_depth_to_color_sample_mode : 3;
+      uint32_t android_value_convert_1010102_to_8888 : 1;
+      uint32_t android_value_convert_16bit_to_8888 : 1;
 
       // Last bits because this affects the pipeline layout - after sorting,
       // only change it as fewer times as possible. Depth buffers have an
@@ -721,6 +742,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     }
   };
 
+  struct TransferRectanglePlan {
+    std::array<Transfer::Rectangle, Transfer::kMaxRectanglesWithCutout>
+        rectangles;
+    uint32_t rectangle_count = 0;
+  };
+
   union DumpPipelineKey {
     uint32_t key;
     struct {
@@ -735,6 +762,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // EDRAM, used to test whether the final-presentable writer is the menu
       // channel-order root cause.
       uint32_t android_writer_gb_fix : 1;
+      // Force a collapsed color source to be packed as guest 8888. Used by
+      // the narrow Android Halo direct-MSAA presentation path.
+      uint32_t android_force_8888_repack : 1;
       // Last bit because this affects the pipeline - after sorting, only change
       // it at most once. Depth buffers have an additional stencil SRV.
       uint32_t is_depth : 1;
@@ -882,7 +912,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,
       const uint64_t* render_target_resolve_clear_values = nullptr,
-      const Transfer::Rectangle* resolve_clear_rectangle = nullptr);
+      const Transfer::Rectangle* resolve_clear_rectangle = nullptr,
+      bool in_current_render_pass = false);
+
+  void ClearPendingDrawPassTransfers();
+  bool CanQueueDrawPassTransfers(uint32_t render_target_index,
+                                 RenderTarget* const* render_targets,
+                                 const std::vector<Transfer>& transfers) const;
+  bool BuildTransferRectanglePlans(
+      RenderTargetKey dest_key, const std::vector<Transfer>& transfers,
+      std::vector<TransferRectanglePlan>& transfer_rectangles_out) const;
+  bool PreflightPendingDrawPassTransfers(RenderPassKey render_pass_key);
+  void PreparePendingDrawPassTransferBarriers();
 
   VkPipeline GetDumpPipeline(DumpPipelineKey key);
 
@@ -906,17 +947,25 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   static constexpr uint32_t kAndroidHaloShadowPitchTiles = 15;
   static constexpr uint32_t kAndroidHaloShadowRows = 45;
   static constexpr uint32_t kAndroidHaloShadowRowLengthTiles = 15;
+  static constexpr uint32_t kAndroidHaloFrontbufferAddress = 0x03044000;
   static constexpr uint32_t kAndroidHaloShadowTileBytes =
       xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples *
       sizeof(uint32_t);
   static constexpr uint32_t kAndroidHaloShadowBytes =
       kAndroidHaloShadowPitchTiles * kAndroidHaloShadowRows *
       kAndroidHaloShadowTileBytes;
+  static constexpr uint32_t kAndroidHaloMenuSceneBaseTiles = 675;
+  static constexpr uint32_t kAndroidHaloMenuScenePitchTiles = 15;
+  static constexpr uint32_t kAndroidHaloMenuSceneRows = 45;
+  static constexpr uint32_t kAndroidHaloMenuSceneBytes =
+      kAndroidHaloMenuScenePitchTiles * kAndroidHaloMenuSceneRows *
+      kAndroidHaloShadowTileBytes;
 
   bool IsAndroidHaloCompatActive() const;
   static bool IsAndroidHaloShadowSpan(uint32_t base, uint32_t row_length_used,
                                       uint32_t rows, uint32_t pitch);
   static bool IsAndroidHaloPresentableColorKey(const RenderTargetKey& key);
+  static bool IsAndroidHaloMsaaSceneColorKey(const RenderTargetKey& key);
   static const char* GetAndroidHaloOwnerKindName(AndroidHaloOwnerKind kind);
   void AndroidHaloNoteColorDrawTargets(
       RenderTarget* const* depth_and_color_render_targets);
@@ -925,6 +974,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                          const RenderTargetKey& dest_key);
   void AndroidHaloTransitionShadowBuffer(VkPipelineStageFlags dst_stage_mask,
                                          VkAccessFlags dst_access_mask);
+  void AndroidHaloTransitionMenuSceneShadowBuffer(
+      VkPipelineStageFlags dst_stage_mask, VkAccessFlags dst_access_mask);
+  void AndroidHaloCaptureMenuSceneShadow(uint32_t dump_base,
+                                         uint32_t dump_row_length_used,
+                                         uint32_t dump_rows,
+                                         uint32_t dump_pitch);
   bool AndroidHaloRefreshPresentableEdramForFinalResolve(
       const draw_util::ResolveInfo& resolve_info, uint32_t dump_base,
       uint32_t dump_row_length_used, uint32_t dump_rows, uint32_t dump_pitch,
@@ -969,6 +1024,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   std::unordered_map<FramebufferKey, Framebuffer, FramebufferKey::Hasher>
       framebuffers_;
 
+  void MaybeRequestRenderTargetMemoryClear();
+  VkDeviceSize render_target_memory_usage_bytes_ = 0;
+  bool render_target_memory_clear_requested_ = false;
+
   // Set 0 - EDRAM storage buffer, set 1 - source depth sampled image (and
   // unused stencil from the transfer descriptor set), HostDepthStoreConstants
   // passed via push constants.
@@ -1004,6 +1063,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   // Temporary storage for PerformTransfersAndResolveClears.
   std::vector<TransferInvocation> current_transfer_invocations_;
+  std::array<RenderTarget*, 1 + xenos::kMaxColorRenderTargets>
+      pending_draw_pass_render_targets_ = {};
+  std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets>
+      pending_draw_pass_transfers_;
+  uint32_t pending_draw_pass_transfer_mask_ = 0;
 
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
@@ -1016,6 +1080,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // destination color RT.
   VulkanRenderTarget* android_depth_to_color_edram_fallback_source_ = nullptr;
   VulkanRenderTarget* android_halo_presentable_color_rt_ = nullptr;
+  VulkanRenderTarget* android_halo_msaa_scene_color_rt_ = nullptr;
 
   VkDeviceMemory android_halo_present_shadow_memory_ = VK_NULL_HANDLE;
   VkBuffer android_halo_present_shadow_buffer_ = VK_NULL_HANDLE;
@@ -1023,9 +1088,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
   VkAccessFlags android_halo_present_shadow_access_mask_ = 0;
   bool android_halo_present_shadow_valid_ = false;
+  VkDeviceMemory android_halo_menu_scene_shadow_memory_ = VK_NULL_HANDLE;
+  VkBuffer android_halo_menu_scene_shadow_buffer_ = VK_NULL_HANDLE;
+  VkPipelineStageFlags android_halo_menu_scene_shadow_stage_mask_ =
+      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+  VkAccessFlags android_halo_menu_scene_shadow_access_mask_ = 0;
+  bool android_halo_menu_scene_shadow_valid_ = false;
+  uint32_t android_halo_menu_scene_shadow_capture_count_ = 0;
   AndroidHaloOwnerKind android_halo_owner_kind_ =
       AndroidHaloOwnerKind::kUnknown;
   bool android_halo_transfer_render_pass_active_ = false;
+  bool android_halo_force_writer_gb_fix_ = false;
+  bool android_halo_force_8888_repack_ = false;
   bool android_halo_depth_alias_quarantine_latched_ = false;
   uint32_t android_halo_depth_to_color_quarantine_count_ = 0;
   uint32_t android_halo_presentable_owner_suppressed_count_ = 0;

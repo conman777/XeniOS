@@ -11,6 +11,7 @@
 #define XENIA_UI_WINDOWED_APP_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -70,6 +71,8 @@ class WindowedApp {
     OnDestroy();
   }
 
+  void InvokeOnMemoryPressure(int32_t level) { OnMemoryPressure(level); }
+
  protected:
   // Positional options should be initialized in the constructor if needed.
   // Cvars will not have been initialized with the arguments at the moment of
@@ -99,6 +102,10 @@ class WindowedApp {
   // still be possible to add more pending functions here depending on whether
   // the context was explicitly shut down before this is invoked).
   virtual void OnDestroy() {}
+
+  // Platform memory-pressure notification. Implementations may release caches
+  // that can be reconstructed without changing guest-visible state.
+  virtual void OnMemoryPressure(int32_t level) {}
 
  private:
   WindowedAppContext& app_context_;

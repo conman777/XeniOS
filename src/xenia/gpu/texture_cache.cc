@@ -200,6 +200,14 @@ bool TextureCache::ClampDrawResolutionScaleToMaxSupported(
 
 void TextureCache::ClearCache() { DestroyAllTextures(); }
 
+uint32_t TextureCache::GetHostMemoryHardLimitMB() const {
+  // texture_cache_memory_limit_render_to_texture is included in the 1x hard
+  // limit. Only add the extra storage required by resolution scaling.
+  return cvars::texture_cache_memory_limit_hard +
+         cvars::texture_cache_memory_limit_render_to_texture *
+             (draw_resolution_scale_x() * draw_resolution_scale_y() - 1);
+}
+
 void TextureCache::CompletedSubmissionUpdated(
     uint64_t completed_submission_index) {
   // If memory usage is too high, destroy unused textures.
@@ -212,8 +220,7 @@ void TextureCache::CompletedSubmissionUpdated(
       (draw_resolution_scale_x() * draw_resolution_scale_y() - 1);
   uint32_t limit_soft_mb =
       cvars::texture_cache_memory_limit_soft + limit_scaled_resolve_add_mb;
-  uint32_t limit_hard_mb =
-      cvars::texture_cache_memory_limit_hard + limit_scaled_resolve_add_mb;
+  uint32_t limit_hard_mb = GetHostMemoryHardLimitMB();
   uint32_t limit_soft_lifetime =
       cvars::texture_cache_memory_limit_soft_lifetime * 1000;
   bool destroyed_any = false;

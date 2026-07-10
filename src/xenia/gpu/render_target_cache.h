@@ -595,6 +595,16 @@ class RenderTargetCache {
   // EDRAM memory are committed with a memory barrier.
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
+#if XE_PLATFORM_ANDROID
+  // WO27 phantom-owner diagnostics: logs the current tile-ownership map
+  // entries overlapping [watch_start_tiles, watch_end_tiles), one OWNSNAP line
+  // per range. context_dest is the resolve destination address (or other tag)
+  // identifying why the snapshot was taken. Logging only.
+  void AndroidLogEdramOwnershipSnapshot(uint32_t watch_start_tiles,
+                                        uint32_t watch_end_tiles,
+                                        uint32_t context_dest);
+#endif
+
  private:
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;

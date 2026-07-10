@@ -86,6 +86,7 @@ class AndroidWindowedAppContext final : public WindowedAppContext {
       JNIEnv* jni_env, jobject activity, jstring windowed_app_identifier,
       jobject asset_manager);
   void JniActivityOnDestroy();
+  void JniActivityOnTrimMemory(jint level);
   void JniActivityOnWindowSurfaceLayoutChange(jint left, jint top, jint right,
                                               jint bottom);
   bool JniActivityOnWindowSurfaceMotionEvent(jobject event);

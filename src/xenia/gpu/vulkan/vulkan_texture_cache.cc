@@ -38,6 +38,17 @@
 
 DECLARE_bool(tiled_shared_memory);
 
+DEFINE_uint32(
+    vulkan_texture_memory_limit_mb, 0,
+    "Maximum Vulkan Memory Allocator block bytes retained by the texture "
+    "cache, in MiB. 0 disables block-level reclamation.",
+    "Vulkan");
+DEFINE_uint32(
+    vulkan_memory_limit_mb, 0,
+    "Maximum Vulkan heap usage, including implementation-owned allocations, "
+    "in MiB. 0 disables heap-level reclamation.",
+    "Vulkan");
+
 DEFINE_bool(halo_android_diag_direct_fb_fill_linear, false,
             "Fill the Android Halo swap texture guest range as linear 32bpp "
             "before texture-cache upload.",
@@ -96,6 +107,10 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_16bpb_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_32bpb_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_32bpb_scaled_cs.h"
+#if XE_PLATFORM_ANDROID
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_32bpb_pattern_cs.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_32bpb_safe_cs.h"
+#endif
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_64bpb_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_64bpb_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_8bpb_cs.h"
@@ -142,6 +157,10 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rgba16_snorm_float_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rgba16_unorm_float_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rgba16_unorm_float_scaled_cs.h"
+#if XE_PLATFORM_ANDROID
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rgba16_pattern_float_cs.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_rgba16_unorm_float_safe_cs.h"
+#endif
 }  // namespace shaders
 
 static_assert(VK_FORMAT_UNDEFINED == VkFormat(0),
@@ -667,7 +686,7 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
   if (binding && AreDimensionsCompatible(dimension, binding->key.dimension)) {
 #if XE_PLATFORM_ANDROID
-    if (cvars::halo_android_diag_log_texture_bindings &&
+    if (GetAndroidHaloExperiment().log_texture_bindings &&
         android_texture_binding_log_count < 512) {
       const TextureKey& key = binding->key;
       XELOGI(
@@ -729,6 +748,58 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
       return null_image_view_2d_array_;
   }
 }
+
+#if XE_PLATFORM_ANDROID
+void VulkanTextureCache::LogActiveTextureBindingForAndroidDraw(
+    const char* stage, uint32_t draw_sequence, uint32_t target_base,
+    uint32_t target_pitch, uint32_t target_format, uint32_t target_msaa,
+    uint32_t target_width, uint64_t vertex_shader_hash,
+    uint64_t pixel_shader_hash, uint32_t binding_index,
+    uint32_t fetch_constant_index, xenos::FetchOpDimension dimension,
+    bool is_signed) const {
+  static uint32_t android_presentable_texture_log_count = 0;
+  if (!GetAndroidHaloExperiment().log_texture_bindings ||
+      android_presentable_texture_log_count >=
+          GetAndroidHaloExperiment().log_texture_binding_max_lines) {
+    return;
+  }
+
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    XELOGI(
+        "Android presentable texture {}: draw={} stage={} bind={} fetch={} "
+        "request_dim={} signed={} target_base={} target_pitch={} target_fmt={} "
+        "target_msaa={} target_width={} valid=0 vs=0x{:016X} ps=0x{:016X}",
+        android_presentable_texture_log_count, draw_sequence, stage,
+        binding_index, fetch_constant_index, uint32_t(dimension),
+        uint32_t(is_signed), target_base, target_pitch, target_format,
+        target_msaa, target_width, vertex_shader_hash, pixel_shader_hash);
+    ++android_presentable_texture_log_count;
+    return;
+  }
+
+  const TextureKey& key = binding->key;
+  XELOGI(
+      "Android presentable texture {}: draw={} stage={} bind={} fetch={} "
+      "request_dim={} signed={} target_base={} target_pitch={} target_fmt={} "
+      "target_msaa={} target_width={} base=0x{:08X} mip=0x{:08X} "
+      "size={}x{}x{} pitch={} tiled={} format={} endian={} packed={} "
+      "host_swizzle=0x{:03X} signs=0x{:02X} tex_valid={} signed_valid={} "
+      "vs=0x{:016X} ps=0x{:016X}",
+      android_presentable_texture_log_count, draw_sequence, stage,
+      binding_index, fetch_constant_index, uint32_t(dimension),
+      uint32_t(is_signed), target_base, target_pitch, target_format,
+      target_msaa, target_width, uint32_t(key.base_page << 12),
+      uint32_t(key.mip_page << 12), key.GetWidth(), key.GetHeight(),
+      key.GetDepthOrArraySize(), uint32_t(key.pitch), uint32_t(key.tiled),
+      uint32_t(key.format), uint32_t(key.endianness),
+      uint32_t(key.packed_mips), uint32_t(binding->host_swizzle),
+      uint32_t(binding->swizzled_signs), uint32_t(binding->texture != nullptr),
+      uint32_t(binding->texture_signed != nullptr), vertex_shader_hash,
+      pixel_shader_hash);
+  ++android_presentable_texture_log_count;
+}
+#endif
 
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     const VulkanShader::SamplerBinding& binding) const {
@@ -812,6 +883,32 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     aniso_filter = xenos::AnisoFilter(cvars::anisotropic_override);
   }
   parameters.aniso_filter = std::min(aniso_filter, max_anisotropy_);
+
+#if XE_PLATFORM_ANDROID
+  if (GetAndroidHaloExperiment().scene_scratch_force_point_sampling) {
+    TextureKey texture_key;
+    uint8_t texture_swizzled_signs;
+    BindingInfoFromFetchConstant(fetch, texture_key, &texture_swizzled_signs);
+    if (texture_key.is_valid && texture_key.base_page == 0x2354 &&
+        texture_key.GetWidth() == 1152 && texture_key.GetHeight() == 720) {
+      parameters.mag_linear = 0;
+      parameters.min_linear = 0;
+      parameters.mip_linear = 0;
+      parameters.aniso_filter = xenos::AnisoFilter::kDisabled;
+      static uint32_t android_scene_point_sampler_log_count = 0;
+      if (android_scene_point_sampler_log_count < 64) {
+        XELOGI(
+            "Android scene scratch point sampler {}: format={} endian={} "
+            "fetch={} clamp={}/{}/{}",
+            android_scene_point_sampler_log_count, uint32_t(texture_key.format),
+            uint32_t(texture_key.endianness), binding.fetch_constant,
+            uint32_t(parameters.clamp_x), uint32_t(parameters.clamp_y),
+            uint32_t(parameters.clamp_z));
+        ++android_scene_point_sampler_log_count;
+      }
+    }
+  }
+#endif
 
   return parameters;
 }
@@ -1266,12 +1363,22 @@ VkImageView VulkanTextureCache::RequestSwapTexture(
   }
 #if XE_PLATFORM_ANDROID
   ApplyAndroidDirectFrontbufferFill(android_request_index, key, *texture);
-  // Channel-order A/B: allow the experiment file to replace the game's fetch
-  // swizzle for the presented frontbuffer (config-only color permutation).
-  uint32_t android_swap_fetch_swizzle = fetch.swizzle;
-  if (GetAndroidHaloExperiment().swap_swizzle_override) {
-    android_swap_fetch_swizzle =
-        GetAndroidHaloExperiment().swap_swizzle_override;
+  // Channel-order A/B: experiment file can replace the game's fetch swizzle.
+  AndroidHaloTickGameplayPresentCounter();
+  uint32_t android_swap_fetch_swizzle =
+      AndroidHaloGetEffectiveSwapSwizzle(fetch.swizzle);
+  if (android_log_swap_texture &&
+      GetAndroidHaloExperiment().swap_swizzle_auto &&
+      !GetAndroidHaloExperiment().swap_swizzle_override) {
+    static uint32_t android_auto_swizzle_log_count = 0;
+    if (android_auto_swizzle_log_count < 32) {
+      XELOGI(
+          "Android swap texture {} auto_swizzle=0x{:03X} gameplay={} "
+          "fetch_swizzle=0x{:03X}",
+          android_request_index, android_swap_fetch_swizzle,
+          uint32_t(AndroidHaloUseGameplaySwizzle()), fetch.swizzle);
+      ++android_auto_swizzle_log_count;
+    }
   }
   VkImageView texture_view = texture->GetView(
       false,
@@ -1413,6 +1520,33 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
     uint64_t hash = 14695981039346656037ull;
   };
 
+  struct RawByteStats {
+    uint8_t min[4] = {255, 255, 255, 255};
+    uint8_t max[4] = {};
+    uint64_t sum[4] = {};
+    uint64_t zero[4] = {};
+    uint64_t clip[4] = {};
+    uint32_t nonzero = 0;
+    uint64_t hash = 14695981039346656037ull;
+
+    void Accumulate(const uint8_t* pixel) {
+      bool any_nonzero = false;
+      for (uint32_t c = 0; c < 4; ++c) {
+        const uint8_t value = pixel[c];
+        min[c] = std::min(min[c], value);
+        max[c] = std::max(max[c], value);
+        sum[c] += value;
+        zero[c] += value == 0;
+        clip[c] += value == 255;
+        any_nonzero |= value != 0;
+        hash = (hash ^ value) * 1099511628211ull;
+      }
+      if (any_nonzero) {
+        ++nonzero;
+      }
+    }
+  };
+
   struct Variant {
     const char* name;
     const char* filename_suffix;
@@ -1435,7 +1569,11 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
       "/sdcard/Android/data/jp.xenios.emulator.github.debug/files/diagnostics",
       "/sdcard/Android/data/jp.xenios.emulator.github/files/diagnostics",
   };
-  constexpr uint32_t kRawDumpMaxBytes = 0x400000;
+  // 16 MiB: large enough for a full 64bpp k_16_16_16_16 frame at 1152x720
+  // (~6.3 MiB), which the previous 4 MiB cap silently truncated.
+  constexpr uint32_t kRawDumpMaxBytes = 0x1000000;
+  const AndroidHaloExperiment& experiment = GetAndroidHaloExperiment();
+  const bool dump_files = experiment.dump_files;
 
   for (const char* diagnostic_root : kDiagnosticRoots) {
     std::error_code ignored_error;
@@ -1445,111 +1583,116 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
     }
 
     bool wrote_any = false;
-    for (const Variant& variant : variants) {
-      std::filesystem::path path =
-          std::filesystem::path(diagnostic_root) /
-          (filename_base + variant.filename_suffix + ".ppm");
-      std::ofstream file(path, std::ios::binary);
-      if (!file) {
-        continue;
-      }
-      file << "P6\n" << width << " " << height << "\n255\n";
-
-      VariantStats stats;
-      std::array<uint8_t, 3> rgb = {};
-      for (uint32_t y = 0; y < height; ++y) {
-        for (uint32_t x = 0; x < width; ++x) {
-          uint32_t offset_bytes =
-              key.tiled ? uint32_t(texture_util::GetTiledOffset2D(
-                              int32_t(x), int32_t(y), pitch_blocks,
-                              bytes_per_block_log2))
-                        : (y * pitch_blocks + x) * bytes_per_block;
-          std::array<uint8_t, 4> pixel = {};
-          if (offset_bytes + bytes_per_block <= base_size) {
-            const uint8_t* source_pixel = base + offset_bytes;
-            uint32_t copied_components = std::min<uint32_t>(bytes_per_block, 4);
-            for (uint32_t i = 0; i < copied_components; ++i) {
-              pixel[i] = source_pixel[i];
-            }
-          }
-
-          if (variant.use_swizzle) {
-            for (uint32_t c = 0; c < 3; ++c) {
-              rgb[c] = component_from_swizzle(pixel, variant.swizzle, c);
-            }
-          } else if (variant.raw_bgr) {
-            rgb[0] = pixel[2];
-            rgb[1] = pixel[1];
-            rgb[2] = pixel[0];
-          } else {
-            rgb[0] = pixel[0];
-            rgb[1] = pixel[1];
-            rgb[2] = pixel[2];
-          }
-
-          bool nonblack = false;
-          for (uint32_t c = 0; c < 3; ++c) {
-            stats.min[c] = std::min(stats.min[c], rgb[c]);
-            stats.max[c] = std::max(stats.max[c], rgb[c]);
-            stats.sum[c] += rgb[c];
-            nonblack |= rgb[c] != 0;
-            stats.hash = (stats.hash ^ rgb[c]) * 1099511628211ull;
-          }
-          if (nonblack) {
-            ++stats.nonblack;
-          }
-          file.write(reinterpret_cast<const char*>(rgb.data()), rgb.size());
+    if (dump_files) {
+      for (const Variant& variant : variants) {
+        std::filesystem::path path =
+            std::filesystem::path(diagnostic_root) /
+            (filename_base + variant.filename_suffix + ".ppm");
+        std::ofstream file(path, std::ios::binary);
+        if (!file) {
+          continue;
         }
-      }
+        file << "P6\n" << width << " " << height << "\n255\n";
 
-      if (file.good()) {
-        wrote_any = true;
-        const double divisor =
-            pixel_count ? static_cast<double>(pixel_count) : 1.0;
-        XELOGI(
-            "Android CPU swap texture stats frame={} variant={} path={} "
-            "base_page=0x{:X} hash=0x{:016X} "
-            "fetch_swizzle=0x{:03X} sampled_swizzle=0x{:03X} "
-            "nonblack={}/{} min_rgb={},{},{} max_rgb={},{},{} "
-            "mean_rgb={:.2f},{:.2f},{:.2f}",
-            request_index, variant.name, path.string(),
-            uint32_t(key.base_page), stats.hash, fetch_swizzle,
-            sampled_swizzle, stats.nonblack, pixel_count,
-            uint32_t(stats.min[0]), uint32_t(stats.min[1]),
-            uint32_t(stats.min[2]), uint32_t(stats.max[0]),
-            uint32_t(stats.max[1]), uint32_t(stats.max[2]),
-            stats.sum[0] / divisor, stats.sum[1] / divisor,
-            stats.sum[2] / divisor);
+        VariantStats stats;
+        std::array<uint8_t, 3> rgb = {};
+        for (uint32_t y = 0; y < height; ++y) {
+          for (uint32_t x = 0; x < width; ++x) {
+            uint32_t offset_bytes =
+                key.tiled ? uint32_t(texture_util::GetTiledOffset2D(
+                                int32_t(x), int32_t(y), pitch_blocks,
+                                bytes_per_block_log2))
+                          : (y * pitch_blocks + x) * bytes_per_block;
+            std::array<uint8_t, 4> pixel = {};
+            if (offset_bytes + bytes_per_block <= base_size) {
+              const uint8_t* source_pixel = base + offset_bytes;
+              uint32_t copied_components =
+                  std::min<uint32_t>(bytes_per_block, 4);
+              for (uint32_t i = 0; i < copied_components; ++i) {
+                pixel[i] = source_pixel[i];
+              }
+            }
+
+            if (variant.use_swizzle) {
+              for (uint32_t c = 0; c < 3; ++c) {
+                rgb[c] = component_from_swizzle(pixel, variant.swizzle, c);
+              }
+            } else if (variant.raw_bgr) {
+              rgb[0] = pixel[2];
+              rgb[1] = pixel[1];
+              rgb[2] = pixel[0];
+            } else {
+              rgb[0] = pixel[0];
+              rgb[1] = pixel[1];
+              rgb[2] = pixel[2];
+            }
+
+            bool nonblack = false;
+            for (uint32_t c = 0; c < 3; ++c) {
+              stats.min[c] = std::min(stats.min[c], rgb[c]);
+              stats.max[c] = std::max(stats.max[c], rgb[c]);
+              stats.sum[c] += rgb[c];
+              nonblack |= rgb[c] != 0;
+              stats.hash = (stats.hash ^ rgb[c]) * 1099511628211ull;
+            }
+            if (nonblack) {
+              ++stats.nonblack;
+            }
+            file.write(reinterpret_cast<const char*>(rgb.data()), rgb.size());
+          }
+        }
+
+        if (file.good()) {
+          wrote_any = true;
+          const double divisor =
+              pixel_count ? static_cast<double>(pixel_count) : 1.0;
+          XELOGI(
+              "Android CPU swap texture stats frame={} variant={} path={} "
+              "base_page=0x{:X} hash=0x{:016X} "
+              "fetch_swizzle=0x{:03X} sampled_swizzle=0x{:03X} "
+              "nonblack={}/{} min_rgb={},{},{} max_rgb={},{},{} "
+              "mean_rgb={:.2f},{:.2f},{:.2f}",
+              request_index, variant.name, path.string(),
+              uint32_t(key.base_page), stats.hash, fetch_swizzle,
+              sampled_swizzle, stats.nonblack, pixel_count,
+              uint32_t(stats.min[0]), uint32_t(stats.min[1]),
+              uint32_t(stats.min[2]), uint32_t(stats.max[0]),
+              uint32_t(stats.max[1]), uint32_t(stats.max[2]),
+              stats.sum[0] / divisor, stats.sum[1] / divisor,
+              stats.sum[2] / divisor);
+        }
       }
     }
 
-    if (wrote_any) {
+    if (wrote_any || !dump_files) {
       std::filesystem::path raw_swap_path =
           std::filesystem::path(diagnostic_root) /
           ("raw_frame_" + std::to_string(request_index) + "_swap.bin");
-      std::ofstream raw_swap_file(raw_swap_path, std::ios::binary);
-      if (raw_swap_file) {
-        const uint32_t raw_swap_bytes =
-            std::min<uint32_t>(base_size, kRawDumpMaxBytes);
-        raw_swap_file.write(reinterpret_cast<const char*>(base),
-                            raw_swap_bytes);
-        if (raw_swap_file.good()) {
-          XELOGI("RAWDUMP frame={} target=swap bytes={} path={}",
-                 request_index, raw_swap_bytes, raw_swap_path.string());
+      if (dump_files) {
+        std::ofstream raw_swap_file(raw_swap_path, std::ios::binary);
+        if (raw_swap_file) {
+          const uint32_t raw_swap_bytes =
+              std::min<uint32_t>(base_size, kRawDumpMaxBytes);
+          raw_swap_file.write(reinterpret_cast<const char*>(base),
+                              raw_swap_bytes);
+          if (raw_swap_file.good()) {
+            XELOGI("RAWDUMP frame={} target=swap bytes={} path={}",
+                   request_index, raw_swap_bytes, raw_swap_path.string());
+          }
         }
       }
 
       XELOGI(
           "Android CPU swap texture wrote variants root={} base_page=0x{:X} "
           "size={} pitch_blocks={} tiled={} fetch_swizzle=0x{:03X} "
-          "sampled_swizzle=0x{:03X}",
+          "sampled_swizzle=0x{:03X} dump_files={}",
           diagnostic_root, uint32_t(key.base_page), base_size, pitch_blocks,
-          uint32_t(key.tiled), fetch_swizzle, sampled_swizzle);
+          uint32_t(key.tiled), fetch_swizzle, sampled_swizzle,
+          uint32_t(dump_files));
       // Ground-truth dumps of the intermediate resolve destinations (raw
       // guest RAM, de-tiled as 1152x720 k_8_8_8_8). One run localizes where
       // the chain (scene resolve -> postprocess -> composite -> final
       // resolve) turns to garbage.
-      const AndroidHaloExperiment& experiment = GetAndroidHaloExperiment();
       for (uint32_t address_index = 0;
            address_index < experiment.dump_address_count; ++address_index) {
         const uint32_t guest_address =
@@ -1562,28 +1705,126 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
         constexpr uint32_t kGuestDumpWidth = 1152;
         constexpr uint32_t kGuestDumpHeight = 720;
         constexpr uint32_t kGuestDumpPitch = 1152;
+        // Scratch addresses are reused across formats. Prefer the latest
+        // resolve writer's metadata over the configured bpp fallback so an
+        // RGBA8 write isn't decoded as a 64bpp format (or vice versa).
+        AndroidHaloLastWriterInfo* last_writer =
+            AndroidHaloLastWriterForAddress(guest_address);
+        const uint32_t configured_guest_bpp =
+            experiment.dump_address_bpp[address_index];
+        const uint32_t writer_guest_format =
+            last_writer ? last_writer->format.load() : UINT32_MAX;
+        const uint32_t writer_guest_endian =
+            last_writer ? last_writer->endian.load() : 0;
+        const uint32_t writer_guest_bpp =
+            last_writer ? last_writer->bpp.load() : 0;
+        const uint32_t guest_bpp =
+            writer_guest_bpp == 4 || writer_guest_bpp == 8
+                ? writer_guest_bpp
+                : configured_guest_bpp;
+        const bool guest_is_unorm16 =
+            guest_bpp == 8 &&
+            writer_guest_format ==
+                uint32_t(xenos::TextureFormat::k_16_16_16_16);
+        const bool guest_is_float16 =
+            guest_bpp == 8 &&
+            writer_guest_format ==
+                uint32_t(xenos::TextureFormat::k_16_16_16_16_FLOAT);
+        // Preserve the old preview for explicitly configured 64bpp dumps if
+        // no resolve has supplied a format yet, but label the assumption.
+        const bool guest_decode_as_float16 =
+            guest_bpp == 8 && !guest_is_unorm16;
+        const char* guest_decode_name =
+            guest_is_unorm16
+                ? "rgba16_unorm"
+                : guest_is_float16
+                      ? "rgba16_float"
+                      : guest_decode_as_float16 ? "unknown64_as_float16"
+                                                : "rgba8_raw";
+        const uint32_t guest_block_log2 = guest_bpp == 8 ? 3u : 2u;
+        // Resolve endian transforms are self-inverse. Canonicalize a 64bpp
+        // pixel before interpreting its four 16-bit components.
+        auto canonicalize_64bpp = [](const uint8_t* source, uint32_t endian,
+                                     std::array<uint8_t, 8>& canonical) {
+          for (uint32_t i = 0; i < canonical.size(); ++i) {
+            uint32_t source_index = i;
+            switch (xenos::Endian128(endian)) {
+              case xenos::Endian128::k8in16:
+                source_index = i ^ 1u;
+                break;
+              case xenos::Endian128::k8in32:
+                source_index = i ^ 3u;
+                break;
+              case xenos::Endian128::k16in32:
+                source_index = i ^ 2u;
+                break;
+              case xenos::Endian128::k8in64:
+                source_index = 7u - i;
+                break;
+              default:
+                break;
+            }
+            canonical[i] = source[source_index];
+          }
+        };
+        // Reinhard tonemap of one F16 channel into 8-bit for a viewable PPM.
+        // NaN/Inf/negative collapse to black so corrupt HDR reads as black
+        // rather than random noise; a natural scene tonemaps to structure.
+        auto tonemap_half = [](uint16_t half_bits) -> uint8_t {
+          float v = xe::xenos_half_to_float(half_bits);
+          if (!(v > 0.0f) || v > 1.0e6f) {
+            return 0;
+          }
+          float t = v / (1.0f + v);
+          if (t > 1.0f) {
+            t = 1.0f;
+          }
+          return uint8_t(t * 255.0f + 0.5f);
+        };
         char guest_filename[64];
         std::snprintf(guest_filename, sizeof(guest_filename),
                       "guest_buffer_frame_%u_0x%08X.ppm", request_index,
                       guest_address);
         std::filesystem::path guest_path =
             std::filesystem::path(diagnostic_root) / guest_filename;
-        std::ofstream guest_file(guest_path, std::ios::binary);
-        if (!guest_file) {
-          continue;
+        std::ofstream guest_file;
+        if (dump_files) {
+          guest_file.open(guest_path, std::ios::binary);
+          if (guest_file) {
+            guest_file << "P6\n"
+                       << kGuestDumpWidth << " " << kGuestDumpHeight
+                       << "\n255\n";
+          }
         }
-        guest_file << "P6\n"
-                   << kGuestDumpWidth << " " << kGuestDumpHeight << "\n255\n";
         VariantStats guest_stats;
+        RawByteStats guest_byte_stats;
         std::array<uint8_t, 3> guest_rgb = {};
+        std::array<uint8_t, 8> canonical_64bpp_pixel = {};
         for (uint32_t y = 0; y < kGuestDumpHeight; ++y) {
           for (uint32_t x = 0; x < kGuestDumpWidth; ++x) {
             uint32_t offset_bytes = uint32_t(texture_util::GetTiledOffset2D(
-                int32_t(x), int32_t(y), kGuestDumpPitch, 2));
+                int32_t(x), int32_t(y), kGuestDumpPitch, guest_block_log2));
             const uint8_t* source_pixel = guest_base + offset_bytes;
+            if (guest_bpp == 8) {
+              canonicalize_64bpp(source_pixel, writer_guest_endian,
+                                 canonical_64bpp_pixel);
+              for (uint32_t c = 0; c < 3; ++c) {
+                const uint16_t component =
+                    uint16_t(canonical_64bpp_pixel[c * 2]) |
+                    (uint16_t(canonical_64bpp_pixel[c * 2 + 1]) << 8);
+                guest_rgb[c] =
+                    guest_is_unorm16
+                        ? uint8_t((uint32_t(component) + 128u) / 257u)
+                        : tonemap_half(component);
+              }
+            } else {
+              guest_byte_stats.Accumulate(source_pixel);
+              for (uint32_t c = 0; c < 3; ++c) {
+                guest_rgb[c] = source_pixel[c];
+              }
+            }
             bool nonblack = false;
             for (uint32_t c = 0; c < 3; ++c) {
-              guest_rgb[c] = source_pixel[c];
               guest_stats.min[c] = std::min(guest_stats.min[c], guest_rgb[c]);
               guest_stats.max[c] = std::max(guest_stats.max[c], guest_rgb[c]);
               guest_stats.sum[c] += guest_rgb[c];
@@ -1594,8 +1835,10 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
             if (nonblack) {
               ++guest_stats.nonblack;
             }
-            guest_file.write(reinterpret_cast<const char*>(guest_rgb.data()),
-                             guest_rgb.size());
+            if (guest_file) {
+              guest_file.write(reinterpret_cast<const char*>(guest_rgb.data()),
+                               guest_rgb.size());
+            }
           }
         }
         const uint64_t guest_pixel_count =
@@ -1607,25 +1850,83 @@ bool VulkanTextureCache::DumpAndroidCpuSwapTexture(
                       guest_address);
         std::filesystem::path guest_raw_path =
             std::filesystem::path(diagnostic_root) / guest_raw_filename;
-        std::ofstream guest_raw_file(guest_raw_path, std::ios::binary);
-        if (guest_raw_file) {
-          guest_raw_file.write(reinterpret_cast<const char*>(guest_base),
-                               kRawDumpMaxBytes);
-          if (guest_raw_file.good()) {
-            XELOGI("RAWDUMP frame={} addr=0x{:08X} bytes={} path={}",
-                   request_index, guest_address, kRawDumpMaxBytes,
-                   guest_raw_path.string());
+        if (dump_files) {
+          std::ofstream guest_raw_file(guest_raw_path, std::ios::binary);
+          if (guest_raw_file) {
+            // Size the raw bin to the real frame so 64bpp isn't truncated.
+            const uint32_t guest_raw_bytes = std::min<uint32_t>(
+                kGuestDumpWidth * kGuestDumpHeight * guest_bpp,
+                kRawDumpMaxBytes);
+            guest_raw_file.write(reinterpret_cast<const char*>(guest_base),
+                                 guest_raw_bytes);
+            if (guest_raw_file.good()) {
+              XELOGI(
+                  "RAWDUMP frame={} addr=0x{:08X} fmt={} endian={} bpp={} "
+                  "decode={} bytes={} path={}",
+                  request_index, guest_address, writer_guest_format,
+                  writer_guest_endian, guest_bpp, guest_decode_name,
+                  guest_raw_bytes, guest_raw_path.string());
+            }
           }
         }
+        const std::string guest_path_text =
+            dump_files ? guest_path.string() : std::string("stats_only");
+        // Log what the resolve path most recently actually wrote to this
+        // address (may differ from guest_bpp/assumed format below - this
+        // address is a reused scratch buffer targeted by resolves of
+        // different formats over the course of a run).
+        if (last_writer) {
+          XELOGI(
+              "LASTWRITER frame={} addr=0x{:08X} last_fmt={} "
+              "last_endian={} last_edram_base={} last_pitch_tiles={} "
+              "last_msaa={} last_bpp={} write_seq={} configured_bpp={} "
+              "decoded_bpp={} decode={}",
+              request_index, guest_address, writer_guest_format,
+              writer_guest_endian, last_writer->edram_base.load(),
+              last_writer->pitch_tiles.load(), last_writer->msaa.load(),
+              writer_guest_bpp,
+              last_writer->write_sequence.load(), configured_guest_bpp,
+              guest_bpp, guest_decode_name);
+        }
         XELOGI(
-            "GUESTDUMP frame={} addr=0x{:08X} hash=0x{:016X} nonblack={}/{} "
+            "GUESTDUMP frame={} addr=0x{:08X} fmt={} endian={} bpp={} "
+            "decode={} hash=0x{:016X} nonblack={}/{} "
             "max_rgb={},{},{} mean_rgb={:.2f},{:.2f},{:.2f} path={}",
-            request_index, guest_address, guest_stats.hash,
-            guest_stats.nonblack, guest_pixel_count,
+            request_index, guest_address, writer_guest_format,
+            writer_guest_endian, guest_bpp, guest_decode_name,
+            guest_stats.hash, guest_stats.nonblack, guest_pixel_count,
             uint32_t(guest_stats.max[0]), uint32_t(guest_stats.max[1]),
             uint32_t(guest_stats.max[2]), guest_stats.sum[0] / guest_divisor,
             guest_stats.sum[1] / guest_divisor,
-            guest_stats.sum[2] / guest_divisor, guest_path.string());
+            guest_stats.sum[2] / guest_divisor, guest_path_text);
+        auto pct = [guest_divisor](uint64_t count) {
+          return guest_divisor ? (100.0 * double(count) / guest_divisor) : 0.0;
+        };
+        XELOGI(
+            "GUESTDUMP_BYTES frame={} addr=0x{:08X} hash=0x{:016X} "
+            "nonzero={}/{} min_b={},{},{},{} max_b={},{},{},{} "
+            "mean_b={:.2f},{:.2f},{:.2f},{:.2f} "
+            "zero_pct={:.1f},{:.1f},{:.1f},{:.1f} "
+            "clip_pct={:.1f},{:.1f},{:.1f},{:.1f} dump_files={}",
+            request_index, guest_address, guest_byte_stats.hash,
+            guest_byte_stats.nonzero, guest_pixel_count,
+            uint32_t(guest_byte_stats.min[0]),
+            uint32_t(guest_byte_stats.min[1]),
+            uint32_t(guest_byte_stats.min[2]),
+            uint32_t(guest_byte_stats.min[3]),
+            uint32_t(guest_byte_stats.max[0]),
+            uint32_t(guest_byte_stats.max[1]),
+            uint32_t(guest_byte_stats.max[2]),
+            uint32_t(guest_byte_stats.max[3]),
+            guest_byte_stats.sum[0] / guest_divisor,
+            guest_byte_stats.sum[1] / guest_divisor,
+            guest_byte_stats.sum[2] / guest_divisor,
+            guest_byte_stats.sum[3] / guest_divisor,
+            pct(guest_byte_stats.zero[0]), pct(guest_byte_stats.zero[1]),
+            pct(guest_byte_stats.zero[2]), pct(guest_byte_stats.zero[3]),
+            pct(guest_byte_stats.clip[0]), pct(guest_byte_stats.clip[1]),
+            pct(guest_byte_stats.clip[2]), pct(guest_byte_stats.clip[3]),
+            uint32_t(dump_files));
       }
       return true;
     }
@@ -1822,6 +2123,47 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     return false;
   }
   const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
+#if XE_PLATFORM_ANDROID
+  if ((texture_key.base_page == 0x2018 || texture_key.base_page == 0x2354) &&
+      texture_key.format == xenos::TextureFormat::k_8_8_8_8) {
+    static uint32_t android_rgba8_load_log_count = 0;
+    if (android_rgba8_load_log_count < 64) {
+      XELOGI(
+          "Android RGBA8 texture upload {}: base=0x{:08X} size={}x{} "
+          "pitch={} tiled={} endian={} load_shader={} host_format={} "
+          "safe_load={} pattern={} load_base={} load_mips={}",
+          android_rgba8_load_log_count, uint32_t(texture_key.base_page << 12),
+          texture_key.GetWidth(), texture_key.GetHeight(),
+          uint32_t(texture_key.pitch), uint32_t(texture_key.tiled),
+          uint32_t(texture_key.endianness), uint32_t(load_shader),
+          uint32_t(host_format.format),
+          uint32_t(GetAndroidHaloExperiment().rgba8_safe_texture_load),
+          uint32_t(GetAndroidHaloExperiment().rgba8_texture_pattern),
+          uint32_t(load_base), uint32_t(load_mips));
+      ++android_rgba8_load_log_count;
+    }
+  }
+  if (texture_key.base_page == 0x2354 &&
+      texture_key.format == xenos::TextureFormat::k_16_16_16_16) {
+    static uint32_t android_rgba16_load_log_count = 0;
+    if (android_rgba16_load_log_count < 64) {
+      XELOGI(
+          "Android RGBA16 texture upload {}: base=0x{:08X} size={}x{} "
+          "pitch={} tiled={} endian={} load_shader={} host_format={} "
+          "safe_source_load={} load_base={} load_mips={}",
+          android_rgba16_load_log_count, uint32_t(texture_key.base_page << 12),
+          texture_key.GetWidth(), texture_key.GetHeight(),
+          uint32_t(texture_key.pitch), uint32_t(texture_key.tiled),
+          uint32_t(texture_key.endianness), uint32_t(load_shader),
+          uint32_t(host_format.format),
+          uint32_t(GetAndroidHaloExperiment().rgba16_safe_texture_load &&
+                   load_shader == kLoadShaderIndexRGBA16UNormToFloat &&
+                   !texture_key.scaled_resolve),
+          uint32_t(load_base), uint32_t(load_mips));
+      ++android_rgba16_load_log_count;
+    }
+  }
+#endif
 
   // Get the guest layout.
   const texture_util::TextureGuestLayout& guest_layout =
@@ -1994,6 +2336,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   // aligned to 16 bytes even though LoadShaderInfo no longer exposes the guest
   // source element size.
   uint32_t source_length_alignment = 16;
+#if XE_PLATFORM_ANDROID
+  const bool android_absolute_source_base_binding =
+      GetAndroidHaloExperiment().texture_load_absolute_shared_memory_binding &&
+      !texture_key.scaled_resolve &&
+      (texture_key.base_page == 0x2018 || texture_key.base_page == 0x2354);
+#endif
   VkDescriptorSet descriptor_set_source_base = VK_NULL_HANDLE;
   VkDescriptorSet descriptor_set_source_mips = VK_NULL_HANDLE;
   VkDescriptorBufferInfo write_descriptor_set_source_base_buffer_info;
@@ -2057,10 +2405,31 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       // Regular unscaled texture - use shared memory
       write_descriptor_set_source_base_buffer_info.buffer =
           vulkan_shared_memory.buffer();
+#if XE_PLATFORM_ANDROID
+      if (android_absolute_source_base_binding) {
+        write_descriptor_set_source_base_buffer_info.offset = 0;
+        write_descriptor_set_source_base_buffer_info.range = xe::align(
+            (texture_key.base_page << 12) + vulkan_texture.GetGuestBaseSize(),
+            source_length_alignment);
+        static uint32_t android_absolute_texture_binding_log_count = 0;
+        if (android_absolute_texture_binding_log_count < 64) {
+          XELOGI(
+              "Android absolute texture source binding {}: base=0x{:08X} "
+              "format={} range={}",
+              android_absolute_texture_binding_log_count,
+              uint32_t(texture_key.base_page << 12),
+              uint32_t(texture_key.format),
+              uint64_t(write_descriptor_set_source_base_buffer_info.range));
+          ++android_absolute_texture_binding_log_count;
+        }
+      } else
+#endif
+      {
       write_descriptor_set_source_base_buffer_info.offset =
           texture_key.base_page << 12;
       write_descriptor_set_source_base_buffer_info.range =
           xe::align(vulkan_texture.GetGuestBaseSize(), source_length_alignment);
+      }
     }
     VkWriteDescriptorSet& write_descriptor_set_source_base =
         write_descriptor_sets[write_descriptor_set_count++];
@@ -2173,6 +2542,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       uint32_t(texture_key.tiled) | (uint32_t(is_3d_tiling) << 1) |
       (uint32_t(texture_load_endianness) << 2) |
       (texture_resolution_scale_x << 4) | (texture_resolution_scale_y << 7);
+#if XE_PLATFORM_ANDROID
+  if (GetAndroidHaloExperiment().rgba8_texture_pattern &&
+      texture_key.format == xenos::TextureFormat::k_8_8_8_8 &&
+      (texture_key.base_page == 0x2018 || texture_key.base_page == 0x2354)) {
+    load_constants.is_tiled_3d_endian_scale |= UINT32_C(1) << 31;
+  }
+#endif
 
   uint32_t guest_x_blocks_per_group_log2 =
       load_shader_info.GetGuestXBlocksPerGroupLog2();
@@ -2192,6 +2568,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 
     // TODO(Triang3l): guest_offset relative to the storage buffer origin.
     load_constants.guest_offset = 0;
+#if XE_PLATFORM_ANDROID
+    if (is_base && android_absolute_source_base_binding) {
+      load_constants.guest_offset = texture_key.base_page << 12;
+    }
+#endif
     if (!is_base) {
       load_constants.guest_offset +=
           guest_layout.mip_offsets_bytes[level] *
@@ -2262,6 +2643,36 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
             sizeof(load_constants.host_offset), &load_constants.host_offset);
       }
       command_processor_.SubmitBarriers(true);
+#if XE_PLATFORM_ANDROID
+      if (GetAndroidHaloExperiment().texture_load_immediate_source_barrier &&
+          !texture_key.scaled_resolve && is_base &&
+          (texture_key.base_page == 0x2018 || texture_key.base_page == 0x2354)) {
+        VkBufferMemoryBarrier source_barrier = {};
+        source_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        source_barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        source_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        source_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        source_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        source_barrier.buffer = vulkan_shared_memory.buffer();
+        source_barrier.offset = texture_key.base_page << 12;
+        source_barrier.size = vulkan_texture.GetGuestBaseSize();
+        command_buffer.CmdVkPipelineBarrier(
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1,
+            &source_barrier, 0, nullptr);
+        static uint32_t android_source_barrier_log_count = 0;
+        if (android_source_barrier_log_count < 64) {
+          XELOGI(
+              "Android immediate texture source barrier {}: base=0x{:08X} "
+              "format={} size={}",
+              android_source_barrier_log_count,
+              uint32_t(texture_key.base_page << 12),
+              uint32_t(texture_key.format),
+              vulkan_texture.GetGuestBaseSize());
+          ++android_source_barrier_log_count;
+        }
+      }
+#endif
       // Debug: show dispatch info with source offset
       command_processor_.InsertDebugMarker(
           "Dispatch: guest_off=0x%X host_off=0x%X groups=%ux%ux%u",
@@ -2349,7 +2760,68 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     copy_region.imageExtent.height =
         std::max((height * texture_resolution_scale_y) >> level, UINT32_C(1));
     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
+#if XE_PLATFORM_ANDROID
+    const bool android_tight_rgba16_copy =
+        GetAndroidHaloExperiment().rgba16_tight_buffer_image_copy &&
+        texture_key.base_page == 0x2354 &&
+        texture_key.format == xenos::TextureFormat::k_16_16_16_16 &&
+        !texture_key.scaled_resolve && level == 0 && array_size == 1 &&
+        copy_region.bufferRowLength == copy_region.imageExtent.width &&
+        copy_region.bufferImageHeight == copy_region.imageExtent.height;
+    if (android_tight_rgba16_copy) {
+      copy_region.bufferRowLength = 0;
+      copy_region.bufferImageHeight = 0;
+      static uint32_t android_tight_rgba16_copy_log_count = 0;
+      if (android_tight_rgba16_copy_log_count < 64) {
+        XELOGI(
+            "Android RGBA16 tight buffer-image copy {}: base=0x{:08X} "
+            "extent={}x{} buffer_offset={}",
+            android_tight_rgba16_copy_log_count,
+            uint32_t(texture_key.base_page << 12),
+            copy_region.imageExtent.width, copy_region.imageExtent.height,
+            uint64_t(copy_region.bufferOffset));
+        ++android_tight_rgba16_copy_log_count;
+      }
+    }
+#endif
   }
+
+#if XE_PLATFORM_ANDROID
+  const bool android_immediate_rgba16_sample_barrier =
+      GetAndroidHaloExperiment().rgba16_immediate_sample_barrier &&
+      texture_key.base_page == 0x2354 &&
+      texture_key.format == xenos::TextureFormat::k_16_16_16_16 &&
+      !texture_key.scaled_resolve && level_first == 0 && level_last == 0 &&
+      level_last_for_blit_gen == 0;
+  if (android_immediate_rgba16_sample_barrier) {
+    VkImageMemoryBarrier sample_barrier = {};
+    sample_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    sample_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    sample_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    sample_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    sample_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    sample_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    sample_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    sample_barrier.image = vulkan_texture.image();
+    sample_barrier.subresourceRange =
+        ui::vulkan::util::InitializeSubresourceRange();
+    command_buffer.CmdVkPipelineBarrier(
+        VK_PIPELINE_STAGE_TRANSFER_BIT, guest_shader_pipeline_stages_, 0, 0,
+        nullptr, 0, nullptr, 1, &sample_barrier);
+    VulkanTexture::Usage previous_usage =
+        vulkan_texture.SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
+    assert_true(previous_usage == VulkanTexture::Usage::kTransferDestination);
+    static uint32_t android_immediate_rgba16_barrier_log_count = 0;
+    if (android_immediate_rgba16_barrier_log_count < 64) {
+      XELOGI(
+          "Android RGBA16 immediate sample barrier {}: base=0x{:08X} "
+          "extent={}x{}",
+          android_immediate_rgba16_barrier_log_count,
+          uint32_t(texture_key.base_page << 12), width, height);
+      ++android_immediate_rgba16_barrier_log_count;
+    }
+  }
+#endif
 
   // Generate mip levels for scaled resolve textures via blit.
   if (level_last_for_blit_gen > 0) {
@@ -2502,6 +2974,26 @@ VulkanTextureCache::VulkanTexture::VulkanTexture(
   vmaGetAllocationInfo(texture_cache.vma_allocator_, allocation_,
                        &allocation_info);
   SetHostMemoryUsage(uint64_t(allocation_info.size));
+#if XE_PLATFORM_ANDROID
+  if (allocation_info.size >= (VkDeviceSize(16) << 20)) {
+    static uint32_t large_texture_log_count = 0;
+    if (large_texture_log_count < 96) {
+      XELOGW(
+          "Android Vulkan large texture {}: allocation={} MB total={} MB "
+          "base=0x{:08X} size={}x{}x{} mips={} dimension={} format={} "
+          "scaled_resolve={} signed_separate={}",
+          large_texture_log_count, allocation_info.size >> 20,
+          (texture_cache.GetTotalHostMemoryUsage() +
+           ((UINT64_C(1) << 20) - 1)) >>
+              20,
+          uint32_t(key.base_page << 12), key.GetWidth(), key.GetHeight(),
+          key.GetDepthOrArraySize(), uint32_t(key.mip_max_level) + 1,
+          uint32_t(key.dimension), uint32_t(key.format),
+          uint32_t(key.scaled_resolve), uint32_t(key.signed_separate));
+      ++large_texture_log_count;
+    }
+  }
+#endif
 }
 
 VulkanTextureCache::VulkanTexture::~VulkanTexture() {
@@ -2756,6 +3248,25 @@ VulkanTextureCache::VulkanTextureCache(
       command_processor_(command_processor),
       guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {}
 
+VulkanTextureCache::AllocatorMemoryUsage
+VulkanTextureCache::GetAllocatorMemoryUsage() const {
+  AllocatorMemoryUsage result;
+  if (vma_allocator_ == VK_NULL_HANDLE) {
+    return result;
+  }
+  VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+  vmaGetHeapBudgets(vma_allocator_, budgets);
+  for (const VmaBudget& budget : budgets) {
+    result.block_bytes += budget.statistics.blockBytes;
+    result.allocation_bytes += budget.statistics.allocationBytes;
+    result.block_count += budget.statistics.blockCount;
+    result.allocation_count += budget.statistics.allocationCount;
+    result.heap_usage_bytes += budget.usage;
+    result.heap_budget_bytes += budget.budget;
+  }
+  return result;
+}
+
 bool VulkanTextureCache::Initialize() {
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
@@ -2852,14 +3363,27 @@ bool VulkanTextureCache::Initialize() {
   // decompressed.
   // TODO(Triang3l): S3TC -> 5551 or 4444 as an option.
   // TODO(Triang3l): S3TC -> ETC2 / EAC (a huge research topic).
+#if XE_PLATFORM_ANDROID
+  const bool android_force_dxt_fallback =
+      GetAndroidHaloExperiment().force_dxt_fallback;
+  const bool android_force_rgba16_fixed_float_fallback =
+      GetAndroidHaloExperiment().rgba16_fixed_texture_float_fallback;
+  if (android_force_dxt_fallback) {
+    XELOGI("HaloCompat forcing DXT/BC texture decompression fallbacks");
+  }
+#endif
   HostFormatPair& host_format_dxt1 =
       host_formats_[uint32_t(xenos::TextureFormat::k_DXT1)];
   assert_true(host_format_dxt1.format_unsigned.format ==
               VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(
       physical_device, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
-      kLinearFilterFeatures) {
+  if (
+#if XE_PLATFORM_ANDROID
+      android_force_dxt_fallback ||
+#endif
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
+          kLinearFilterFeatures) {
     host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndexDXT1ToRGBA8;
     host_format_dxt1.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_dxt1.format_unsigned.block_compressed = false;
@@ -2872,8 +3396,12 @@ bool VulkanTextureCache::Initialize() {
               VK_FORMAT_BC2_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(
       physical_device, VK_FORMAT_BC2_UNORM_BLOCK, &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
-      kLinearFilterFeatures) {
+  if (
+#if XE_PLATFORM_ANDROID
+      android_force_dxt_fallback ||
+#endif
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
+          kLinearFilterFeatures) {
     host_format_dxt2_3.format_unsigned.load_shader =
         kLoadShaderIndexDXT3ToRGBA8;
     host_format_dxt2_3.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -2887,8 +3415,12 @@ bool VulkanTextureCache::Initialize() {
               VK_FORMAT_BC3_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(
       physical_device, VK_FORMAT_BC3_UNORM_BLOCK, &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
-      kLinearFilterFeatures) {
+  if (
+#if XE_PLATFORM_ANDROID
+      android_force_dxt_fallback ||
+#endif
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
+          kLinearFilterFeatures) {
     host_format_dxt4_5.format_unsigned.load_shader =
         kLoadShaderIndexDXT5ToRGBA8;
     host_format_dxt4_5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -2902,8 +3434,12 @@ bool VulkanTextureCache::Initialize() {
               VK_FORMAT_BC5_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(
       physical_device, VK_FORMAT_BC5_UNORM_BLOCK, &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
-      kLinearFilterFeatures) {
+  if (
+#if XE_PLATFORM_ANDROID
+      android_force_dxt_fallback ||
+#endif
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
+          kLinearFilterFeatures) {
     host_format_dxn.format_unsigned.load_shader = kLoadShaderIndexDXNToRG8;
     host_format_dxn.format_unsigned.format = VK_FORMAT_R8G8_UNORM;
     host_format_dxn.format_unsigned.block_compressed = false;
@@ -2914,8 +3450,12 @@ bool VulkanTextureCache::Initialize() {
               VK_FORMAT_BC4_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(
       physical_device, VK_FORMAT_BC4_UNORM_BLOCK, &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
-      kLinearFilterFeatures) {
+  if (
+#if XE_PLATFORM_ANDROID
+      android_force_dxt_fallback ||
+#endif
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
+          kLinearFilterFeatures) {
     host_format_dxt5a.format_unsigned.load_shader = kLoadShaderIndexDXT5AToR8;
     host_format_dxt5a.format_unsigned.format = VK_FORMAT_R8_UNORM;
     host_format_dxt5a.format_unsigned.block_compressed = false;
@@ -2931,6 +3471,13 @@ bool VulkanTextureCache::Initialize() {
   // or precision).
   VkFormatFeatureFlags norm16_required_features =
       VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+  VkFormatFeatureFlags rgba16_required_features = norm16_required_features;
+#if XE_PLATFORM_ANDROID
+  // Reach linearly samples format-26 scene resolves. Unlike SFLOAT, linear
+  // filtering of RGBA16 UNORM / SNORM isn't guaranteed by Vulkan.
+  rgba16_required_features |=
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+#endif
   HostFormatPair& host_format_16 =
       host_formats_[uint32_t(xenos::TextureFormat::k_16)];
   assert_true(host_format_16.format_unsigned.format == VK_FORMAT_R16_UNORM);
@@ -2977,8 +3524,12 @@ bool VulkanTextureCache::Initialize() {
       host_formats_[uint32_t(xenos::TextureFormat::k_16_16_16_16)];
   assert_true(host_format_16_16_16_16.format_unsigned.format ==
               VK_FORMAT_R16G16B16A16_UNORM);
-  if ((r16g16b16a16_unorm_properties.optimalTilingFeatures &
-       norm16_required_features) != norm16_required_features) {
+  if (
+#if XE_PLATFORM_ANDROID
+      android_force_rgba16_fixed_float_fallback ||
+#endif
+      (r16g16b16a16_unorm_properties.optimalTilingFeatures &
+       rgba16_required_features) != rgba16_required_features) {
     host_format_16_16_16_16.format_unsigned.load_shader =
         kLoadShaderIndexRGBA16UNormToFloat;
     host_format_16_16_16_16.format_unsigned.format =
@@ -2986,13 +3537,29 @@ bool VulkanTextureCache::Initialize() {
   }
   assert_true(host_format_16_16_16_16.format_signed.format ==
               VK_FORMAT_R16G16B16A16_SNORM);
-  if ((r16g16b16a16_snorm_properties.optimalTilingFeatures &
-       norm16_required_features) != norm16_required_features) {
+  if (
+#if XE_PLATFORM_ANDROID
+      android_force_rgba16_fixed_float_fallback ||
+#endif
+      (r16g16b16a16_snorm_properties.optimalTilingFeatures &
+       rgba16_required_features) != rgba16_required_features) {
     host_format_16_16_16_16.format_signed.load_shader =
         kLoadShaderIndexRGBA16SNormToFloat;
     host_format_16_16_16_16.format_signed.format =
         VK_FORMAT_R16G16B16A16_SFLOAT;
   }
+#if XE_PLATFORM_ANDROID
+  XELOGI(
+      "HaloCompat RGBA16 fixed texture host selection: force_float={} "
+      "required_features=0x{:X} unorm_features=0x{:X} "
+      "snorm_features=0x{:X} unsigned_host={} signed_host={}",
+      uint32_t(android_force_rgba16_fixed_float_fallback),
+      uint32_t(rgba16_required_features),
+      uint32_t(r16g16b16a16_unorm_properties.optimalTilingFeatures),
+      uint32_t(r16g16b16a16_snorm_properties.optimalTilingFeatures),
+      uint32_t(host_format_16_16_16_16.format_unsigned.format),
+      uint32_t(host_format_16_16_16_16.format_signed.format));
+#endif
   host_format_16_16_16_16.unsigned_signed_compatible =
       (host_format_16_16_16_16.format_unsigned.format ==
            VK_FORMAT_R16G16B16A16_UNORM &&
@@ -3214,6 +3781,19 @@ bool VulkanTextureCache::Initialize() {
       shaders::texture_load_16bpb_cs, sizeof(shaders::texture_load_16bpb_cs));
   load_shader_code[kLoadShaderIndex32bpb] = std::make_pair(
       shaders::texture_load_32bpb_cs, sizeof(shaders::texture_load_32bpb_cs));
+#if XE_PLATFORM_ANDROID
+  if (GetAndroidHaloExperiment().rgba8_texture_pattern) {
+    load_shader_code[kLoadShaderIndex32bpb] = std::make_pair(
+        shaders::texture_load_32bpb_pattern_cs,
+        sizeof(shaders::texture_load_32bpb_pattern_cs));
+    XELOGI("HaloCompat using 32bpp coordinate-pattern texture loads");
+  } else if (GetAndroidHaloExperiment().rgba8_safe_texture_load) {
+    load_shader_code[kLoadShaderIndex32bpb] = std::make_pair(
+        shaders::texture_load_32bpb_safe_cs,
+        sizeof(shaders::texture_load_32bpb_safe_cs));
+    XELOGI("HaloCompat using fully scalar 32bpp texture loads");
+  }
+#endif
   load_shader_code[kLoadShaderIndex64bpb] = std::make_pair(
       shaders::texture_load_64bpb_cs, sizeof(shaders::texture_load_64bpb_cs));
   load_shader_code[kLoadShaderIndex128bpb] = std::make_pair(
@@ -3264,6 +3844,19 @@ bool VulkanTextureCache::Initialize() {
   load_shader_code[kLoadShaderIndexRGBA16UNormToFloat] =
       std::make_pair(shaders::texture_load_rgba16_unorm_float_cs,
                      sizeof(shaders::texture_load_rgba16_unorm_float_cs));
+#if XE_PLATFORM_ANDROID
+  if (GetAndroidHaloExperiment().rgba16_texture_pattern) {
+    load_shader_code[kLoadShaderIndexRGBA16UNormToFloat] = std::make_pair(
+        shaders::texture_load_rgba16_pattern_float_cs,
+        sizeof(shaders::texture_load_rgba16_pattern_float_cs));
+    XELOGI("HaloCompat using RGBA16 coordinate-pattern texture loads");
+  } else if (GetAndroidHaloExperiment().rgba16_safe_texture_load) {
+    load_shader_code[kLoadShaderIndexRGBA16UNormToFloat] = std::make_pair(
+        shaders::texture_load_rgba16_unorm_float_safe_cs,
+        sizeof(shaders::texture_load_rgba16_unorm_float_safe_cs));
+    XELOGI("HaloCompat using fully scalar RGBA16 UNORM texture loads");
+  }
+#endif
   load_shader_code[kLoadShaderIndexRGBA16SNormToFloat] =
       std::make_pair(shaders::texture_load_rgba16_snorm_float_cs,
                      sizeof(shaders::texture_load_rgba16_snorm_float_cs));

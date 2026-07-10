@@ -205,6 +205,12 @@ class PosixFileHandle : public FileHandle {
       return false;
     }
   }
+  void DiscardCachedData(size_t file_offset, size_t length) override {
+    if (length) {
+      posix_fadvise(handle_, static_cast<off_t>(file_offset),
+                    static_cast<off_t>(length), POSIX_FADV_DONTNEED);
+    }
+  }
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
     ssize_t out = pwrite(handle_, buffer, buffer_length, file_offset);

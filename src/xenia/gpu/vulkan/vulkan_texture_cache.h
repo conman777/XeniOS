@@ -81,6 +81,16 @@ class VulkanTextureCache final : public TextureCache {
 
   ~VulkanTextureCache();
 
+  struct AllocatorMemoryUsage {
+    VkDeviceSize block_bytes = 0;
+    VkDeviceSize allocation_bytes = 0;
+    uint32_t block_count = 0;
+    uint32_t allocation_count = 0;
+    VkDeviceSize heap_usage_bytes = 0;
+    VkDeviceSize heap_budget_bytes = 0;
+  };
+  AllocatorMemoryUsage GetAllocatorMemoryUsage() const;
+
   void BeginSubmission(uint64_t new_submission_index) override;
 
   // Must be called within a frame - creates and untiles textures needed by
@@ -93,6 +103,16 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension,
                                               bool is_signed);
+
+#if XE_PLATFORM_ANDROID
+  void LogActiveTextureBindingForAndroidDraw(
+      const char* stage, uint32_t draw_sequence, uint32_t target_base,
+      uint32_t target_pitch, uint32_t target_format, uint32_t target_msaa,
+      uint32_t target_width, uint64_t vertex_shader_hash,
+      uint64_t pixel_shader_hash, uint32_t binding_index,
+      uint32_t fetch_constant_index, xenos::FetchOpDimension dimension,
+      bool is_signed) const;
+#endif
 
   SamplerParameters GetSamplerParameters(
       const VulkanShader::SamplerBinding& binding) const;

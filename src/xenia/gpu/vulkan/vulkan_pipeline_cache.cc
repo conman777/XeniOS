@@ -800,6 +800,70 @@ void VulkanPipelineCache::EndSubmission() {
   ProcessDeferredDestructions();
 }
 
+void VulkanPipelineCache::ClearCache() {
+  // Cache clearing is called only after the GPU queue has been idled. Also
+  // drain asynchronous creation so no worker retains a pointer into pipelines_.
+  if (!creation_threads_.empty()) {
+    bool await_creation_completion_event;
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      await_creation_completion_event =
+          !creation_queue_.empty() || creation_threads_busy_ != 0;
+      if (await_creation_completion_event) {
+        creation_completion_event_->Reset();
+        creation_completion_set_event_.store(true, std::memory_order_release);
+      }
+    }
+    if (await_creation_completion_event) {
+      creation_request_cond_.notify_one();
+      xe::threading::Wait(creation_completion_event_.get(), false);
+    }
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  size_t destroyed_pipeline_count = 0;
+  {
+    std::lock_guard<std::mutex> lock(deferred_destroy_mutex_);
+    for (const auto& pipeline_pair : deferred_destroy_pipelines_) {
+      if (pipeline_pair.first != VK_NULL_HANDLE) {
+        dfn.vkDestroyPipeline(device, pipeline_pair.first, nullptr);
+        ++destroyed_pipeline_count;
+      }
+    }
+    deferred_destroy_pipelines_.clear();
+  }
+
+  last_pipeline_ = nullptr;
+  for (const auto& pipeline_pair : pipelines_) {
+    VkPipeline pipeline =
+        pipeline_pair.second.pipeline.load(std::memory_order_acquire);
+    if (pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, pipeline, nullptr);
+      ++destroyed_pipeline_count;
+    }
+  }
+  pipelines_.clear();
+
+  if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineCache(device, vk_pipeline_cache_, nullptr);
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+  }
+  VkPipelineCacheCreateInfo pipeline_cache_create_info = {};
+  pipeline_cache_create_info.sType =
+      VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  if (dfn.vkCreatePipelineCache(device, &pipeline_cache_create_info, nullptr,
+                                &vk_pipeline_cache_) != VK_SUCCESS) {
+    XELOGW("VulkanPipelineCache: Failed to recreate pipeline cache");
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+  }
+  XELOGW("Vulkan pipeline cache reclaimed {} guest pipelines",
+         destroyed_pipeline_count);
+}
+
 bool VulkanPipelineCache::IsCreatingPipelines() {
   if (creation_threads_.empty()) {
     return false;

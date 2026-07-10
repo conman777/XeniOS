@@ -40,6 +40,8 @@ public abstract class WindowedAppActivity extends Activity {
 
     private native void onDestroyNative(long appContext);
 
+    private native void onTrimMemoryNative(long appContext, int level);
+
     private native void onWindowSurfaceLayoutChange(
             long appContext, int left, int top, int right, int bottom);
 
@@ -142,6 +144,22 @@ public abstract class WindowedAppActivity extends Activity {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) {
             enterImmersiveMode();
+        }
+    }
+
+    @Override
+    public void onTrimMemory(final int level) {
+        super.onTrimMemory(level);
+        if (mAppContext != 0) {
+            onTrimMemoryNative(mAppContext, level);
+        }
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        if (mAppContext != 0) {
+            onTrimMemoryNative(mAppContext, 80);
         }
     }
 

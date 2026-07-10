@@ -120,6 +120,12 @@ void AndroidWindowedAppContext::JniActivityOnDestroy() {
   RequestDestruction();
 }
 
+void AndroidWindowedAppContext::JniActivityOnTrimMemory(jint level) {
+  if (app_) {
+    app_->InvokeOnMemoryPressure(int32_t(level));
+  }
+}
+
 void AndroidWindowedAppContext::JniActivityOnWindowSurfaceLayoutChange(
     jint left, jint top, jint right, jint bottom) {
   window_surface_layout_left_ = left;
@@ -612,6 +618,13 @@ Java_jp_xenios_emulator_WindowedAppActivity_onDestroyNative(
     JNIEnv* jni_env, jobject activity, jlong app_context_ptr) {
   reinterpret_cast<xe::ui::AndroidWindowedAppContext*>(app_context_ptr)
       ->JniActivityOnDestroy();
+}
+
+JNIEXPORT void JNICALL
+Java_jp_xenios_emulator_WindowedAppActivity_onTrimMemoryNative(
+    JNIEnv* jni_env, jobject activity, jlong app_context_ptr, jint level) {
+  reinterpret_cast<xe::ui::AndroidWindowedAppContext*>(app_context_ptr)
+      ->JniActivityOnTrimMemory(level);
 }
 
 JNIEXPORT void JNICALL

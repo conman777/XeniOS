@@ -93,6 +93,15 @@ class TextureCache {
 
   virtual void ClearCache();
 
+  uint64_t GetTotalHostMemoryUsage() const {
+    return textures_total_host_memory_usage_;
+  }
+  uint32_t GetHostMemoryHardLimitMB() const;
+  bool IsHostMemoryUsageAboveHardLimit() const {
+    return GetTotalHostMemoryUsage() >
+           (uint64_t(GetHostMemoryHardLimitMB()) << 20);
+  }
+
   virtual void CompletedSubmissionUpdated(uint64_t completed_submission_index);
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
