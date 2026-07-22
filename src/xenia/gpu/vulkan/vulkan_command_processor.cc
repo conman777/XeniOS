@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
@@ -2104,9 +2105,26 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   // resolution-scaled if it's a resolve destination, or not otherwise.
   uint32_t frontbuffer_width_scaled, frontbuffer_height_scaled;
   xenos::TextureFormat frontbuffer_format;
-  VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
-      frontbuffer_ptr, frontbuffer_width_scaled, frontbuffer_height_scaled,
-      frontbuffer_format);
+  VkImageView swap_texture_view = VK_NULL_HANDLE;
+#if XE_PLATFORM_ANDROID
+  const AndroidHaloExperiment& android_halo_experiment =
+      GetAndroidHaloExperiment();
+  if (!android_halo_experiment.present_cpu_swap_texture) {
+    swap_texture_view =
+        render_target_cache_->RequestAndroidHaloHostSwapTexture(
+            frontbuffer_width, frontbuffer_height, frontbuffer_width_scaled,
+            frontbuffer_height_scaled, frontbuffer_format);
+    if (swap_texture_view != VK_NULL_HANDLE) {
+      // RequestSwapTexture normally advances this presentation classifier.
+      AndroidHaloTickGameplayPresentCounter();
+    }
+  }
+#endif
+  if (swap_texture_view == VK_NULL_HANDLE) {
+    swap_texture_view = texture_cache_->RequestSwapTexture(
+        frontbuffer_ptr, frontbuffer_width_scaled, frontbuffer_height_scaled,
+        frontbuffer_format);
+  }
   if (swap_texture_view == VK_NULL_HANDLE) {
     return;
   }
@@ -3499,8 +3517,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       VkDeviceSize(cvars::vulkan_memory_limit_mb) << 20;
   const uint64_t android_kgsl_limit =
       uint64_t(cvars::vulkan_kgsl_memory_limit_mb) << 20;
+  const AndroidHaloExperiment& android_halo_experiment =
+      GetAndroidHaloExperiment();
+  const bool android_kgsl_preserve_pipeline_cache =
+      android_halo_experiment.kgsl_preserve_pipeline_cache;
+  const uint64_t android_kgsl_reclaim_cooldown_millis =
+      android_halo_experiment.kgsl_reclaim_cooldown_ms;
   static uint64_t android_kgsl_last_check_millis = 0;
-  static uint64_t android_kgsl_last_reclaim_millis = 0;
+  static uint64_t android_memory_last_reclaim_millis = 0;
   static uint64_t android_kgsl_usage = 0;
   const uint64_t android_kgsl_now_millis =
       xe::Clock::QueryHostUptimeMillis();
@@ -3512,25 +3536,94 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   if (texture_cache_) {
     texture_allocator_usage = texture_cache_->GetAllocatorMemoryUsage();
   }
-  const bool texture_allocator_limit_exceeded =
+  const uint64_t sparse_shared_memory_usage =
+      shared_memory_ ? shared_memory_->host_gpu_memory_sparse_used_bytes() : 0;
+  const uint64_t excluded_sparse_shared_memory_usage =
+      android_halo_experiment.kgsl_exclude_sparse_shared_memory
+          ? sparse_shared_memory_usage
+          : 0;
+  const uint64_t vulkan_heap_usage_reclaimable =
+      texture_allocator_usage.heap_usage_bytes >
+              excluded_sparse_shared_memory_usage
+          ? texture_allocator_usage.heap_usage_bytes -
+                excluded_sparse_shared_memory_usage
+          : 0;
+  const uint64_t android_kgsl_usage_reclaimable =
+      android_kgsl_usage > excluded_sparse_shared_memory_usage
+          ? android_kgsl_usage - excluded_sparse_shared_memory_usage
+          : 0;
+  const bool texture_payload_limit_exceeded =
+      texture_cache_ && texture_cache_->IsHostMemoryUsageAboveHardLimit();
+  const bool texture_allocator_limit_exceeded_raw =
       texture_allocator_limit &&
       texture_allocator_usage.block_bytes > texture_allocator_limit;
-  const bool vulkan_heap_limit_exceeded =
+  const bool vulkan_heap_limit_exceeded_raw =
       vulkan_heap_limit &&
-      texture_allocator_usage.heap_usage_bytes > vulkan_heap_limit;
+      vulkan_heap_usage_reclaimable > vulkan_heap_limit;
+  const bool android_kgsl_limit_exceeded_raw =
+      android_kgsl_limit &&
+      android_kgsl_usage_reclaimable > android_kgsl_limit;
+  // WO36: all persistent pressure sources share one cooldown. Previously only
+  // KGSL did, so a global Vulkan heap above its threshold submitted and waited
+  // on every draw even while the live texture payload was only a few MiB.
+  const bool android_memory_reclaim_cooldown_elapsed =
+      android_kgsl_now_millis >=
+          android_memory_last_reclaim_millis +
+              (android_kgsl_preserve_pipeline_cache
+                   ? android_kgsl_reclaim_cooldown_millis
+                   : 3000);
+  const bool texture_allocator_limit_exceeded =
+      texture_allocator_limit_exceeded_raw &&
+      android_memory_reclaim_cooldown_elapsed;
+  const bool vulkan_heap_limit_exceeded =
+      vulkan_heap_limit_exceeded_raw &&
+      android_memory_reclaim_cooldown_elapsed;
   const bool android_kgsl_limit_exceeded =
-      android_kgsl_limit && android_kgsl_usage > android_kgsl_limit &&
-      android_kgsl_now_millis >= android_kgsl_last_reclaim_millis + 3000;
+      android_kgsl_limit_exceeded_raw &&
+      android_memory_reclaim_cooldown_elapsed;
+  const bool texture_payload_pressure =
+      texture_payload_limit_exceeded &&
+      android_memory_reclaim_cooldown_elapsed;
   if (texture_cache_ &&
-      (texture_cache_->IsHostMemoryUsageAboveHardLimit() ||
+      (texture_payload_pressure ||
        texture_allocator_limit_exceeded || vulkan_heap_limit_exceeded ||
        android_kgsl_limit_exceeded)) {
     const uint64_t usage_before = texture_cache_->GetTotalHostMemoryUsage();
+    uint64_t readback_memory_usage = memexport_readback_buffer_size_;
+    for (const auto& pair : readback_buffers_) {
+      readback_memory_usage +=
+          uint64_t(pair.second.sizes[0]) + uint64_t(pair.second.sizes[1]);
+    }
+    for (const auto& pair : memexport_readback_buffers_) {
+      readback_memory_usage +=
+          uint64_t(pair.second.sizes[0]) + uint64_t(pair.second.sizes[1]);
+    }
+    const uint64_t uniform_upload_usage =
+        uniform_buffer_pool_ ? uniform_buffer_pool_->GetMemoryUsage() : 0;
+    const uint64_t primitive_upload_usage =
+        primitive_processor_
+            ? primitive_processor_->upload_buffer_memory_usage()
+            : 0;
+    const uint64_t shared_upload_usage =
+        shared_memory_ ? shared_memory_->upload_buffer_memory_usage() : 0;
+    const uint64_t render_target_usage =
+        render_target_cache_
+            ? render_target_cache_->render_target_memory_usage_bytes()
+            : 0;
+    const uint64_t render_target_upload_usage =
+        render_target_cache_
+            ? render_target_cache_->transfer_upload_memory_usage()
+            : 0;
     XELOGW(
-        "Android Vulkan texture cache pressure: payload={} MB (hard limit {} "
+        "Android Vulkan memory pressure: payload={} MB (hard limit {} "
         "MB) VMA blocks={} MB allocations={} MB blocks={} allocations={} "
-        "Vulkan heap={} / {} MB KGSL={} MB; "
-        "submitting before the next draw",
+        "Vulkan heap raw/reclaimable/limit={}/{}/{} MB KGSL "
+        "raw/reclaimable/limit={}/{}/{} MB sparse_shared={} MB/{} allocs "
+        "RT={} MB uploads(uniform/index/shared/RT)={}/{}/{}/{} MB "
+        "scratch={} MB readback={} MB/{} keys "
+        "pipelines(live/deferred)={}/{} "
+        "triggers(payload/blocks/heap/kgsl)={}/{}/{}/{}; submitting before "
+        "the next draw",
         (usage_before + ((UINT64_C(1) << 20) - 1)) >> 20,
         texture_cache_->GetHostMemoryHardLimitMB(),
         (texture_allocator_usage.block_bytes +
@@ -3544,11 +3637,61 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         (texture_allocator_usage.heap_usage_bytes +
          ((VkDeviceSize(1) << 20) - 1)) >>
             20,
-        texture_allocator_usage.heap_budget_bytes >> 20,
-        (android_kgsl_usage + ((UINT64_C(1) << 20) - 1)) >> 20);
+        (vulkan_heap_usage_reclaimable + ((UINT64_C(1) << 20) - 1)) >> 20,
+        vulkan_heap_limit >> 20,
+        (android_kgsl_usage + ((UINT64_C(1) << 20) - 1)) >> 20,
+        (android_kgsl_usage_reclaimable + ((UINT64_C(1) << 20) - 1)) >> 20,
+        android_kgsl_limit >> 20,
+        (sparse_shared_memory_usage + ((UINT64_C(1) << 20) - 1)) >> 20,
+        shared_memory_
+            ? shared_memory_->host_gpu_memory_sparse_allocation_count()
+            : 0,
+        (render_target_usage + ((UINT64_C(1) << 20) - 1)) >> 20,
+        (uniform_upload_usage + ((UINT64_C(1) << 20) - 1)) >> 20,
+        (primitive_upload_usage + ((UINT64_C(1) << 20) - 1)) >> 20,
+        (shared_upload_usage + ((UINT64_C(1) << 20) - 1)) >> 20,
+        (render_target_upload_usage + ((UINT64_C(1) << 20) - 1)) >> 20,
+        (uint64_t(scratch_buffer_size_) + ((UINT64_C(1) << 20) - 1)) >> 20,
+        (readback_memory_usage + ((UINT64_C(1) << 20) - 1)) >> 20,
+        readback_buffers_.size() + memexport_readback_buffers_.size() +
+            size_t(memexport_readback_buffer_ != VK_NULL_HANDLE),
+        pipeline_cache_->pipeline_count(),
+        pipeline_cache_->deferred_pipeline_count(),
+        uint32_t(texture_payload_limit_exceeded),
+        uint32_t(texture_allocator_limit_exceeded_raw),
+        uint32_t(vulkan_heap_limit_exceeded_raw),
+        uint32_t(android_kgsl_limit_exceeded_raw));
     if (!EndSubmission(false) || !AwaitAllQueueOperationsCompletion()) {
-      XELOGE("Android Vulkan texture cache reclamation submission failed");
+      XELOGE("Android Vulkan memory reclamation submission failed");
       return false;
+    }
+    size_t pipelines_trimmed = 0;
+    bool pipeline_cache_cleared = false;
+    bool retained_pools_cleared = false;
+    if (android_halo_experiment.kgsl_reclaim_retained_pools) {
+      // The queue is idle here. Release peak allocations that the old
+      // pressure path skipped even though the normal full-cache clear frees
+      // them. All are recreated lazily on the next draw.
+      ClearReadbackBuffers();
+      DestroyScratchBuffer();
+      ClearTransientDescriptorPools();
+      if (resolve_downscale_descriptor_pool_chain_) {
+        resolve_downscale_descriptor_pool_chain_->ClearCache();
+      }
+      uniform_buffer_pool_->ClearCache();
+      primitive_processor_->ClearCache();
+      shared_memory_->ClearUploadBufferCache();
+      current_constant_buffers_up_to_date_ = 0;
+      std::memset(current_graphics_descriptor_sets_, 0,
+                  sizeof(current_graphics_descriptor_sets_));
+      current_graphics_descriptor_sets_
+          [SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram] =
+              shared_memory_and_edram_descriptor_set_;
+      current_graphics_descriptor_set_values_up_to_date_ =
+          UINT32_C(1)
+          << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram;
+      current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+      retained_pools_cleared = true;
     }
     VulkanTextureCache::AllocatorMemoryUsage texture_allocator_after =
         texture_cache_->GetAllocatorMemoryUsage();
@@ -3557,27 +3700,116 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       texture_cache_->ClearCache();
       texture_allocator_after = texture_cache_->GetAllocatorMemoryUsage();
     }
+    const uint64_t vulkan_heap_after_reclaimable =
+        texture_allocator_after.heap_usage_bytes >
+                excluded_sparse_shared_memory_usage
+            ? texture_allocator_after.heap_usage_bytes -
+                  excluded_sparse_shared_memory_usage
+            : 0;
     if ((vulkan_heap_limit &&
-         texture_allocator_after.heap_usage_bytes > vulkan_heap_limit) ||
+         vulkan_heap_after_reclaimable > vulkan_heap_limit) ||
         android_kgsl_limit_exceeded) {
       texture_cache_->ClearCache();
-      pipeline_cache_->ClearCache();
       render_target_cache_->ClearCache();
-      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
-      current_guest_graphics_pipeline_layout_ = nullptr;
-      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+      if (!android_kgsl_preserve_pipeline_cache) {
+        pipeline_cache_->ClearCache();
+        pipeline_cache_cleared = true;
+        current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+        current_guest_graphics_pipeline_layout_ = nullptr;
+        current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+      } else {
+        // Reclaim textures and render targets first. Only trim pipelines when
+        // KGSL is still above the configured limit so short-lived spikes don't
+        // force shader recompilation.
+        android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
+        android_kgsl_last_check_millis = android_kgsl_now_millis;
+        texture_allocator_after = texture_cache_->GetAllocatorMemoryUsage();
+        const uint64_t android_kgsl_after_reclaimable =
+            android_kgsl_usage > excluded_sparse_shared_memory_usage
+                ? android_kgsl_usage - excluded_sparse_shared_memory_usage
+                : 0;
+        const uint64_t vulkan_heap_after_cache_reclaimable =
+            texture_allocator_after.heap_usage_bytes >
+                    excluded_sparse_shared_memory_usage
+                ? texture_allocator_after.heap_usage_bytes -
+                      excluded_sparse_shared_memory_usage
+                : 0;
+        if ((android_kgsl_limit &&
+             android_kgsl_after_reclaimable > android_kgsl_limit) ||
+            (vulkan_heap_limit &&
+             vulkan_heap_after_cache_reclaimable > vulkan_heap_limit)) {
+          const size_t pipeline_count_before =
+              pipeline_cache_->pipeline_count();
+          const size_t pipeline_keep_count = std::max<size_t>(
+              android_halo_experiment.kgsl_pipeline_min_count,
+              (pipeline_count_before *
+                   android_halo_experiment.kgsl_pipeline_keep_percent +
+               99) /
+                  100);
+          if (pipeline_keep_count < pipeline_count_before) {
+            pipelines_trimmed =
+                pipeline_cache_->TrimCache(
+                    pipeline_keep_count,
+                    android_halo_experiment
+                        .kgsl_reset_driver_pipeline_cache_on_trim);
+            current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+            current_guest_graphics_pipeline_layout_ = nullptr;
+            current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+            android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
+            android_kgsl_last_check_millis = android_kgsl_now_millis;
+          }
+        }
+
+        const uint64_t android_kgsl_emergency_limit =
+            android_kgsl_limit +
+            (uint64_t(android_halo_experiment
+                          .kgsl_pipeline_emergency_headroom_mb)
+             << 20);
+        const uint64_t android_kgsl_emergency_usage =
+            android_kgsl_usage > excluded_sparse_shared_memory_usage
+                ? android_kgsl_usage - excluded_sparse_shared_memory_usage
+                : 0;
+        if (android_kgsl_emergency_usage > android_kgsl_emergency_limit) {
+          const size_t pipeline_count_before =
+              pipeline_cache_->pipeline_count();
+          const size_t pipeline_keep_count = std::min<size_t>(
+              pipeline_count_before,
+              android_halo_experiment.kgsl_pipeline_emergency_keep_count);
+          XELOGW(
+              "Android KGSL remains at {} MB raw / {} MB reclaimable after "
+              "partial reclamation (emergency limit {} MB); emergency LRU "
+              "retaining {} of {} pipelines and resetting the driver cache",
+              (android_kgsl_usage + ((UINT64_C(1) << 20) - 1)) >> 20,
+              (android_kgsl_emergency_usage +
+               ((UINT64_C(1) << 20) - 1)) >>
+                  20,
+              android_kgsl_emergency_limit >> 20,
+              pipeline_keep_count, pipeline_count_before);
+          pipelines_trimmed +=
+              pipeline_cache_->TrimCache(pipeline_keep_count, true);
+          current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+          current_guest_graphics_pipeline_layout_ = nullptr;
+          current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+          android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
+          android_kgsl_last_check_millis = android_kgsl_now_millis;
+        }
+      }
       current_graphics_descriptor_sets_bound_up_to_date_ = 0;
       texture_allocator_after = texture_cache_->GetAllocatorMemoryUsage();
     }
-    if (android_kgsl_limit_exceeded) {
-      android_kgsl_last_reclaim_millis = android_kgsl_now_millis;
-      android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
-      android_kgsl_last_check_millis = android_kgsl_now_millis;
-    }
+    android_memory_last_reclaim_millis = android_kgsl_now_millis;
+    android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
+    android_kgsl_last_check_millis = android_kgsl_now_millis;
     const uint64_t usage_after = texture_cache_->GetTotalHostMemoryUsage();
+    const uint64_t android_kgsl_after_reclaimable =
+        android_kgsl_usage > excluded_sparse_shared_memory_usage
+            ? android_kgsl_usage - excluded_sparse_shared_memory_usage
+            : 0;
     XELOGW(
-        "Android Vulkan texture cache reclaimed {} MB payload; {} MB payload "
-        "and {} MB VMA blocks retained; Vulkan heap={} MB KGSL={} MB",
+        "Android Vulkan memory reclaimed {} MB payload; {} MB payload and {} "
+        "MB VMA blocks retained; Vulkan heap={} MB KGSL raw/reclaimable={}/{} "
+        "MB pipelines_trimmed={} pipelines_retained={} pipelines_deferred={} "
+        "pipeline_cache_cleared={} retained_pools_cleared={}",
         (usage_before - usage_after) >> 20,
         (usage_after + ((UINT64_C(1) << 20) - 1)) >> 20,
         (texture_allocator_after.block_bytes +
@@ -3586,7 +3818,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         (texture_allocator_after.heap_usage_bytes +
          ((VkDeviceSize(1) << 20) - 1)) >>
             20,
-        (android_kgsl_usage + ((UINT64_C(1) << 20) - 1)) >> 20);
+        (android_kgsl_usage + ((UINT64_C(1) << 20) - 1)) >> 20,
+        (android_kgsl_after_reclaimable + ((UINT64_C(1) << 20) - 1)) >> 20,
+        pipelines_trimmed, pipeline_cache_->pipeline_count(),
+        pipeline_cache_->deferred_pipeline_count(),
+        uint32_t(pipeline_cache_cleared),
+        uint32_t(retained_pools_cleared));
   }
 #endif
 
@@ -3827,6 +4064,50 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   if (render_target_cache_->GetPath() ==
       RenderTargetCache::Path::kHostRenderTargets) {
     auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    static uint32_t android_base675_probe_draw_poll_count = 0;
+    static uint32_t android_base675_probe_mode =
+        AndroidHaloLiveBase675ProbeMode().load(std::memory_order_relaxed);
+    static uint64_t android_base675_probe_hash =
+        GetAndroidHaloExperiment().base675_draw_probe_hash;
+    static uint32_t android_base675_probe_log_count = 0;
+    if ((android_base675_probe_draw_poll_count++ & 63) == 0) {
+      uint32_t new_probe_mode =
+          GetAndroidHaloExperiment().base675_draw_probe_mode;
+      uint64_t new_probe_hash =
+          GetAndroidHaloExperiment().base675_draw_probe_hash;
+      constexpr const char* kProbePaths[] = {
+          "/sdcard/Android/data/jp.xenios.emulator.github.debug/files/"
+          "halo_scene_probe.txt",
+          "/sdcard/Android/data/jp.xenios.emulator.github/files/"
+          "halo_scene_probe.txt",
+      };
+      for (const char* probe_path : kProbePaths) {
+        std::ifstream probe_file(probe_path);
+        uint32_t file_probe_mode;
+        if (probe_file >> file_probe_mode) {
+          new_probe_mode = std::min(file_probe_mode, uint32_t(15));
+          std::string file_probe_hash;
+          if (probe_file >> file_probe_hash) {
+            new_probe_hash =
+                uint64_t(std::strtoull(file_probe_hash.c_str(), nullptr, 0));
+          }
+          break;
+        }
+      }
+      if (new_probe_mode != android_base675_probe_mode ||
+          new_probe_hash != android_base675_probe_hash) {
+        XELOGI(
+            "HaloCompat live base675 probe mode {} -> {} hash "
+            "0x{:016X} -> 0x{:016X}",
+            android_base675_probe_mode, new_probe_mode,
+            android_base675_probe_hash, new_probe_hash);
+        android_base675_probe_mode = new_probe_mode;
+        AndroidHaloLiveBase675ProbeMode().store(new_probe_mode,
+                                                std::memory_order_relaxed);
+        android_base675_probe_hash = new_probe_hash;
+        android_base675_probe_log_count = 0;
+      }
+    }
     for (uint32_t rt_index = 0; rt_index < xenos::kMaxColorRenderTargets;
          ++rt_index) {
       uint32_t rt_write_mask = (normalized_color_mask >> (rt_index * 4)) & 0xF;
@@ -3900,15 +4181,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         static uint32_t android_draw_log_count = 0;
         static uint32_t android_base675_draw_log_count = 0;
         static uint32_t android_base0_draw_log_count = 0;
-        // Narrow to the specific 64bpp F16 format (fmt=7) - base 675 is a
+        // Narrow to Reach's 7e3 scene formats (fmt=3/12) - base 675 is a
         // reused scratch address hit by many unrelated passes (menus, UI,
         // LUTs) first; without this filter a flat counter cap exhausts long
-        // before real gameplay's F16 scene draws are ever reached.
+        // before real gameplay's scene draws are ever reached.
         bool android_want_base675_log =
             GetAndroidHaloExperiment().log_base675_draw_state &&
             rb_color_info.color_base == 675 &&
-            rb_color_info.color_format ==
-                xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT &&
+            (rb_color_info.color_format ==
+                 xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+             rb_color_info.color_format ==
+                 xenos::ColorRenderTargetFormat::
+                     k_2_10_10_10_FLOAT_AS_16_16_16_16) &&
             android_base675_draw_log_count < 4096;
         bool android_want_base0_log =
             GetAndroidHaloExperiment().log_base0_draw_state &&
@@ -3941,7 +4225,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           XELOGI(
               "Android draw {}: prim={} index_count={} host_vertices={} "
               "edram_mode={} raster={} color_mask=0x{:X} rt{} write=0x{:X} "
-              "base={} pitch={} msaa={} fmt={} surface_pitch={} "
+              "base={} pitch={} msaa={} fmt={} exp_bias={} surface_pitch={} "
               "surface_msaa={} blend_enabled={} color_srcblend={} "
               "color_destblend={} color_comb_fcn={} alpha_srcblend={} "
               "alpha_destblend={} alpha_comb_fcn={} vs=0x{:016X} ps=0x{:016X}",
@@ -3956,6 +4240,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
               rb_color_info.color_base, pitch_tiles,
               uint32_t(rb_surface_info.msaa_samples),
               uint32_t(rb_color_info.color_format),
+              int32_t(rb_color_info.color_exp_bias),
               uint32_t(rb_surface_info.surface_pitch),
               uint32_t(rb_surface_info.msaa_samples),
               uint32_t(android_blend_enabled),
@@ -4023,6 +4308,84 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
               pixel_shader->ucode_data_hash());
         }
         return true;
+      }
+
+      const bool android_base675_scene_draw =
+          android_base675_probe_mode != 0 &&
+          rb_color_info.color_base == 675 &&
+          rb_surface_info.surface_pitch == 1200 &&
+          rb_surface_info.msaa_samples == xenos::MsaaSamples::k1X &&
+          (rb_color_info.color_format ==
+               xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+           rb_color_info.color_format == xenos::ColorRenderTargetFormat::
+                                           k_2_10_10_10_FLOAT_AS_16_16_16_16) &&
+          pixel_shader;
+      if (android_base675_scene_draw) {
+        auto blend_control = regs.Get<reg::RB_BLENDCONTROL>(
+            reg::RB_BLENDCONTROL::rt_register_indices[rt_index]);
+        const bool blend_enabled =
+            uint32_t(blend_control.color_srcblend) != 1 ||
+            uint32_t(blend_control.color_destblend) != 0 ||
+            uint32_t(blend_control.color_comb_fcn) != 0 ||
+            uint32_t(blend_control.alpha_srcblend) != 1 ||
+            uint32_t(blend_control.alpha_destblend) != 0 ||
+            uint32_t(blend_control.alpha_comb_fcn) != 0;
+        const bool src_alpha_blend =
+            uint32_t(blend_control.color_srcblend) == 6 &&
+            uint32_t(blend_control.color_destblend) == 7;
+        const bool color_multiply_blend =
+            uint32_t(blend_control.color_srcblend) == 8 &&
+            uint32_t(blend_control.color_destblend) == 4;
+        const uint64_t pixel_shader_hash = pixel_shader->ucode_data_hash();
+        const bool is_fullscreen_8d =
+            pixel_shader_hash == UINT64_C(0x8D5529A24BBA7685);
+        const bool is_scene_0aef =
+            pixel_shader_hash == UINT64_C(0x0AEFB3104700397A);
+        bool skip_scene_draw = false;
+        switch (android_base675_probe_mode) {
+          case 1:
+            skip_scene_draw = blend_enabled;
+            break;
+          case 2:
+            skip_scene_draw = src_alpha_blend;
+            break;
+          case 3:
+            skip_scene_draw = color_multiply_blend;
+            break;
+          case 4:
+            skip_scene_draw = is_fullscreen_8d;
+            break;
+          case 5:
+            skip_scene_draw = is_scene_0aef;
+            break;
+          case 6:
+            skip_scene_draw = !is_fullscreen_8d;
+            break;
+          case 7:
+            skip_scene_draw = !is_scene_0aef;
+            break;
+          case 8:
+            skip_scene_draw = pixel_shader_hash == android_base675_probe_hash;
+            break;
+          case 9:
+            skip_scene_draw = pixel_shader_hash != android_base675_probe_hash;
+            break;
+          default:
+            break;
+        }
+        if (skip_scene_draw) {
+          if (android_base675_probe_log_count++ < 256) {
+            XELOGI(
+                "BASE675_DRAW_PROBE skip mode={} target=0x{:016X} prim={} "
+                "indices={} fmt={} blend={} src={} dst={} ps=0x{:016X}",
+                android_base675_probe_mode, android_base675_probe_hash,
+                uint32_t(prim_type), index_count,
+                uint32_t(rb_color_info.color_format), uint32_t(blend_enabled),
+                uint32_t(blend_control.color_srcblend),
+                uint32_t(blend_control.color_destblend), pixel_shader_hash);
+          }
+          return true;
+        }
       }
     }
   }
@@ -4740,27 +5103,20 @@ void VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(
     readback_buffer_offset += memexport_range.size_bytes;
   }
 
-  // Use delayed sync (read from previous frame's buffer)
+  // Record which submission and range layout will populate the write buffer.
+  // The deferred command buffer has not been submitted yet, so this buffer
+  // must not be read on the CPU during this call.
+  rb.memexport_submissions[write_index] = GetCurrentSubmission();
+  rb.memexport_ranges[write_index] = memexport_ranges_;
+
+  // Use a previous buffer only after its GPU submission has completed. On a
+  // cold key, defer the CPU update rather than turning the fast path into a
+  // full AwaitAllQueueOperationsCompletion stall.
   uint32_t read_index = 1 - write_index;
-
-  bool is_cache_miss = false;
-  // If previous buffer doesn't exist or is too small, fall back to sync
-  // This happens on first use or buffer resize - subsequent frames will be fast
-  if (rb.buffers[read_index] == VK_NULL_HANDLE ||
-      memexport_total_size > rb.sizes[read_index]) {
-    is_cache_miss = true;
-    read_index = write_index;
-    if (!AwaitAllQueueOperationsCompletion()) {
-      return;
-    }
-  }
-
-  // TODO(has207): figure out why not copying only on cache hit
-  // doesn't work on vulkan but works in d3d12.
-  // DISABLED:// Only copy on cache miss (when we have fresh data from GPU sync)
-  // DISABLED:// On cache hit, we'd be copying stale data from previous frame
-  // DISABLED://if (is_cache_miss && rb.buffers[read_index] != VK_NULL_HANDLE &&
-  if (rb.buffers[read_index] != VK_NULL_HANDLE &&
+  const uint64_t completed_submission = GetCompletedSubmission();
+  if (rb.memexport_submissions[read_index] != 0 &&
+      rb.memexport_submissions[read_index] <= completed_submission &&
+      rb.buffers[read_index] != VK_NULL_HANDLE &&
       memexport_total_size <= rb.sizes[read_index] &&
       rb.mapped_data[read_index] != nullptr) {
 #if XE_PLATFORM_ANDROID
@@ -4773,7 +5129,8 @@ void VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(
 #endif  // XE_PLATFORM_ANDROID
     const uint8_t* readback_bytes =
         static_cast<const uint8_t*>(rb.mapped_data[read_index]);
-    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    for (const draw_util::MemExportRange& memexport_range :
+         rb.memexport_ranges[read_index]) {
       uint32_t dest_address = memexport_range.base_address_dwords << 2;
       uint8_t* dest_ptr = memory_->TranslatePhysical(dest_address);
 #if XE_PLATFORM_ANDROID
@@ -6165,6 +6522,8 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
 
   texture_cache_->CompletedSubmissionUpdated(completed_submission);
 
+  pipeline_cache_->CompletedSubmissionUpdated();
+
   // Reclaim descriptor pools that the GPU has finished using.
   if (resolve_downscale_descriptor_pool_chain_) {
     resolve_downscale_descriptor_pool_chain_->Reclaim(completed_submission);
@@ -6576,6 +6935,22 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     current_submission_wait_semaphores_.clear();
     command_buffers_submitted_.emplace_back(submission_index, command_buffer);
     command_buffers_writable_.pop_back();
+
+    // AcquireFenceAndSubmit refreshes the completion timeline before queuing
+    // this submission. Reclaim pipelines retired by older submissions even
+    // when proactive LRU is disabled.
+    pipeline_cache_->CompletedSubmissionUpdated();
+
+#if XE_PLATFORM_ANDROID
+    const AndroidHaloExperiment& android_halo_experiment =
+        GetAndroidHaloExperiment();
+    if (android_halo_experiment.kgsl_preserve_pipeline_cache &&
+        android_halo_experiment.kgsl_pipeline_proactive_limit) {
+      pipeline_cache_->TrimCacheAfterSubmission(
+          android_halo_experiment.kgsl_pipeline_proactive_limit,
+          submission_index);
+    }
+#endif
 
     // Mark descriptor pool chains with submission index for reclaim tracking.
     if (resolve_downscale_descriptor_pool_chain_) {
@@ -7288,10 +7663,32 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
 
   // Color exponent bias and FSI render target writing.
+#if XE_PLATFORM_ANDROID
+  const uint32_t android_live_base675_probe_mode =
+      AndroidHaloLiveBase675ProbeMode().load(std::memory_order_relaxed);
+#endif
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     reg::RB_COLOR_INFO color_info = color_infos[i];
     // Exponent bias is in bits 20:25 of RB_COLOR_INFO.
     int32_t color_exp_bias = color_info.color_exp_bias;
+#if XE_PLATFORM_ANDROID
+    bool android_host_7e3 =
+        render_target_cache_->GetPath() ==
+            RenderTargetCache::Path::kHostRenderTargets &&
+        (color_info.color_format ==
+             xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+         color_info.color_format == xenos::ColorRenderTargetFormat::
+                                        k_2_10_10_10_FLOAT_AS_16_16_16_16);
+    uint32_t android_host_7e3_range_mode =
+        GetAndroidHaloExperiment().host_7e3_range_mode;
+    if (android_host_7e3 &&
+        !render_target_cache_->UsesScaledUNorm7e3RenderTargets() &&
+        (android_host_7e3_range_mode == 1 ||
+         android_host_7e3_range_mode == 3)) {
+      // Keep the host attachment normalized and cancel the paired resolve -5.
+      color_exp_bias -= 5;
+    }
+#endif
     if (render_target_cache_->GetPath() ==
             RenderTargetCache::Path::kHostRenderTargets &&
         (color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 &&
@@ -7303,11 +7700,88 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       // losing blending correctness, but getting the full range.
       color_exp_bias -= 5;
     }
-    float color_exp_bias_scale;
-    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
-        UINT32_C(0x3F800000) + (color_exp_bias << 23);
+    float color_exp_bias_scale = std::ldexp(1.0f, color_exp_bias);
     dirty |= system_constants_.color_exp_bias[i] != color_exp_bias_scale;
     system_constants_.color_exp_bias[i] = color_exp_bias_scale;
+
+    uint32_t format_flags = uint32_t(color_info.color_format);
+    if (edram_fragment_shader_interlock) {
+      format_flags =
+          RenderTargetCache::AddPSIColorFormatFlags(color_info.color_format);
+    }
+#if XE_PLATFORM_ANDROID
+    else {
+      uint32_t host_7e3_alpha_mode =
+          GetAndroidHaloExperiment().host_7e3_alpha_mode;
+      bool is_7e3 =
+          color_info.color_format ==
+              xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+          color_info.color_format == xenos::ColorRenderTargetFormat::
+                                         k_2_10_10_10_FLOAT_AS_16_16_16_16;
+      const bool live_base675_output_probe =
+          is_7e3 && color_info.color_base == 675 &&
+          android_live_base675_probe_mode >= 10;
+      if (live_base675_output_probe) {
+        host_7e3_alpha_mode = android_live_base675_probe_mode == 10
+                                  ? 0
+                              : android_live_base675_probe_mode == 11
+                                  ? 1
+                                  : 2;
+      }
+      if (is_7e3 && host_7e3_alpha_mode != 0) {
+        format_flags =
+            RenderTargetCache::AddPSIColorFormatFlags(color_info.color_format);
+        if (host_7e3_alpha_mode >= 2) {
+          format_flags |=
+              RenderTargetCache::kHostColorFormatFlag_UnbiasedAlpha;
+        }
+      }
+      uint32_t host_7e3_range_mode =
+          GetAndroidHaloExperiment().host_7e3_range_mode;
+      if (is_7e3 && host_7e3_range_mode >= 2) {
+        format_flags |= RenderTargetCache::kHostColorFormatFlag_ClampColor;
+        if (host_7e3_range_mode == 3) {
+          format_flags |=
+              RenderTargetCache::kHostColorFormatFlag_NormalizedColor;
+        }
+      }
+      if (is_7e3 &&
+          render_target_cache_->UsesScaledUNorm7e3RenderTargets()) {
+        format_flags =
+            RenderTargetCache::AddPSIColorFormatFlags(color_info.color_format);
+        format_flags |= RenderTargetCache::kHostColorFormatFlag_ClampColor |
+                        RenderTargetCache::kHostColorFormatFlag_ScaledUNormColor;
+        const reg::RB_BLENDCONTROL blend_control =
+            regs.Get<reg::RB_BLENDCONTROL>(
+                reg::RB_BLENDCONTROL::rt_register_indices[i]);
+        if (blend_control.color_srcblend == xenos::BlendFactor::kDstColor &&
+            blend_control.color_destblend == xenos::BlendFactor::kSrcColor &&
+            blend_control.color_comb_fcn == xenos::BlendOp::kAdd) {
+          // If D' = D / 31.875 is stored in the UNORM target, using C / 31.875
+          // as the source would make 2 * C * D another 31.875 times too dark.
+          // Keeping C unscaled gives 2 * C * D' = (2 * C * D) / 31.875.
+          format_flags |= RenderTargetCache::
+              kHostColorFormatFlag_ScaledUNormSourceColor;
+        }
+        if (host_7e3_alpha_mode >= 2) {
+          format_flags |=
+              RenderTargetCache::kHostColorFormatFlag_UnbiasedAlpha;
+        }
+      }
+      if (live_base675_output_probe) {
+        if (android_live_base675_probe_mode == 13) {
+          format_flags |= RenderTargetCache::kHostColorFormatFlag_RGBScale2;
+        } else if (android_live_base675_probe_mode == 14) {
+          format_flags |= RenderTargetCache::kHostColorFormatFlag_RGBScale4;
+        } else if (android_live_base675_probe_mode == 15) {
+          format_flags |= RenderTargetCache::kHostColorFormatFlag_RGBScaleHalf;
+        }
+      }
+    }
+#endif
+    dirty |= system_constants_.edram_rt_format_flags[i] != format_flags;
+    system_constants_.edram_rt_format_flags[i] = format_flags;
+
     if (edram_fragment_shader_interlock) {
       dirty |=
           system_constants_.edram_rt_keep_mask[i][0] != rt_keep_masks[i][0];
@@ -7323,10 +7797,6 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
                  rt_base_dwords_scaled;
         system_constants_.edram_rt_base_dwords_scaled[i] =
             rt_base_dwords_scaled;
-        uint32_t format_flags =
-            RenderTargetCache::AddPSIColorFormatFlags(color_info.color_format);
-        dirty |= system_constants_.edram_rt_format_flags[i] != format_flags;
-        system_constants_.edram_rt_format_flags[i] = format_flags;
         uint32_t blend_factors_ops =
             regs[reg::RB_BLENDCONTROL::rt_register_indices[i]] & 0x1FFF1FFF;
         dirty |= system_constants_.edram_rt_blend_factors_ops[i] !=
@@ -7721,6 +8191,68 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch;
     }
   }
+
+#if XE_PLATFORM_ANDROID
+  if (GetAndroidHaloExperiment().log_scene_fetch_constants) {
+    struct AndroidSceneFetchLogEntry {
+      uint32_t fetch_index;
+      uint64_t pixel_shader_hash;
+      std::array<uint32_t, 6> dwords;
+    };
+    static std::array<AndroidSceneFetchLogEntry, 64>
+        android_scene_fetch_log_entries;
+    static uint32_t android_scene_fetch_log_count = 0;
+    const uint64_t pixel_shader_hash =
+        pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0);
+    for (uint32_t fetch_index = 0;
+         fetch_index < xenos::kTextureFetchConstantCount; ++fetch_index) {
+      const xenos::xe_gpu_texture_fetch_t fetch =
+          regs.GetTextureFetch(fetch_index);
+      const uint32_t physical_base_page = fetch.base_address & 0x1FFFF;
+      if (fetch.type != xenos::FetchConstantType::kTexture ||
+          physical_base_page < (UINT32_C(0x02354000) >> 12) ||
+          physical_base_page >= (UINT32_C(0x029A8000) >> 12)) {
+        continue;
+      }
+      const std::array<uint32_t, 6> fetch_dwords = {
+          fetch.dword_0, fetch.dword_1, fetch.dword_2,
+          fetch.dword_3, fetch.dword_4, fetch.dword_5};
+      bool already_logged = false;
+      for (uint32_t log_index = 0;
+           log_index < android_scene_fetch_log_count; ++log_index) {
+        const AndroidSceneFetchLogEntry& entry =
+            android_scene_fetch_log_entries[log_index];
+        if (entry.fetch_index == fetch_index &&
+            entry.pixel_shader_hash == pixel_shader_hash &&
+            entry.dwords == fetch_dwords) {
+          already_logged = true;
+          break;
+        }
+      }
+      if (already_logged ||
+          android_scene_fetch_log_count >=
+              android_scene_fetch_log_entries.size()) {
+        continue;
+      }
+      AndroidSceneFetchLogEntry& entry =
+          android_scene_fetch_log_entries[android_scene_fetch_log_count];
+      entry.fetch_index = fetch_index;
+      entry.pixel_shader_hash = pixel_shader_hash;
+      entry.dwords = fetch_dwords;
+      XELOGI(
+          "HaloCompat scene fetch constant {}: fetch={} base=0x{:08X} "
+          "raw_base_page=0x{:05X} format={} endian={} signs={}/{}/{}/{} "
+          "exp_adjust={} num_format={} ps=0x{:016X}",
+          android_scene_fetch_log_count, fetch_index,
+          uint32_t(physical_base_page << 12), uint32_t(fetch.base_address),
+          uint32_t(fetch.format), uint32_t(fetch.endianness),
+          uint32_t(fetch.sign_x), uint32_t(fetch.sign_y),
+          uint32_t(fetch.sign_z), uint32_t(fetch.sign_w),
+          int32_t(fetch.exp_adjust), fetch.num_format, pixel_shader_hash);
+      ++android_scene_fetch_log_count;
+    }
+  }
+#endif
 
   // Textures and samplers.
   const std::vector<VulkanShader::SamplerBinding>& samplers_vertex =

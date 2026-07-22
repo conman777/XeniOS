@@ -16,8 +16,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
+
+#if XE_PLATFORM_ANDROID
+#include <jni.h>
+#endif
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -40,12 +45,30 @@ constexpr float kAndroidCenterStartMaxX = 0.65f;
 constexpr float kAndroidStartMinY = 0.72f;
 constexpr float kAndroidDeadZone = 0.18f;
 constexpr float kAndroidDpadThreshold = 0.55f;
+constexpr float kAndroidPhysicalGamepadDeadZone = 0.15f;
 constexpr uint32_t kAndroidDebugInputFilePollInterval = 20;
 constexpr uint8_t kAndroidDebugLeftTrigger = 1;
 constexpr uint8_t kAndroidDebugRightTrigger = 2;
 
 std::atomic<uint8_t> android_debug_trigger_bits{0};
 std::atomic<uint32_t> android_debug_trigger_polls{0};
+
+struct AndroidPhysicalGamepadSnapshot {
+  uint16_t buttons = 0;
+  uint8_t left_trigger = 0;
+  uint8_t right_trigger = 0;
+  int16_t thumb_lx = 0;
+  int16_t thumb_ly = 0;
+  int16_t thumb_rx = 0;
+  int16_t thumb_ry = 0;
+};
+
+struct AndroidPhysicalGamepadState {
+  std::mutex mutex;
+  AndroidPhysicalGamepadSnapshot snapshot;
+};
+
+AndroidPhysicalGamepadState android_physical_gamepad_state;
 
 constexpr const char* kAndroidDebugInputPaths[] = {
     "/sdcard/Android/data/jp.xenios.emulator.github.debug/files/"
@@ -59,6 +82,30 @@ int16_t AxisFromUnit(float value) {
     return 0;
   }
   return static_cast<int16_t>(value * 32767.0f);
+}
+
+int16_t AxisFromPhysicalGamepad(float value) {
+  value = std::clamp(value, -1.0f, 1.0f);
+  const float magnitude = std::abs(value);
+  if (magnitude <= kAndroidPhysicalGamepadDeadZone) {
+    return 0;
+  }
+  const float normalized_magnitude =
+      (magnitude - kAndroidPhysicalGamepadDeadZone) /
+      (1.0f - kAndroidPhysicalGamepadDeadZone);
+  const float normalized = std::copysign(normalized_magnitude, value);
+  return static_cast<int16_t>(std::lround(
+      normalized * (normalized < 0.0f ? 32768.0f : 32767.0f)));
+}
+
+uint8_t TriggerFromUnit(float value) {
+  return static_cast<uint8_t>(
+      std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
+}
+
+AndroidPhysicalGamepadSnapshot ReadAndroidPhysicalGamepadState() {
+  std::lock_guard<std::mutex> lock(android_physical_gamepad_state.mutex);
+  return android_physical_gamepad_state.snapshot;
 }
 
 std::string UppercaseAscii(std::string value) {
@@ -169,6 +216,26 @@ uint16_t ReadAndroidDebugInputFile() {
 }
 
 }  // namespace
+
+void SetAndroidPhysicalGamepadState(uint16_t buttons, float left_x,
+                                    float left_y, float right_x, float right_y,
+                                    float left_trigger, float right_trigger) {
+  AndroidPhysicalGamepadSnapshot snapshot;
+  snapshot.buttons = buttons;
+  snapshot.left_trigger = TriggerFromUnit(left_trigger);
+  snapshot.right_trigger = TriggerFromUnit(right_trigger);
+  snapshot.thumb_lx = AxisFromPhysicalGamepad(left_x);
+  snapshot.thumb_ly = AxisFromPhysicalGamepad(-left_y);
+  snapshot.thumb_rx = AxisFromPhysicalGamepad(right_x);
+  snapshot.thumb_ry = AxisFromPhysicalGamepad(-right_y);
+  std::lock_guard<std::mutex> lock(android_physical_gamepad_state.mutex);
+  android_physical_gamepad_state.snapshot = snapshot;
+}
+
+void ResetAndroidPhysicalGamepadState() {
+  std::lock_guard<std::mutex> lock(android_physical_gamepad_state.mutex);
+  android_physical_gamepad_state.snapshot = {};
+}
 #endif  // XE_PLATFORM_ANDROID
 
 NopInputDriver::NopInputDriver(xe::ui::Window* window, size_t window_z_order)
@@ -394,8 +461,14 @@ X_RESULT NopInputDriver::GetState(uint32_t user_index,
   }
 
   std::memset(out_state, 0, sizeof(*out_state));
-  const uint16_t buttons = GetButtonsForPoll(poll_count_++);
+  uint16_t buttons = GetButtonsForPoll(poll_count_++);
   uint8_t trigger_bits = 0;
+  uint8_t left_trigger = 0;
+  uint8_t right_trigger = 0;
+  int16_t thumb_lx = android_thumb_lx_.load();
+  int16_t thumb_ly = android_thumb_ly_.load();
+  int16_t thumb_rx = 0;
+  int16_t thumb_ry = 0;
 #if XE_PLATFORM_ANDROID
   if (android_debug_trigger_polls.load()) {
     trigger_bits = android_debug_trigger_bits.load();
@@ -403,25 +476,44 @@ X_RESULT NopInputDriver::GetState(uint32_t user_index,
       android_debug_trigger_bits.store(0);
     }
   }
+  left_trigger =
+      trigger_bits & kAndroidDebugLeftTrigger ? uint8_t(0xFF) : uint8_t(0);
+  right_trigger =
+      trigger_bits & kAndroidDebugRightTrigger ? uint8_t(0xFF) : uint8_t(0);
+
+  const AndroidPhysicalGamepadSnapshot physical_gamepad =
+      ReadAndroidPhysicalGamepadState();
+  buttons |= physical_gamepad.buttons;
+  left_trigger = std::max(left_trigger, physical_gamepad.left_trigger);
+  right_trigger = std::max(right_trigger, physical_gamepad.right_trigger);
+  if (physical_gamepad.thumb_lx || physical_gamepad.thumb_ly) {
+    thumb_lx = physical_gamepad.thumb_lx;
+    thumb_ly = physical_gamepad.thumb_ly;
+  }
+  thumb_rx = physical_gamepad.thumb_rx;
+  thumb_ry = physical_gamepad.thumb_ry;
 #endif
-  const int16_t thumb_lx = android_thumb_lx_.load();
-  const int16_t thumb_ly = android_thumb_ly_.load();
-  if (buttons != last_buttons_ || trigger_bits != last_trigger_bits_ ||
-      thumb_lx != last_thumb_lx_ || thumb_ly != last_thumb_ly_) {
+  if (buttons != last_buttons_ || left_trigger != last_left_trigger_ ||
+      right_trigger != last_right_trigger_ || thumb_lx != last_thumb_lx_ ||
+      thumb_ly != last_thumb_ly_ || thumb_rx != last_thumb_rx_ ||
+      thumb_ry != last_thumb_ry_) {
     ++packet_number_;
     last_buttons_ = buttons;
-    last_trigger_bits_ = trigger_bits;
+    last_left_trigger_ = left_trigger;
+    last_right_trigger_ = right_trigger;
     last_thumb_lx_ = thumb_lx;
     last_thumb_ly_ = thumb_ly;
+    last_thumb_rx_ = thumb_rx;
+    last_thumb_ry_ = thumb_ry;
   }
   out_state->packet_number = packet_number_;
   out_state->gamepad.buttons = buttons;
-  out_state->gamepad.left_trigger =
-      trigger_bits & kAndroidDebugLeftTrigger ? 0xFF : 0;
-  out_state->gamepad.right_trigger =
-      trigger_bits & kAndroidDebugRightTrigger ? 0xFF : 0;
+  out_state->gamepad.left_trigger = left_trigger;
+  out_state->gamepad.right_trigger = right_trigger;
   out_state->gamepad.thumb_lx = thumb_lx;
   out_state->gamepad.thumb_ly = thumb_ly;
+  out_state->gamepad.thumb_rx = thumb_rx;
+  out_state->gamepad.thumb_ry = thumb_ry;
   return X_ERROR_SUCCESS;
 }
 
@@ -452,3 +544,25 @@ InputType NopInputDriver::GetInputType() const { return InputType::Controller; }
 }  // namespace nop
 }  // namespace hid
 }  // namespace xe
+
+#if XE_PLATFORM_ANDROID
+extern "C" {
+
+JNIEXPORT void JNICALL
+Java_jp_xenios_emulator_EmulatorActivity_setGamepadStateNative(
+    JNIEnv* jni_env, jobject activity, jint buttons, jfloat left_x,
+    jfloat left_y, jfloat right_x, jfloat right_y, jfloat left_trigger,
+    jfloat right_trigger) {
+  xe::hid::nop::SetAndroidPhysicalGamepadState(
+      uint16_t(buttons), float(left_x), float(left_y), float(right_x),
+      float(right_y), float(left_trigger), float(right_trigger));
+}
+
+JNIEXPORT void JNICALL
+Java_jp_xenios_emulator_EmulatorActivity_resetGamepadStateNative(
+    JNIEnv* jni_env, jobject activity) {
+  xe::hid::nop::ResetAndroidPhysicalGamepadState();
+}
+
+}  // extern "C"
+#endif

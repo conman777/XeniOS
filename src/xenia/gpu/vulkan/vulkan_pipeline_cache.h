@@ -75,6 +75,11 @@ class VulkanPipelineCache {
     // the real pipeline is being compiled in the background.
     std::atomic<bool> is_placeholder{false};
 
+    // Monotonically increasing command-processor usage stamp. Pipelines loaded
+    // speculatively from storage remain at zero until a guest draw uses them,
+    // making them the first candidates for memory-pressure eviction.
+    uint64_t last_used_sequence = 0;
+
     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
         : pipeline_layout(pipeline_layout_provider) {}
 
@@ -82,14 +87,16 @@ class VulkanPipelineCache {
     Pipeline(const Pipeline& other)
         : pipeline(other.pipeline.load(std::memory_order_acquire)),
           pipeline_layout(other.pipeline_layout),
-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {
+          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+          last_used_sequence(other.last_used_sequence) {
     }
 
     // Move constructor
     Pipeline(Pipeline&& other) noexcept
         : pipeline(other.pipeline.load(std::memory_order_acquire)),
           pipeline_layout(other.pipeline_layout),
-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {
+          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+          last_used_sequence(other.last_used_sequence) {
     }
 
     // Deleted copy assignment to prevent accidental copying
@@ -116,8 +123,21 @@ class VulkanPipelineCache {
       std::function<void()> completion_callback = nullptr);
   void ShutdownShaderStorage();
 
+  // Non-blocking reclamation after the command processor's completion
+  // timeline has been refreshed.
+  void CompletedSubmissionUpdated();
+  size_t deferred_pipeline_count();
   void EndSubmission();
   void ClearCache();
+  // Evicts the least recently used guest pipelines until no more than
+  // max_pipeline_count remain. If requested, the driver compiler cache is
+  // reset even when the guest pipeline count is already within the limit.
+  // The caller must idle the GPU queue first.
+  size_t TrimCache(size_t max_pipeline_count, bool reset_driver_cache);
+  // Removes old entries after a submission and defers VkPipeline destruction
+  // until that submission completes, avoiding an idle wait on the hot path.
+  size_t TrimCacheAfterSubmission(size_t max_pipeline_count,
+                                  uint64_t submission_index);
   size_t pipeline_count() const { return pipelines_.size(); }
   bool IsCreatingPipelines();
 
@@ -477,6 +497,8 @@ class VulkanPipelineCache {
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher>
       pipelines_;
 
+  uint64_t pipeline_usage_sequence_ = 0;
+
   // Previously used pipeline, to avoid lookups if the state wasn't changed.
   std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;
 
@@ -486,10 +508,9 @@ class VulkanPipelineCache {
   std::vector<std::unique_ptr<xe::threading::Thread>> creation_threads_;
   std::atomic<bool> creation_threads_shutdown_{false};
   std::atomic<size_t> creation_threads_busy_{0};
-  // Priority queue contains pointers to map entries. Pipelines are never
-  // evicted as games have a finite set that should all remain cached for
-  // performance. Higher priority pipelines (those writing to visible RTs)
-  // are compiled first.
+  // Priority queue contains pointers to map entries. Cache trimming drains
+  // this queue before evicting entries. Higher priority pipelines (those
+  // writing to visible RTs) are compiled first.
   std::priority_queue<PipelineCreationArguments,
                       std::vector<PipelineCreationArguments>,
                       PipelineCreationPriorityCompare>

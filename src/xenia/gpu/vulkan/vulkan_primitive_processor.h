@@ -36,6 +36,9 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
   bool Initialize();
   void Shutdown(bool from_destructor = false);
   void ClearCache() { frame_index_buffer_pool_->ClearCache(); }
+  size_t upload_buffer_memory_usage() const {
+    return frame_index_buffer_pool_->GetMemoryUsage();
+  }
 
   void CompletedSubmissionUpdated();
   void BeginSubmission();

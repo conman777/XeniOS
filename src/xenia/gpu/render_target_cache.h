@@ -103,12 +103,46 @@ class RenderTargetCache {
     // Requires clamping of blending sources and factors.
     kPSIColorFormatFlag_FixedPointColor_Shift,
     kPSIColorFormatFlag_FixedPointAlpha_Shift,
+    // Host-render-target experiment: use the shader's unbiased alpha rather
+    // than the exponent-scaled alpha for a fixed-point-alpha attachment.
+    kHostColorFormatFlag_UnbiasedAlpha_Shift,
+    // Host-render-target experiments for constraining 7e3 RGB before Vulkan
+    // fixed-function blending.
+    kHostColorFormatFlag_ClampColor_Shift,
+    kHostColorFormatFlag_NormalizedColor_Shift,
+    // The host attachment stores the 7e3 [0, 31.875] RGB range linearly in a
+    // normalized format so fixed-function blending clamps the result after
+    // every draw, like Xenos EDRAM.
+    kHostColorFormatFlag_ScaledUNormColor_Shift,
+    // The symmetric DstColor * Src + SrcColor * Dst blend needs the shader's
+    // source RGB in guest units while the destination remains normalized.
+    kHostColorFormatFlag_ScaledUNormSourceColor_Shift,
+    // Live base675 output-probe source RGB scales.
+    kHostColorFormatFlag_RGBScale2_Shift,
+    kHostColorFormatFlag_RGBScale4_Shift,
+    kHostColorFormatFlag_RGBScaleHalf_Shift,
 
     kPSIColorFormatFlag_64bpp = uint32_t(1) << kPSIColorFormatFlag_64bpp_Shift,
     kPSIColorFormatFlag_FixedPointColor =
         uint32_t(1) << kPSIColorFormatFlag_FixedPointColor_Shift,
     kPSIColorFormatFlag_FixedPointAlpha =
         uint32_t(1) << kPSIColorFormatFlag_FixedPointAlpha_Shift,
+    kHostColorFormatFlag_UnbiasedAlpha =
+        uint32_t(1) << kHostColorFormatFlag_UnbiasedAlpha_Shift,
+    kHostColorFormatFlag_ClampColor =
+        uint32_t(1) << kHostColorFormatFlag_ClampColor_Shift,
+    kHostColorFormatFlag_NormalizedColor =
+        uint32_t(1) << kHostColorFormatFlag_NormalizedColor_Shift,
+    kHostColorFormatFlag_ScaledUNormColor =
+        uint32_t(1) << kHostColorFormatFlag_ScaledUNormColor_Shift,
+    kHostColorFormatFlag_ScaledUNormSourceColor =
+        uint32_t(1) << kHostColorFormatFlag_ScaledUNormSourceColor_Shift,
+    kHostColorFormatFlag_RGBScale2 =
+        uint32_t(1) << kHostColorFormatFlag_RGBScale2_Shift,
+    kHostColorFormatFlag_RGBScale4 =
+        uint32_t(1) << kHostColorFormatFlag_RGBScale4_Shift,
+    kHostColorFormatFlag_RGBScaleHalf =
+        uint32_t(1) << kHostColorFormatFlag_RGBScaleHalf_Shift,
   };
 
   static constexpr uint32_t AddPSIColorFormatFlags(
@@ -511,6 +545,10 @@ class RenderTargetCache {
                                  xenos::MsaaSamples msaa_samples) const;
 
   virtual RenderTarget* CreateRenderTarget(RenderTargetKey key) = 0;
+  RenderTarget* FindRenderTarget(RenderTargetKey key) const {
+    auto it_rt = render_targets_.find(key);
+    return it_rt != render_targets_.cend() ? it_rt->second : nullptr;
+  }
 
   // Whether depth buffer is encoded differently on the host, thus after
   // aliasing naively, precision may be lost - host depth must only be

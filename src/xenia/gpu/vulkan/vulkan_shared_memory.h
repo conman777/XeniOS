@@ -37,6 +37,10 @@ class VulkanSharedMemory : public SharedMemory {
   bool Initialize();
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
+  void ClearUploadBufferCache() { upload_buffer_pool_->ClearCache(); }
+  size_t upload_buffer_memory_usage() const {
+    return upload_buffer_pool_->GetMemoryUsage();
+  }
 
   void CompletedSubmissionUpdated();
   void EndSubmission();

@@ -135,6 +135,65 @@ spv::Id SpirvShaderTranslator::UnclampedFloat32To7e3(
   return PreClampedFloat32To7e3(builder, f32_scalar, ext_inst_glsl_std_450);
 }
 
+spv::Id SpirvShaderTranslator::UnclampedFloat32To7e3Arithmetic(
+    SpirvBuilder& builder, spv::Id f32_scalar,
+    spv::Id ext_inst_glsl_std_450) {
+  spv::Id type_bool = builder.makeBoolType();
+  spv::Id type_float = builder.makeFloatType(32);
+  spv::Id type_uint = builder.makeUintType(32);
+
+  spv::Id source_type = builder.getTypeId(f32_scalar);
+  assert_true(builder.isScalarType(source_type));
+  if (!builder.isFloatType(source_type)) {
+    f32_scalar =
+        builder.createUnaryOp(spv::OpBitcast, type_float, f32_scalar);
+  }
+
+  f32_scalar = builder.createTriBuiltinCall(
+      type_float, ext_inst_glsl_std_450, GLSLstd450NClamp, f32_scalar,
+      builder.makeFloatConstant(0.0f), builder.makeFloatConstant(31.875f));
+
+  auto make_affine = [&](float scale, float offset) {
+    spv::Id value = builder.createBinOp(
+        spv::OpFMul, type_float, f32_scalar,
+        builder.makeFloatConstant(scale));
+    if (offset != 0.0f) {
+      value = builder.createBinOp(spv::OpFAdd, type_float, value,
+                                  builder.makeFloatConstant(offset));
+    }
+    return value;
+  };
+  auto select_below = [&](float threshold, spv::Id below,
+                          spv::Id otherwise) {
+    return builder.createTriOp(
+        spv::OpSelect, type_float,
+        builder.createBinOp(spv::OpFOrdLessThan, type_bool, f32_scalar,
+                            builder.makeFloatConstant(threshold)),
+        below, otherwise);
+  };
+
+  // Each exponent range is linear in the packed integer. Powers-of-two scales
+  // make these operations exact before round-to-nearest-even.
+  spv::Id packed_float = make_affine(8.0f, 768.0f);
+  packed_float =
+      select_below(16.0f, make_affine(16.0f, 640.0f), packed_float);
+  packed_float =
+      select_below(8.0f, make_affine(32.0f, 512.0f), packed_float);
+  packed_float =
+      select_below(4.0f, make_affine(64.0f, 384.0f), packed_float);
+  packed_float =
+      select_below(2.0f, make_affine(128.0f, 256.0f), packed_float);
+  packed_float =
+      select_below(1.0f, make_affine(256.0f, 128.0f), packed_float);
+  packed_float =
+      select_below(0.5f, make_affine(512.0f, 0.0f), packed_float);
+
+  return builder.createUnaryOp(
+      spv::OpConvertFToU, type_uint,
+      builder.createUnaryBuiltinCall(type_float, ext_inst_glsl_std_450,
+                                     GLSLstd450RoundEven, packed_float));
+}
+
 spv::Id SpirvShaderTranslator::Float7e3To32(SpirvBuilder& builder,
                                             spv::Id f10_uint_scalar,
                                             uint32_t f10_shift,
@@ -230,6 +289,56 @@ spv::Id SpirvShaderTranslator::Float7e3To32(SpirvBuilder& builder,
   }
 
   return f32;
+}
+
+spv::Id SpirvShaderTranslator::Float7e3To32Arithmetic(
+    SpirvBuilder& builder, spv::Id f10_uint_scalar, uint32_t f10_shift,
+    bool result_as_uint) {
+  assert_true(builder.isUintType(builder.getTypeId(f10_uint_scalar)));
+  assert_true(f10_shift <= (32 - 10));
+
+  spv::Id type_bool = builder.makeBoolType();
+  spv::Id type_float = builder.makeFloatType(32);
+  spv::Id type_uint = builder.makeUintType(32);
+  spv::Id exponent = builder.createTriOp(
+      spv::OpBitFieldUExtract, type_uint, f10_uint_scalar,
+      builder.makeUintConstant(f10_shift + 7), builder.makeUintConstant(3));
+  spv::Id mantissa = builder.createTriOp(
+      spv::OpBitFieldUExtract, type_uint, f10_uint_scalar,
+      builder.makeUintConstant(f10_shift), builder.makeUintConstant(7));
+  spv::Id mantissa_float =
+      builder.createUnaryOp(spv::OpConvertUToF, type_float, mantissa);
+
+  spv::Id exponent_scale = builder.makeFloatConstant(0.25f);
+  constexpr float kExponentScales[] = {0.5f, 1.0f, 2.0f,
+                                       4.0f, 8.0f, 16.0f};
+  for (uint32_t i = 0; i < xe::countof(kExponentScales); ++i) {
+    exponent_scale = builder.createTriOp(
+        spv::OpSelect, type_float,
+        builder.createBinOp(spv::OpIEqual, type_bool, exponent,
+                            builder.makeUintConstant(i + 2)),
+        builder.makeFloatConstant(kExponentScales[i]), exponent_scale);
+  }
+
+  spv::Id normal = builder.createBinOp(
+      spv::OpFMul, type_float,
+      builder.createBinOp(
+          spv::OpFAdd, type_float, builder.makeFloatConstant(1.0f),
+          builder.createBinOp(spv::OpFMul, type_float, mantissa_float,
+                              builder.makeFloatConstant(1.0f / 128.0f))),
+      exponent_scale);
+  spv::Id denormal = builder.createBinOp(
+      spv::OpFMul, type_float, mantissa_float,
+      builder.makeFloatConstant(1.0f / 512.0f));
+  spv::Id result = builder.createTriOp(
+      spv::OpSelect, type_float,
+      builder.createBinOp(spv::OpIEqual, type_bool, exponent,
+                          builder.makeUintConstant(0)),
+      denormal, normal);
+  if (result_as_uint) {
+    result = builder.createUnaryOp(spv::OpBitcast, type_uint, result);
+  }
+  return result;
 }
 
 spv::Id SpirvShaderTranslator::PreClampedDepthTo20e4(
@@ -787,6 +896,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
       spv::Id color_variable = output_or_var_fragment_data_[color_target_index];
       spv::Id color = builder_->createLoad(color_variable, spv::NoPrecision);
+      spv::Id color_unbiased = color;
 
       // Apply the exponent bias after the alpha test and alpha to coverage
       // because they need the unbiased alpha from the shader.
@@ -801,6 +911,119 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
                                    spv::StorageClassUniform,
                                    uniform_system_constants_, id_vector_temp_),
                                spv::NoPrecision));
+
+      if (!edram_fragment_shader_interlock_) {
+        // Float host attachments don't clamp their alpha before fixed-function
+        // blending. For Xenos formats with fixed-point alpha, do that in the
+        // shader so source-alpha blend factors can't consume exponent-scaled
+        // values outside [0, 1]. The command processor controls whether the
+        // scaled or unbiased alpha is selected through the format flags.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(kSystemConstantEdramRTFormatFlags));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int32_t(color_target_index)));
+        spv::Id rt_format_flags = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform,
+                                        uniform_system_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+        spv::Id rt_alpha_is_fixed_point = builder_->createBinOp(
+            spv::OpINotEqual, type_bool_,
+            builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_, rt_format_flags,
+                builder_->makeUintConstant(
+                    RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha)),
+            const_uint_0_);
+        spv::Id rt_use_unbiased_alpha = builder_->createBinOp(
+            spv::OpINotEqual, type_bool_,
+            builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_, rt_format_flags,
+                builder_->makeUintConstant(
+                    RenderTargetCache::kHostColorFormatFlag_UnbiasedAlpha)),
+            const_uint_0_);
+        spv::Id rt_clamp_color = builder_->createBinOp(
+            spv::OpINotEqual, type_bool_,
+            builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_, rt_format_flags,
+                builder_->makeUintConstant(
+                    RenderTargetCache::kHostColorFormatFlag_ClampColor)),
+            const_uint_0_);
+        spv::Id rt_color_is_normalized = builder_->createBinOp(
+            spv::OpINotEqual, type_bool_,
+            builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_, rt_format_flags,
+                builder_->makeUintConstant(
+                    RenderTargetCache::kHostColorFormatFlag_NormalizedColor)),
+            const_uint_0_);
+        spv::Id rt_color_is_scaled_unorm = builder_->createBinOp(
+            spv::OpINotEqual, type_bool_,
+            builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_, rt_format_flags,
+                builder_->makeUintConstant(RenderTargetCache::
+                                               kHostColorFormatFlag_ScaledUNormColor)),
+            const_uint_0_);
+        auto format_flag_is_set = [&](uint32_t flag) {
+          return builder_->createBinOp(
+              spv::OpINotEqual, type_bool_,
+              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                    rt_format_flags,
+                                    builder_->makeUintConstant(flag)),
+              const_uint_0_);
+        };
+        spv::Id rt_scaled_unorm_source_color = format_flag_is_set(
+            RenderTargetCache::kHostColorFormatFlag_ScaledUNormSourceColor);
+        uint_vector_temp_.clear();
+        uint_vector_temp_.push_back(0);
+        uint_vector_temp_.push_back(1);
+        uint_vector_temp_.push_back(2);
+        spv::Id color_rgb = builder_->createRvalueSwizzle(
+            spv::NoPrecision, type_float3_, color, uint_vector_temp_);
+        spv::Id color_clamp_max = builder_->createTriOp(
+            spv::OpSelect, type_float_, rt_color_is_normalized, const_float_1_,
+            builder_->makeFloatConstant(31.875f));
+        spv::Id color_rgb_clamped = builder_->createTriBuiltinCall(
+            type_float3_, ext_inst_glsl_std_450_, GLSLstd450NClamp, color_rgb,
+            const_float3_0_,
+            builder_->smearScalar(spv::NoPrecision, color_clamp_max,
+                                  type_float3_));
+        color_rgb = builder_->createTriOp(spv::OpSelect, type_float3_,
+                                          rt_clamp_color, color_rgb_clamped,
+                                          color_rgb);
+        spv::Id color_rgb_scaled_unorm = builder_->createBinOp(
+            spv::OpFMul, type_float3_, color_rgb,
+            builder_->smearScalar(spv::NoPrecision,
+                                  builder_->makeFloatConstant(1.0f / 31.875f),
+                                  type_float3_));
+        spv::Id scale_color_for_scaled_unorm = builder_->createBinOp(
+            spv::OpLogicalAnd, type_bool_, rt_color_is_scaled_unorm,
+            builder_->createUnaryOp(spv::OpLogicalNot, type_bool_,
+                                    rt_scaled_unorm_source_color));
+        color_rgb = builder_->createTriOp(
+            spv::OpSelect, type_float3_, scale_color_for_scaled_unorm,
+            color_rgb_scaled_unorm, color_rgb);
+        spv::Id alpha_scaled =
+            builder_->createCompositeExtract(color, type_float_, 3);
+        spv::Id alpha_unbiased =
+            builder_->createCompositeExtract(color_unbiased, type_float_, 3);
+        spv::Id alpha_for_fixed_point = builder_->createTriOp(
+            spv::OpSelect, type_float_, rt_use_unbiased_alpha, alpha_unbiased,
+            alpha_scaled);
+        alpha_for_fixed_point = builder_->createTriBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
+            alpha_for_fixed_point, const_float_0_, const_float_1_);
+        spv::Id alpha = builder_->createTriOp(
+            spv::OpSelect, type_float_, rt_alpha_is_fixed_point,
+            alpha_for_fixed_point, alpha_scaled);
+        id_vector_temp_.clear();
+        for (uint32_t i = 0; i < 3; ++i) {
+          id_vector_temp_.push_back(
+              builder_->createCompositeExtract(color_rgb, type_float_, i));
+        }
+        id_vector_temp_.push_back(alpha);
+        color = builder_->createCompositeConstruct(type_float4_,
+                                                   id_vector_temp_);
+      }
 
       if (edram_fragment_shader_interlock_) {
         // Write the color to the target in the EDRAM only it was written on the

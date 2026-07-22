@@ -16,16 +16,22 @@
 // unreliable at runtime on the Android build (silent no-op on dynamic_cast or
 // registry misses), which has repeatedly invalidated device experiments. This
 // reader bypasses the cvar system entirely: it parses
-// files/halo_experiment.txt directly, once, and logs every effective value so
-// each run is self-verifying from logcat alone. Defaults encode the current
-// best fix configuration, so no file is required on the device.
+// files/halo_experiment.txt directly and logs every launch value so each run
+// is self-verifying from logcat alone. WO39 also polls the file contents every
+// two seconds and atomically publishes reload-safe changes. Defaults encode
+// the current best fix configuration, so no file is required on the device.
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "xenia/base/logging.h"
 
@@ -37,6 +43,11 @@ struct AndroidHaloExperiment {
   // Copy the tracked presentable color RT into EDRAM base 1350 right before
   // the final frontbuffer resolve.
   bool direct_presentable_resolve = true;
+  // WO37 legacy presentation fallback. The name is retained for the device
+  // A/B even though the normal Vulkan fallback detiles from GPU shared memory;
+  // the CPU frontbuffer dump itself is diagnostic-only. Default OFF presents
+  // Reach's tracked host 8888 render target without the guest-memory round trip.
+  bool present_cpu_swap_texture = false;
   // Diagnostic A/B: bypass the mixed-format 1x composite and present the live
   // 4x 10-bit scene color target through the normal collapse/dump path.
   bool direct_msaa_scene_resolve = false;
@@ -96,6 +107,30 @@ struct AndroidHaloExperiment {
   // combination (UBWC compression metadata mismatch is a plausible cause).
   // Default off (keeps the UINT-reinterpretation path, matching D3D12).
   bool native_float_view_for_16bpc_transfer = false;
+  // Use arithmetic 7e3 pack/unpack in dynamically generated Vulkan render
+  // target transfer shaders. Default off for a clean device A/B.
+  bool arithmetic_7e3_conversion = false;
+  // Store 7e3 render targets in RGBA32F instead of RGBA16F to bypass the
+  // Adreno 16-bit-float color-attachment/sample path. Default off because the
+  // wider host format increases render-target memory use.
+  bool rgba32f_for_7e3_render_targets = false;
+  // Store 7e3 RGB linearly in a normalized attachment. This enforces the
+  // finite 7e3 range after every fixed-function blend instead of allowing
+  // RGBA16F/32F accumulation to exceed 31.875 indefinitely. 0 = disabled,
+  // 1 = 10:10:10:2 UNORM, 2 = RGBA16 UNORM for higher dark-range precision.
+  // WO30 restores the stock RGBA16F baseline; modes 1 and 2 remain opt-in via
+  // halo_experiment.txt.
+  uint32_t scaled_unorm_7e3_render_targets = 0;
+  // Host-render-target alpha handling for 7e3 formats: 0 = unchanged,
+  // 1 = clamp exponent-scaled alpha, 2 = preserve and clamp unbiased alpha.
+  uint32_t host_7e3_alpha_mode = 0;
+  // Host-render-target RGB handling for 7e3 formats: 0 = unchanged,
+  // 1 = neutralize the paired +5/-5 biases, 2 = clamp native HDR range,
+  // 3 = neutralize the biases and clamp to normalized range.
+  uint32_t host_7e3_range_mode = 0;
+  // Replace 7e3 render-target dump input with a generated HDR pattern to
+  // distinguish bad host-rendered values from dump/resolve corruption.
+  bool dump_7e3_pattern = false;
   // 1 = value-convert collapsible owners to 8888 before EDRAM packing.
   // 0 = keep the owner's native pack format so raw bits land in EDRAM.
   uint32_t repack_mode = 0;
@@ -124,13 +159,48 @@ struct AndroidHaloExperiment {
   bool linear_to_tiled_frontbuffer = false;
   // Force the FSI (pixel-shader-interlock) render target path even though the
   // device lacks VK_EXT_fragment_shader_interlock. EDRAM becomes a raw
-  // storage buffer (bit-exact format aliasing - what Halo Reach needs);
-  // fragment ordering races may cause blending speckle on overlapping
-  // geometry. Shader codegen omits interlock ops when the feature is absent.
+  // storage buffer with bit-exact format aliasing. Shader codegen omits
+  // interlock ops when the feature is absent, and the render-target cache
+  // serializes guest draws with fragment read/write barriers.
   bool force_fsi = false;
   // Silence info/debug logs during load and shader-compile storms so logd
   // traffic does not contribute to Android watchdog kills.
   bool quiet_logs = true;
+  // WO39: mount only cache1: on Android using the existing disk-backed
+  // HostPathDevice. Reach stores its resume checkpoint at cache1:\\autosave;
+  // XContent saved games remain independently backed by content_root.
+  bool mount_cache_disk_backed = true;
+  // Adreno may retain driver allocations after VkPipeline destruction. Use
+  // LRU trimming for KGSL-only reclamation to avoid full-recompile feedback.
+  bool kgsl_preserve_pipeline_cache = true;
+  // WO36: subtract the bounded sparse 512 MB guest-memory aperture from the
+  // reclaimable heap/KGSL budget. Those pages cannot be evicted safely while
+  // the guest is using them, and treating them as texture pressure caused a
+  // submit-and-wait storm as Reach touched new physical-memory ranges.
+  bool kgsl_exclude_sparse_shared_memory = true;
+  // Release peak-sized transient pools during an already-idle KGSL reclaim.
+  bool kgsl_reclaim_retained_pools = true;
+  // Runtime-tunable KGSL pipeline reclamation policy. These are intentionally
+  // external-profile settings so device A/B runs don't require a rebuild.
+  uint32_t kgsl_reclaim_cooldown_ms = 5000;
+  uint32_t kgsl_pipeline_keep_percent = 50;
+  uint32_t kgsl_pipeline_min_count = 64;
+  // If ordinary pressure reclamation is not enough, retain only this many hot
+  // pipelines and reset the driver compiler cache instead of clearing every
+  // guest pipeline and starting a full recompilation storm.
+  uint32_t kgsl_pipeline_emergency_keep_count = 32;
+  uint32_t kgsl_pipeline_emergency_headroom_mb = 512;
+  // Bound the live VkPipeline set at normal submission boundaries. Zero
+  // disables proactive eviction and leaves only KGSL pressure reclamation.
+  // WO38 disables this by default: Reach's measured 160-180-entry working set
+  // thrashed when WO37 capped it at 96, continuously recompiling evicted state
+  // permutations and growing driver compiler RSS. Pressure-triggered LRU with
+  // a cooldown remains enabled and resets the driver cache when it runs.
+  uint32_t kgsl_pipeline_proactive_limit = 0;
+  // Keeping the Vulkan binary cache makes an evicted pipeline much cheaper to
+  // recreate. Emergency LRU reclamation always resets it regardless of this
+  // flag while retaining the configured hot guest-pipeline subset.
+  bool kgsl_reset_driver_pipeline_cache_on_trim = true;
   // Per-run diagnostic logging switches. These intentionally live in
   // halo_experiment.txt rather than xenios_android_profile.txt because private
   // saved profiles can shadow the pushed external profile on Android.
@@ -138,6 +208,9 @@ struct AndroidHaloExperiment {
   bool log_texture_bindings = false;
   uint32_t log_texture_binding_skip_draws = 0;
   uint32_t log_texture_binding_max_lines = 1024;
+  // Log distinct texture fetch constants in Reach's scene-scratch address
+  // range, independent of the presentable-binding logger's draw filter.
+  bool log_scene_fetch_constants = false;
   bool log_owner_history = false;
   bool log_presentable_source_owner = false;
   // WO26 Probe A: log the same per-draw write-mask/blend/shader-hash census
@@ -145,6 +218,17 @@ struct AndroidHaloExperiment {
   // 64bpp F16 scene RT), independent of log_draws so it can run without the
   // base-1350 log volume.
   bool log_base675_draw_state = false;
+  // Diagnostic: before DumpRenderTargets for resolve dest 0x02354000 /
+  // dest_fmt=26 (k_16_16_16_16) from EDRAM base 675, read back a small
+  // center crop of the host Vulkan RT image and log HOSTDUMP_675 float
+  // stats (nonblack / min/max/mean RGB / HDR%). Default off.
+  bool dump_host_675_stats = false;
+  // Runtime-selectable draw-group bypass for Reach's base-675 7e3 scene.
+  // The external halo_scene_probe.txt file may override this while running.
+  // Modes 1-9 isolate draw groups. Modes 10-15 are accepted for compatibility
+  // with old probe files, but no longer mutate render-target output.
+  uint32_t base675_draw_probe_mode = 0;
+  uint64_t base675_draw_probe_hash = 0;
   // Log draws targeting Reach's base-0, pitch-29 RGBA8 menu composition RT.
   // This is independent of the global draw cap, which expires before menus.
   bool log_base0_draw_state = false;
@@ -207,10 +291,31 @@ struct AndroidHaloExperiment {
   bool menu_skip_base0_rectangle_draw = false;
   bool menu_skip_base0_triangle_fan_draw = false;
   bool menu_skip_base0_triangle_list_draw = false;
-  // Force fixed-point RGBA16 textures through the float conversion shader.
-  // Leave this disabled when native RGBA16 UNORM sampling and filtering are
-  // supported so fixed-point values aren't needlessly re-encoded as float16.
-  bool rgba16_fixed_texture_float_fallback = false;
+  // Force fixed-point RG16/RGBA16 textures through the float conversion shader
+  // even when native SNORM/UNORM sampling and filtering are advertised.
+  // Default ON for Reach: Adreno sampling of scene scratch (0x02354000) is
+  // unreliable for both signed and unsigned views; load as SFLOAT so
+  // exp_adjust +5 sees the intended [-32,32] / [0,32] range.
+  bool rgba16_fixed_texture_float_fallback = true;
+  // Obsolete: resolve shaders now use true Edram fixed16 pack. Kept so old
+  // experiment files still parse; has no effect.
+  bool signed_fixed16_resolve_pack = false;
+  // Force exp_bias -5 for 7e3→fixed16 (old UNORM(f/32) path). Default OFF:
+  // with Edram pack, bias 0 preserves the full [0, 32) HDR range.
+  bool force_7e3_fixed16_resolve_exp_bias_minus5 = false;
+  // Preserve the full 7e3 RGB range when an ownership dump is repacked to an
+  // RGBA8 consumer view instead of clamping all HDR values above 1 to white.
+  // WO35 promoted this after the Reach scene was verified on device.
+  bool normalize_7e3_to_rgba8_repack = true;
+  // WO36/40 low-range + highlight recovery for the RGBA8 compatibility path:
+  // 0 = linear /31.875
+  // 1 = sqrt(linear) — midtone lift (playability default; WO39 baseline)
+  // 2 = Reinhard x/(1+x) — soft global shoulder
+  // 3 = linear /31.875 then soft knee c/(c+0.35) — experimental highlight roll-off
+  uint32_t normalize_7e3_to_rgba8_repack_curve = 1;
+  // Load Reach's RGBA8 scene view using the k8in16 byte swap used by the
+  // fixed16 view instead of the fetch constant's k8in32 operation.
+  bool scene_rgba8_texture_endian_8in16 = false;
   // Avoid vectorized SSBO reads for fixed-point RGBA16 texture uploads. This
   // works around corruption seen when Adreno samples Reach's tiled scene
   // resolve after the normal uint4-based detile.
@@ -240,6 +345,18 @@ struct AndroidHaloExperiment {
   // Diagnostic A/B for base-1350 render-target ownership transfers.
   bool blit_rt_transfers = false;
   bool log_rt_transfers = false;
+  // Phase-2: skip ColorToColor (and depth→color) ownership transfers that
+  // thrash the Reach 1152x720 scene span at EDRAM base 675 between 7e3 and
+  // LDR formats. Census showed ~70 7e3→8888 and ~145 8888→7e3 transfers per
+  // run while dump→0x02354000 itself works (pattern bifurcation). Default OFF.
+  bool skip_scene_675_hdr_format_alias = false;
+  // HOSTDUMP t150: block 7e3 FLOAT → LDR (esp. fixed 1010102) ownership steals
+  // at base 675 pitch 15 so fmt26 scene resolves dump the FLOAT host RT.
+  bool skip_scene_675_hdr_to_ldr = false;
+  // Prefer dumping the existing 7e3 FLOAT RT at base 675 for HDR scene
+  // resolves (dest 0x02354000 fmt26) when LDR currently owns the tiles.
+  // Keeps LDR transfers working for lighting while fixing fmt26 dump source.
+  bool dump_scene_675_prefer_7e3_float = false;
   // Diagnostic A/B: skip ColorToColor transfers from a single source RT format
   // into the presentable base-1350 8888 target. -1 disables the skip.
   int32_t skip_presentable_color_transfer_src_fmt = -1;
@@ -289,17 +406,18 @@ struct AndroidHaloExperiment {
   bool legacy_collapse_64bpp_1x = false;
 };
 
-inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
-  static const AndroidHaloExperiment experiment = [] {
-    AndroidHaloExperiment result;
-    const char* kPaths[] = {
+inline AndroidHaloExperiment LoadAndroidHaloExperiment(
+    std::string* loaded_content_out = nullptr,
+    std::string* loaded_path_out = nullptr, bool log_values = true) {
+  AndroidHaloExperiment result;
+  const char* kPaths[] = {
         "/sdcard/Android/data/jp.xenios.emulator.github.debug/files/"
         "halo_experiment.txt",
         "/sdcard/Android/data/jp.xenios.emulator.github/files/"
         "halo_experiment.txt",
     };
-    const char* loaded_path = nullptr;
-    for (const char* path : kPaths) {
+  const char* loaded_path = nullptr;
+  for (const char* path : kPaths) {
       std::ifstream file(path);
       if (!file) {
         continue;
@@ -307,6 +425,10 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
       loaded_path = path;
       std::string line;
       while (std::getline(file, line)) {
+        if (loaded_content_out) {
+          loaded_content_out->append(line);
+          loaded_content_out->push_back('\n');
+        }
         size_t comment = line.find('#');
         if (comment != std::string::npos) {
           line.resize(comment);
@@ -346,6 +468,8 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
         };
         if (name == "direct_presentable_resolve") {
           parse_bool(result.direct_presentable_resolve);
+        } else if (name == "present_cpu_swap_texture") {
+          parse_bool(result.present_cpu_swap_texture);
         } else if (name == "direct_msaa_scene_resolve") {
           parse_bool(result.direct_msaa_scene_resolve);
         } else if (name == "final_resolve_raw_copy") {
@@ -366,6 +490,24 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
           parse_bool(result.edram_64bpp_tile_height_halved);
         } else if (name == "native_float_view_for_16bpc_transfer") {
           parse_bool(result.native_float_view_for_16bpc_transfer);
+        } else if (name == "arithmetic_7e3_conversion") {
+          parse_bool(result.arithmetic_7e3_conversion);
+        } else if (name == "rgba32f_for_7e3_render_targets") {
+          parse_bool(result.rgba32f_for_7e3_render_targets);
+        } else if (name == "scaled_unorm_7e3_render_targets") {
+          result.scaled_unorm_7e3_render_targets =
+              std::min(uint32_t(std::strtoul(value.c_str(), nullptr, 0)),
+                       uint32_t(2));
+        } else if (name == "host_7e3_alpha_mode") {
+          result.host_7e3_alpha_mode =
+              std::min(uint32_t(std::strtoul(value.c_str(), nullptr, 0)),
+                       uint32_t(2));
+        } else if (name == "host_7e3_range_mode") {
+          result.host_7e3_range_mode =
+              std::min(uint32_t(std::strtoul(value.c_str(), nullptr, 0)),
+                       uint32_t(3));
+        } else if (name == "dump_7e3_pattern") {
+          parse_bool(result.dump_7e3_pattern);
         } else if (name == "repack_mode") {
           result.repack_mode =
               uint32_t(std::strtoul(value.c_str(), nullptr, 0));
@@ -384,6 +526,40 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
           parse_bool(result.force_fsi);
         } else if (name == "quiet_logs") {
           parse_bool(result.quiet_logs);
+        } else if (name == "mount_cache_disk_backed") {
+          parse_bool(result.mount_cache_disk_backed);
+        } else if (name == "kgsl_preserve_pipeline_cache") {
+          parse_bool(result.kgsl_preserve_pipeline_cache);
+        } else if (name == "kgsl_exclude_sparse_shared_memory") {
+          parse_bool(result.kgsl_exclude_sparse_shared_memory);
+        } else if (name == "kgsl_reclaim_retained_pools") {
+          parse_bool(result.kgsl_reclaim_retained_pools);
+        } else if (name == "kgsl_reclaim_cooldown_ms") {
+          result.kgsl_reclaim_cooldown_ms = std::clamp(
+              uint32_t(std::strtoul(value.c_str(), nullptr, 0)), uint32_t(500),
+              uint32_t(60000));
+        } else if (name == "kgsl_pipeline_keep_percent") {
+          result.kgsl_pipeline_keep_percent = std::clamp(
+              uint32_t(std::strtoul(value.c_str(), nullptr, 0)), uint32_t(1),
+              uint32_t(100));
+        } else if (name == "kgsl_pipeline_min_count") {
+          result.kgsl_pipeline_min_count = std::min(
+              uint32_t(std::strtoul(value.c_str(), nullptr, 0)),
+              uint32_t(4096));
+        } else if (name == "kgsl_pipeline_emergency_keep_count") {
+          result.kgsl_pipeline_emergency_keep_count = std::min(
+              uint32_t(std::strtoul(value.c_str(), nullptr, 0)),
+              uint32_t(4096));
+        } else if (name == "kgsl_pipeline_emergency_headroom_mb") {
+          result.kgsl_pipeline_emergency_headroom_mb = std::min(
+              uint32_t(std::strtoul(value.c_str(), nullptr, 0)),
+              uint32_t(4096));
+        } else if (name == "kgsl_pipeline_proactive_limit") {
+          result.kgsl_pipeline_proactive_limit = std::min(
+              uint32_t(std::strtoul(value.c_str(), nullptr, 0)),
+              uint32_t(4096));
+        } else if (name == "kgsl_reset_driver_pipeline_cache_on_trim") {
+          parse_bool(result.kgsl_reset_driver_pipeline_cache_on_trim);
         } else if (name == "log_draws" ||
                    name == "halo_android_diag_log_draws") {
           parse_bool(result.log_draws);
@@ -396,12 +572,23 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
         } else if (name == "log_texture_binding_max_lines") {
           result.log_texture_binding_max_lines =
               uint32_t(std::strtoul(value.c_str(), nullptr, 0));
+        } else if (name == "log_scene_fetch_constants") {
+          parse_bool(result.log_scene_fetch_constants);
         } else if (name == "log_owner_history") {
           parse_bool(result.log_owner_history);
         } else if (name == "log_presentable_source_owner") {
           parse_bool(result.log_presentable_source_owner);
         } else if (name == "log_base675_draw_state") {
           parse_bool(result.log_base675_draw_state);
+        } else if (name == "dump_host_675_stats") {
+          parse_bool(result.dump_host_675_stats);
+        } else if (name == "base675_draw_probe_mode") {
+          result.base675_draw_probe_mode =
+              std::min(uint32_t(std::strtoul(value.c_str(), nullptr, 0)),
+                       uint32_t(15));
+        } else if (name == "base675_draw_probe_hash") {
+          result.base675_draw_probe_hash =
+              uint64_t(std::strtoull(value.c_str(), nullptr, 0));
         } else if (name == "log_base0_draw_state") {
           parse_bool(result.log_base0_draw_state);
         } else if (name == "dump_msaa_sample_index_override") {
@@ -451,6 +638,18 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
           parse_bool(result.menu_skip_base0_triangle_list_draw);
         } else if (name == "rgba16_fixed_texture_float_fallback") {
           parse_bool(result.rgba16_fixed_texture_float_fallback);
+        } else if (name == "signed_fixed16_resolve_pack") {
+          parse_bool(result.signed_fixed16_resolve_pack);
+        } else if (name ==
+                   "force_7e3_fixed16_resolve_exp_bias_minus5") {
+          parse_bool(result.force_7e3_fixed16_resolve_exp_bias_minus5);
+        } else if (name == "normalize_7e3_to_rgba8_repack") {
+          parse_bool(result.normalize_7e3_to_rgba8_repack);
+        } else if (name == "normalize_7e3_to_rgba8_repack_curve") {
+          result.normalize_7e3_to_rgba8_repack_curve = std::min(
+              uint32_t(std::strtoul(value.c_str(), nullptr, 0)), uint32_t(3));
+        } else if (name == "scene_rgba8_texture_endian_8in16") {
+          parse_bool(result.scene_rgba8_texture_endian_8in16);
         } else if (name == "rgba16_safe_texture_load") {
           parse_bool(result.rgba16_safe_texture_load);
         } else if (name == "rgba16_texture_pattern") {
@@ -472,6 +671,12 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
         } else if (name == "log_rt_transfers" ||
                    name == "halo_android_diag_log_rt_transfers") {
           parse_bool(result.log_rt_transfers);
+        } else if (name == "skip_scene_675_hdr_format_alias") {
+          parse_bool(result.skip_scene_675_hdr_format_alias);
+        } else if (name == "skip_scene_675_hdr_to_ldr") {
+          parse_bool(result.skip_scene_675_hdr_to_ldr);
+        } else if (name == "dump_scene_675_prefer_7e3_float") {
+          parse_bool(result.dump_scene_675_prefer_7e3_float);
         } else if (name == "skip_presentable_color_transfer_src_fmt") {
           result.skip_presentable_color_transfer_src_fmt =
               int32_t(std::strtol(value.c_str(), nullptr, 0));
@@ -538,8 +743,13 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
       }
       break;
     }
+  if (loaded_path_out) {
+    *loaded_path_out = loaded_path ? loaded_path : "";
+  }
+  if (log_values) {
     XELOGI(
         "HaloExperiment file={} direct_presentable_resolve={} "
+        "present_cpu_swap_texture={} "
         "direct_msaa_scene_resolve={} "
         "final_resolve_raw_copy={} writer_gb_fix={} "
         "skip_depth_to_color_alias={} "
@@ -550,10 +760,13 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
         "snorm16_render_target_full_range_override={} "
         "readback_resolve_full={} "
         "vblank_uncapped={} linear_to_tiled_frontbuffer={} force_fsi={} "
-        "quiet_logs={} log_draws={} log_texture_bindings={} "
+        "quiet_logs={} mount_cache_disk_backed={} "
+        "log_draws={} log_texture_bindings={} "
         "log_texture_binding_skip_draws={} log_texture_binding_max_lines={} "
+        "log_scene_fetch_constants={} "
         "log_owner_history={} log_presentable_source_owner={} "
-        "log_base675_draw_state={} dump_msaa_sample_index_override={} "
+        "log_base675_draw_state={} dump_host_675_stats={} "
+        "dump_msaa_sample_index_override={} "
         "log_base0_draw_state={} "
         "swap_base_page_override=0x{:X} swap_swizzle_override=0x{:03X} "
         "swap_swizzle_auto={} swap_swizzle_menu=0x{:03X} "
@@ -577,6 +790,9 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
         "force_dxt_fallback={} "
         "force_1010102_rt_as_rgba8={} "
         "blit_rt_transfers={} log_rt_transfers={} "
+        "skip_scene_675_hdr_format_alias={} "
+        "skip_scene_675_hdr_to_ldr={} "
+        "dump_scene_675_prefer_7e3_float={} "
         "skip_presentable_color_transfer_src_fmt={} "
         "skip_presentable_color_transfer_src_fmt_mask=0x{:X} "
         "skip_presentable_color_transfer_dest_fmt={} "
@@ -588,6 +804,7 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
         "{:#010X} dump_address_count={}",
         loaded_path ? loaded_path : "none(defaults)",
         uint32_t(result.direct_presentable_resolve),
+        uint32_t(result.present_cpu_swap_texture),
         uint32_t(result.direct_msaa_scene_resolve),
         uint32_t(result.final_resolve_raw_copy),
         uint32_t(result.writer_gb_fix),
@@ -604,12 +821,15 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
         uint32_t(result.vblank_uncapped),
         uint32_t(result.linear_to_tiled_frontbuffer),
         uint32_t(result.force_fsi), uint32_t(result.quiet_logs),
+        uint32_t(result.mount_cache_disk_backed),
         uint32_t(result.log_draws), uint32_t(result.log_texture_bindings),
         result.log_texture_binding_skip_draws,
         result.log_texture_binding_max_lines,
+        uint32_t(result.log_scene_fetch_constants),
         uint32_t(result.log_owner_history),
         uint32_t(result.log_presentable_source_owner),
         uint32_t(result.log_base675_draw_state),
+        uint32_t(result.dump_host_675_stats),
         result.dump_msaa_sample_index_override,
         uint32_t(result.log_base0_draw_state),
         result.swap_base_page_override,
@@ -640,6 +860,9 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
         uint32_t(result.force_1010102_rt_as_rgba8),
         uint32_t(result.blit_rt_transfers),
         uint32_t(result.log_rt_transfers),
+        uint32_t(result.skip_scene_675_hdr_format_alias),
+        uint32_t(result.skip_scene_675_hdr_to_ldr),
+        uint32_t(result.dump_scene_675_prefer_7e3_float),
         result.skip_presentable_color_transfer_src_fmt,
         result.skip_presentable_color_transfer_src_fmt_mask,
         result.skip_presentable_color_transfer_dest_fmt,
@@ -652,6 +875,45 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
         result.dump_address_count > 2 ? result.dump_addresses[2] : 0,
         result.dump_address_count);
     XELOGI(
+        "HaloExperiment 7e3: arithmetic_7e3_conversion={} "
+        "rgba32f_for_7e3_render_targets={} "
+        "rgba16_fixed_texture_float_fallback={} "
+        "signed_fixed16_resolve_pack={} "
+        "force_7e3_fixed16_resolve_exp_bias_minus5={} "
+        "normalize_7e3_to_rgba8_repack={} "
+        "normalize_7e3_to_rgba8_repack_curve={} "
+        "scene_rgba8_texture_endian_8in16={} "
+        "scaled_unorm_7e3_render_targets={} host_7e3_alpha_mode={} "
+        "host_7e3_range_mode={} dump_7e3_pattern={}",
+        uint32_t(result.arithmetic_7e3_conversion),
+        uint32_t(result.rgba32f_for_7e3_render_targets),
+        uint32_t(result.rgba16_fixed_texture_float_fallback),
+        uint32_t(result.signed_fixed16_resolve_pack),
+        uint32_t(result.force_7e3_fixed16_resolve_exp_bias_minus5),
+        uint32_t(result.normalize_7e3_to_rgba8_repack),
+        result.normalize_7e3_to_rgba8_repack_curve,
+        uint32_t(result.scene_rgba8_texture_endian_8in16),
+        uint32_t(result.scaled_unorm_7e3_render_targets),
+        result.host_7e3_alpha_mode,
+        result.host_7e3_range_mode,
+        uint32_t(result.dump_7e3_pattern));
+    XELOGI(
+        "HaloExperiment memory: kgsl_preserve_pipeline_cache={} "
+        "exclude_sparse_shared_memory={} reclaim_retained_pools={} "
+        "reclaim_cooldown_ms={} pipeline_keep_percent={} "
+        "pipeline_min_count={} emergency_keep_count={} "
+        "emergency_headroom_mb={} "
+        "pipeline_proactive_limit={} reset_driver_cache_on_trim={}",
+        uint32_t(result.kgsl_preserve_pipeline_cache),
+        uint32_t(result.kgsl_exclude_sparse_shared_memory),
+        uint32_t(result.kgsl_reclaim_retained_pools),
+        result.kgsl_reclaim_cooldown_ms,
+        result.kgsl_pipeline_keep_percent, result.kgsl_pipeline_min_count,
+        result.kgsl_pipeline_emergency_keep_count,
+        result.kgsl_pipeline_emergency_headroom_mb,
+        result.kgsl_pipeline_proactive_limit,
+        uint32_t(result.kgsl_reset_driver_pipeline_cache_on_trim));
+    XELOGI(
         "HaloExperiment ownership: log_ownership_changes={} "
         "log_ownership_snapshot={} watch_tiles=[{},{}) "
         "legacy_collapse_64bpp_1x={}",
@@ -659,10 +921,267 @@ inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
         uint32_t(result.log_ownership_snapshot),
         result.ownership_watch_start_tiles, result.ownership_watch_end_tiles,
         uint32_t(result.legacy_collapse_64bpp_1x));
-    return result;
-  }();
-  return experiment;
+  }
+  return result;
 }
+
+// Fields in the first list are consumed directly at draw, resolve, present or
+// diagnostic time. Fields in the second list select device capabilities,
+// object formats, startup cvars, texture representations, or shader code that
+// isn't fully represented in its pipeline key, and must therefore stay at the
+// launch value. Keeping both lists explicit makes additions fail review loudly
+// instead of becoming accidentally reloadable.
+#define XE_ANDROID_HALO_RELOAD_SAFE_FIELDS(X)                      \
+  X(direct_presentable_resolve)                                    \
+  X(present_cpu_swap_texture)                                      \
+  X(direct_msaa_scene_resolve)                                     \
+  X(final_resolve_raw_copy)                                        \
+  X(writer_gb_fix)                                                  \
+  X(skip_depth_to_color_alias)                                     \
+  X(shadow_fallback)                                                \
+  X(force_alpha_pass)                                               \
+  X(collapse_msaa_resolve)                                          \
+  X(host_7e3_alpha_mode)                                            \
+  X(host_7e3_range_mode)                                            \
+  X(linear_to_tiled_frontbuffer)                                   \
+  X(kgsl_preserve_pipeline_cache)                                  \
+  X(kgsl_exclude_sparse_shared_memory)                             \
+  X(kgsl_reclaim_retained_pools)                                   \
+  X(kgsl_reclaim_cooldown_ms)                                      \
+  X(kgsl_pipeline_keep_percent)                                    \
+  X(kgsl_pipeline_min_count)                                       \
+  X(kgsl_pipeline_emergency_keep_count)                            \
+  X(kgsl_pipeline_emergency_headroom_mb)                           \
+  X(kgsl_pipeline_proactive_limit)                                 \
+  X(kgsl_reset_driver_pipeline_cache_on_trim)                      \
+  X(log_draws)                                                      \
+  X(log_texture_bindings)                                           \
+  X(log_texture_binding_skip_draws)                                \
+  X(log_texture_binding_max_lines)                                 \
+  X(log_scene_fetch_constants)                                     \
+  X(log_owner_history)                                              \
+  X(log_presentable_source_owner)                                  \
+  X(log_base675_draw_state)                                        \
+  X(dump_host_675_stats)                                           \
+  X(base675_draw_probe_mode)                                       \
+  X(base675_draw_probe_hash)                                       \
+  X(log_base0_draw_state)                                          \
+  X(swap_base_page_override)                                       \
+  X(swap_swizzle_override)                                         \
+  X(swap_swizzle_auto)                                             \
+  X(swap_swizzle_menu)                                             \
+  X(swap_swizzle_gameplay)                                         \
+  X(resolve_base0_pitch29_to15)                                    \
+  X(menu_base0_transfer_dump)                                      \
+  X(menu_skip_depth_to_color_alias)                                \
+  X(menu_skip_base0_rectangle_draw)                                \
+  X(menu_skip_base0_triangle_fan_draw)                             \
+  X(menu_skip_base0_triangle_list_draw)                            \
+  X(signed_fixed16_resolve_pack)                                   \
+  X(force_7e3_fixed16_resolve_exp_bias_minus5)                     \
+  X(normalize_7e3_to_rgba8_repack)                                 \
+  X(normalize_7e3_to_rgba8_repack_curve)                           \
+  X(blit_rt_transfers)                                              \
+  X(log_rt_transfers)                                               \
+  X(skip_scene_675_hdr_format_alias)                               \
+  X(skip_scene_675_hdr_to_ldr)                                     \
+  X(dump_scene_675_prefer_7e3_float)                               \
+  X(skip_presentable_color_transfer_src_fmt)                       \
+  X(skip_presentable_color_transfer_src_fmt_mask)                  \
+  X(skip_presentable_color_transfer_dest_fmt)                      \
+  X(skip_presentable_color_transfer_src_msaa)                      \
+  X(value_convert_1010102_to_8888)                                 \
+  X(value_convert_16bit_to_8888)                                   \
+  X(dump_files)                                                     \
+  X(log_ownership_changes)                                          \
+  X(log_ownership_snapshot)                                         \
+  X(ownership_watch_start_tiles)                                   \
+  X(ownership_watch_end_tiles)                                     \
+  X(legacy_collapse_64bpp_1x)
+
+#define XE_ANDROID_HALO_INIT_ONLY_FIELDS(X)                        \
+  X(disable_geometry_shaders)                                      \
+  X(edram_64bpp_tile_height_halved)                                \
+  X(native_float_view_for_16bpc_transfer)                          \
+  X(arithmetic_7e3_conversion)                                     \
+  X(rgba32f_for_7e3_render_targets)                                \
+  X(scaled_unorm_7e3_render_targets)                               \
+  X(dump_7e3_pattern)                                               \
+  X(repack_mode)                                                    \
+  X(repack_16_16_to_8888)                                         \
+  X(snorm16_render_target_full_range)                              \
+  X(readback_resolve_full)                                         \
+  X(vblank_uncapped)                                                \
+  X(force_fsi)                                                      \
+  X(quiet_logs)                                                     \
+  X(mount_cache_disk_backed)                                      \
+  X(dump_msaa_sample_index_override)                               \
+  X(tex_endian_mode)                                                \
+  X(rgba8_safe_texture_load)                                       \
+  X(rgba8_texture_pattern)                                         \
+  X(texture_load_absolute_shared_memory_binding)                   \
+  X(texture_load_immediate_source_barrier)                         \
+  X(menu_initialize_from_base675)                                  \
+  X(menu_transfer_in_draw_pass)                                    \
+  X(rgba16_fixed_texture_float_fallback)                           \
+  X(scene_rgba8_texture_endian_8in16)                              \
+  X(rgba16_safe_texture_load)                                      \
+  X(rgba16_texture_pattern)                                        \
+  X(rgba16_tight_buffer_image_copy)                                \
+  X(rgba16_immediate_sample_barrier)                               \
+  X(scene_scratch_force_point_sampling)                            \
+  X(force_dxt_fallback)                                             \
+  X(force_1010102_rt_as_rgba8)
+
+inline std::atomic<uint32_t>& AndroidHaloLiveBase675ProbeMode() {
+  static std::atomic<uint32_t> mode{0};
+  return mode;
+}
+
+inline std::string AndroidHaloJoinReloadFields(
+    const std::vector<std::string>& fields) {
+  std::string result;
+  for (const std::string& field : fields) {
+    if (!result.empty()) {
+      result += ',';
+    }
+    result += field;
+  }
+  return result;
+}
+
+inline void MergeAndroidHaloReloadSafeFields(
+    AndroidHaloExperiment& destination,
+    const AndroidHaloExperiment& parsed,
+    std::vector<std::string>& applied,
+    std::vector<std::string>& ignored_init_only) {
+#define XE_ANDROID_HALO_APPLY_RELOAD_FIELD(field) \
+  if (destination.field != parsed.field) {        \
+    destination.field = parsed.field;             \
+    applied.emplace_back(#field);                 \
+  }
+  XE_ANDROID_HALO_RELOAD_SAFE_FIELDS(XE_ANDROID_HALO_APPLY_RELOAD_FIELD)
+#undef XE_ANDROID_HALO_APPLY_RELOAD_FIELD
+
+#define XE_ANDROID_HALO_REPORT_INIT_FIELD(field) \
+  if (destination.field != parsed.field) {        \
+    ignored_init_only.emplace_back(#field);       \
+  }
+  XE_ANDROID_HALO_INIT_ONLY_FIELDS(XE_ANDROID_HALO_REPORT_INIT_FIELD)
+#undef XE_ANDROID_HALO_REPORT_INIT_FIELD
+
+  bool dump_addresses_changed =
+      destination.dump_address_count != parsed.dump_address_count;
+  for (uint32_t i = 0; i < AndroidHaloExperiment::kMaxDumpAddresses; ++i) {
+    dump_addresses_changed |=
+        destination.dump_addresses[i] != parsed.dump_addresses[i] ||
+        destination.dump_address_bpp[i] != parsed.dump_address_bpp[i];
+  }
+  if (dump_addresses_changed) {
+    destination.dump_address_count = parsed.dump_address_count;
+    for (uint32_t i = 0; i < AndroidHaloExperiment::kMaxDumpAddresses; ++i) {
+      destination.dump_addresses[i] = parsed.dump_addresses[i];
+      destination.dump_address_bpp[i] = parsed.dump_address_bpp[i];
+    }
+    applied.emplace_back("dump_addresses");
+  }
+}
+
+class AndroidHaloExperimentReloadController {
+ public:
+  AndroidHaloExperimentReloadController(
+      const AndroidHaloExperiment* initial, std::string initial_content,
+      std::string initial_path)
+      : current_(initial),
+        loaded_content_(std::move(initial_content)),
+        loaded_path_(std::move(initial_path)) {}
+
+  const AndroidHaloExperiment* current() const {
+    return current_.load(std::memory_order_acquire);
+  }
+
+  void Poll() {
+    using namespace std::chrono;
+    const int64_t now_millis =
+        duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
+            .count();
+    int64_t next_poll_millis =
+        next_poll_millis_.load(std::memory_order_relaxed);
+    if (now_millis < next_poll_millis ||
+        !next_poll_millis_.compare_exchange_strong(
+            next_poll_millis, now_millis + 2000,
+            std::memory_order_relaxed)) {
+      return;
+    }
+
+    std::string loaded_content;
+    std::string loaded_path;
+    AndroidHaloExperiment parsed = LoadAndroidHaloExperiment(
+        &loaded_content, &loaded_path, false);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (loaded_path == loaded_path_ && loaded_content == loaded_content_) {
+      return;
+    }
+    loaded_path_ = loaded_path;
+    loaded_content_ = loaded_content;
+
+    auto snapshot =
+        std::make_unique<AndroidHaloExperiment>(*current_.load(
+            std::memory_order_acquire));
+    std::vector<std::string> applied;
+    std::vector<std::string> ignored_init_only;
+    MergeAndroidHaloReloadSafeFields(*snapshot, parsed, applied,
+                                     ignored_init_only);
+
+    if (!applied.empty()) {
+      AndroidHaloExperiment* snapshot_pointer = snapshot.get();
+      snapshots_.push_back(std::move(snapshot));
+      current_.store(snapshot_pointer, std::memory_order_release);
+      if (std::find(applied.cbegin(), applied.cend(),
+                    "base675_draw_probe_mode") != applied.cend()) {
+        AndroidHaloLiveBase675ProbeMode().store(
+            snapshot_pointer->base675_draw_probe_mode,
+            std::memory_order_relaxed);
+      }
+    }
+    XELOGI(
+        "HaloExperiment reload: applied=[{}] ignored_init_only=[{}] file={}",
+        AndroidHaloJoinReloadFields(applied),
+        AndroidHaloJoinReloadFields(ignored_init_only),
+        loaded_path.empty() ? "none(defaults)" : loaded_path);
+  }
+
+ private:
+  std::atomic<const AndroidHaloExperiment*> current_;
+  std::atomic<int64_t> next_poll_millis_{0};
+  std::mutex mutex_;
+  std::string loaded_content_;
+  std::string loaded_path_;
+  // References returned by GetAndroidHaloExperiment may outlive a reload.
+  // Retain old immutable snapshots until process shutdown to keep them valid.
+  std::vector<std::unique_ptr<AndroidHaloExperiment>> snapshots_;
+};
+
+inline const AndroidHaloExperiment& GetAndroidHaloExperiment() {
+  static std::string initial_content;
+  static std::string initial_path;
+  static const AndroidHaloExperiment initial = LoadAndroidHaloExperiment(
+      &initial_content, &initial_path, true);
+  static AndroidHaloExperimentReloadController controller(
+      &initial, std::move(initial_content), std::move(initial_path));
+  static const bool live_probe_initialized = [] {
+    AndroidHaloLiveBase675ProbeMode().store(
+        initial.base675_draw_probe_mode, std::memory_order_relaxed);
+    return true;
+  }();
+  (void)live_probe_initialized;
+  controller.Poll();
+  return *controller.current();
+}
+
+#undef XE_ANDROID_HALO_RELOAD_SAFE_FIELDS
+#undef XE_ANDROID_HALO_INIT_ONLY_FIELDS
 
 inline std::atomic<uint32_t>& AndroidHaloGameplayPresentFramesRemaining() {
   static std::atomic<uint32_t> frames{0};

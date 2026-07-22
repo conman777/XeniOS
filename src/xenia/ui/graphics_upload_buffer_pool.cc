@@ -73,6 +73,17 @@ void GraphicsUploadBufferPool::ClearCache() {
   writable_last_ = nullptr;
 }
 
+size_t GraphicsUploadBufferPool::GetPageCount() const {
+  size_t page_count = 0;
+  for (const Page* page = submitted_first_; page; page = page->next_) {
+    ++page_count;
+  }
+  for (const Page* page = writable_first_; page; page = page->next_) {
+    ++page_count;
+  }
+  return page_count;
+}
+
 GraphicsUploadBufferPool::Page::~Page() {}
 
 void GraphicsUploadBufferPool::FlushWrites() {

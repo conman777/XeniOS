@@ -281,6 +281,14 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void InsertDebugMarker(const char* format, ...);
   bool debug_markers_enabled() const { return debug_markers_enabled_; }
 
+  // Android HOSTDUMP_675: mid-resolve GPU stall + resume (RT cache caller).
+  bool AndroidAwaitQueueAndResumeGuestSubmission() {
+    if (!AwaitAllQueueOperationsCompletion()) {
+      return false;
+    }
+    return BeginSubmission(true);
+  }
+
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
@@ -882,6 +890,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
     void* mapped_data[2] = {nullptr, nullptr};  // Persistent mappings
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
+    // Used only by memexport readback. A mapped buffer is CPU-readable only
+    // after the submission containing its GPU copy has completed.
+    uint64_t memexport_submissions[2] = {0, 0};
+    std::vector<draw_util::MemExportRange> memexport_ranges[2];
   };
 
   // Helper to evict old readback buffers from a cache map

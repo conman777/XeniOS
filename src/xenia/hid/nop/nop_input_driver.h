@@ -20,6 +20,13 @@ namespace xe {
 namespace hid {
 namespace nop {
 
+#if XE_PLATFORM_ANDROID
+void SetAndroidPhysicalGamepadState(uint16_t buttons, float left_x,
+                                    float left_y, float right_x, float right_y,
+                                    float left_trigger, float right_trigger);
+void ResetAndroidPhysicalGamepadState();
+#endif
+
 class NopInputDriver final : public InputDriver,
                              public xe::ui::WindowInputListener {
  public:
@@ -49,9 +56,12 @@ class NopInputDriver final : public InputDriver,
   uint32_t packet_number_ = 0;
   uint32_t poll_count_ = 0;
   uint16_t last_buttons_ = 0;
-  uint8_t last_trigger_bits_ = 0;
+  uint8_t last_left_trigger_ = 0;
+  uint8_t last_right_trigger_ = 0;
   int16_t last_thumb_lx_ = 0;
   int16_t last_thumb_ly_ = 0;
+  int16_t last_thumb_rx_ = 0;
+  int16_t last_thumb_ry_ = 0;
 
   std::atomic<uint32_t> android_active_pointer_id_{
       xe::ui::TouchEvent::kPointerIDNone};

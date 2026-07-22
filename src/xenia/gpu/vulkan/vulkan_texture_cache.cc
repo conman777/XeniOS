@@ -2534,6 +2534,20 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       ++android_tex_endian_override_log_count;
     }
   }
+  if (GetAndroidHaloExperiment().scene_rgba8_texture_endian_8in16 &&
+      texture_key.base_page == 0x2354 &&
+      texture_key.format == xenos::TextureFormat::k_8_8_8_8 &&
+      texture_load_endianness == xenos::Endian::k8in32) {
+    texture_load_endianness = xenos::Endian::k8in16;
+    static uint32_t android_scene_rgba8_endian_log_count = 0;
+    if (android_scene_rgba8_endian_log_count++ < 32) {
+      XELOGI(
+          "HaloCompat scene RGBA8 texture endian: base=0x{:08X} "
+          "format={} endian=2->1 load_shader={} host_format={}",
+          uint32_t(texture_key.base_page << 12), uint32_t(texture_key.format),
+          uint32_t(load_shader), uint32_t(host_format.format));
+    }
+  }
 #endif
   // 3 bits for each.
   assert_true(texture_resolution_scale_x <= 7);
@@ -3509,7 +3523,11 @@ bool VulkanTextureCache::Initialize() {
     host_format_16_16.format_unsigned.format = VK_FORMAT_R16G16_SFLOAT;
   }
   assert_true(host_format_16_16.format_signed.format == VK_FORMAT_R16G16_SNORM);
-  if ((r16g16_snorm_properties.optimalTilingFeatures &
+  if (
+#if XE_PLATFORM_ANDROID
+      android_force_rgba16_fixed_float_fallback ||
+#endif
+      (r16g16_snorm_properties.optimalTilingFeatures &
        norm16_required_features) != norm16_required_features) {
     host_format_16_16.format_signed.load_shader =
         kLoadShaderIndexRG16SNormToFloat;
@@ -3524,6 +3542,11 @@ bool VulkanTextureCache::Initialize() {
       host_formats_[uint32_t(xenos::TextureFormat::k_16_16_16_16)];
   assert_true(host_format_16_16_16_16.format_unsigned.format ==
               VK_FORMAT_R16G16B16A16_UNORM);
+  // Android: force both signed and unsigned RGBA16 through the snorm/unorm→
+  // float convert. Adreno may advertise LINEAR on UNORM16 while still sampling
+  // Reach's 0x02354000 scene scratch incorrectly (oracle: cinematic OK when
+  // guest FB is good; gameplay composite still depends on reliable RGBA16
+  // loads). Signed-only fallback left UNORM path on the broken native format.
   if (
 #if XE_PLATFORM_ANDROID
       android_force_rgba16_fixed_float_fallback ||
@@ -3550,7 +3573,7 @@ bool VulkanTextureCache::Initialize() {
   }
 #if XE_PLATFORM_ANDROID
   XELOGI(
-      "HaloCompat RGBA16 fixed texture host selection: force_float={} "
+      "HaloCompat RGBA16 fixed texture host selection: force_signed_float={} "
       "required_features=0x{:X} unorm_features=0x{:X} "
       "snorm_features=0x{:X} unsigned_host={} signed_host={}",
       uint32_t(android_force_rgba16_fixed_float_fallback),

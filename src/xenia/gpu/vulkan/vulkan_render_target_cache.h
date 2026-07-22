@@ -107,6 +107,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool Initialize(uint32_t shared_memory_binding_count);
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
+  VkDeviceSize render_target_memory_usage_bytes() const {
+    return render_target_memory_usage_bytes_;
+  }
+  size_t transfer_upload_memory_usage() const {
+    return transfer_vertex_buffer_pool_
+               ? transfer_vertex_buffer_pool_->GetMemoryUsage()
+               : 0;
+  }
 
   void CompletedSubmissionUpdated();
   void EndSubmission();
@@ -183,6 +191,22 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool gamma_render_target_as_unorm16() const {
     return gamma_render_target_as_unorm16_;
   }
+  uint32_t scaled_unorm_7e3_render_target_mode() const {
+    return scaled_unorm_7e3_render_target_mode_;
+  }
+  bool UsesScaledUNorm7e3RenderTargets() const {
+    return scaled_unorm_7e3_render_target_mode_ != 0;
+  }
+
+#if XE_PLATFORM_ANDROID
+  // Returns Reach's live host 8888 composition target for presentation,
+  // transitioning it for compute sampling. Returns null when the tracked RT
+  // isn't an exact safe match so the caller can use the guest-memory path.
+  VkImageView RequestAndroidHaloHostSwapTexture(
+      uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+      uint32_t& width_scaled_out, uint32_t& height_scaled_out,
+      xenos::TextureFormat& format_out);
+#endif
 
   bool msaa_2x_attachments_supported() const {
     return msaa_2x_attachments_supported_;
@@ -765,6 +789,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // Force a collapsed color source to be packed as guest 8888. Used by
       // the narrow Android Halo direct-MSAA presentation path.
       uint32_t android_force_8888_repack : 1;
+      // WO40: bake normalize_7e3_to_rgba8_repack_curve into the dump pipeline
+      // so hot-reloading the curve builds a new shader instead of silently
+      // reusing the launch-time SPIR-V (curve was previously init-only for
+      // this reason). 0-3, see android_halo_experiment.h.
+      uint32_t android_normalize_7e3_curve : 2;
+      uint32_t android_normalize_7e3 : 1;
       // Last bit because this affects the pipeline - after sorting, only change
       // it at most once. Depth buffers have an additional stencil SRV.
       uint32_t is_depth : 1;
@@ -1001,6 +1031,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       uint32_t dump_row_length_used, uint32_t dump_rows, uint32_t dump_pitch,
       uint32_t copy_width, uint32_t copy_height, uint32_t copy_bpp,
       const draw_util::ResolveCopyShaderConstants& copy_shader_constants);
+  // dump_host_675_stats: read a center crop of the host RT image owning the
+  // dump span and log HOSTDUMP_675 float stats (capped).
+  void AndroidHaloMaybeLogHost675Stats(uint32_t dump_base,
+                                       uint32_t dump_row_length_used,
+                                       uint32_t dump_rows, uint32_t dump_pitch,
+                                       uint32_t resolve_dest,
+                                       uint32_t resolve_dest_fmt);
 #endif
 
   bool gamma_render_target_as_unorm16_ = false;
@@ -1008,10 +1045,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool depth_unorm24_vulkan_format_supported_ = false;
   bool depth_float24_round_ = false;
   bool snorm16_color_attachments_supported_ = true;
+  // Effective host storage selected after Vulkan format capability checks:
+  // 0 = float, 1 = A2B10G10R10 UNORM, 2 = RGBA16 UNORM.
+  uint32_t scaled_unorm_7e3_render_target_mode_ = 0;
   // Set around DumpRenderTargets during a resolve when the guest reads the
   // dumped span as 1x MSAA (used to collapse 4x-MSAA owner samples on
   // Android - samples-as-pixels aliasing).
   bool android_resolve_read_msaa_1x_ = false;
+  // Set around DumpRenderTargets for dest 0x02354000 fmt26: prefer dumping the
+  // 7e3 FLOAT RT at base 675 even if LDR currently owns the tiles.
+  bool android_prefer_7e3_dump_675_ = false;
   bool android_resolve_read_64bpp_ = false;
 
   bool msaa_2x_attachments_supported_ = false;

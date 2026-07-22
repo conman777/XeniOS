@@ -43,7 +43,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 10;
+    static constexpr uint32_t kVersion = 14;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -469,11 +469,20 @@ class SpirvShaderTranslator : public ShaderTranslator {
   static spv::Id UnclampedFloat32To7e3(SpirvBuilder& builder,
                                        spv::Id f32_scalar,
                                        spv::Id ext_inst_glsl_std_450);
+  // Arithmetic equivalents used to avoid bit-scan and variable-shift paths
+  // on Vulkan drivers where those paths are unreliable.
+  static spv::Id UnclampedFloat32To7e3Arithmetic(
+      SpirvBuilder& builder, spv::Id f32_scalar,
+      spv::Id ext_inst_glsl_std_450);
   // Converts the 7e3 number in bits [f10_shift, f10_shift + 10) to a 32-bit
   // float.
   static spv::Id Float7e3To32(SpirvBuilder& builder, spv::Id f10_uint_scalar,
                               uint32_t f10_shift, bool result_as_uint,
                               spv::Id ext_inst_glsl_std_450);
+  static spv::Id Float7e3To32Arithmetic(SpirvBuilder& builder,
+                                        spv::Id f10_uint_scalar,
+                                        uint32_t f10_shift,
+                                        bool result_as_uint);
   // Converts the depth value externally clamped to the representable [0, 2)
   // range to 20e4 floating point, with zeros in bits 24:31, rounding to the
   // nearest even or towards zero. If remap_from_0_to_0_5 is true, it's assumed

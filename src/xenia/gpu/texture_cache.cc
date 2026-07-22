@@ -1126,6 +1126,55 @@ void TextureCache::BindingInfoFromFetchConstant(
 
   key_out.is_valid = 1;
 
+#if XE_PLATFORM_ANDROID
+  // Side-by-side layout census for Reach scene scratch: fmt54 samples vs the
+  // fmt26 resolve that fills the same address (see RESOLVE_SCRATCH logs).
+  if (key_out.base_page == 0x2354 &&
+      (uint32_t(fetch.format) ==
+           uint32_t(xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16) ||
+       uint32_t(fetch.format) ==
+           uint32_t(xenos::TextureFormat::k_16_16_16_16) ||
+       uint32_t(fetch.format) ==
+           uint32_t(xenos::TextureFormat::k_2_10_10_10))) {
+    static uint32_t android_scratch_sample_layout_log_count = 0;
+    if (android_scratch_sample_layout_log_count < 64) {
+      const FormatInfo* fetch_fi = FormatInfo::Get(fetch.format);
+      const FormatInfo* base_fi = FormatInfo::Get(format);
+      const FormatInfo* as16_fi =
+          FormatInfo::Get(xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16);
+      const FormatInfo* f26_fi =
+          FormatInfo::Get(xenos::TextureFormat::k_16_16_16_16);
+      const uint32_t w = key_out.GetWidth();
+      const uint32_t h = key_out.GetHeight();
+      const uint32_t pitch_texels = uint32_t(key_out.pitch) << 5;
+      XELOGI(
+          "SCRATCH_SAMPLE_LAYOUT {}: fetch_fmt={} base_fmt={} "
+          "size={}x{} pitch_field={} pitch_texels={} tiled={} endian={} "
+          "exp_adjust={} signs={}/{}/{}/{} "
+          "fetch_bpp={} base_bpp={} as16_bpp={} fmt26_bpp={} "
+          "byte_pitch_base={} byte_pitch_as16={} byte_pitch_fmt26={} "
+          "bytes_base={} bytes_as16={} bytes_fmt26={}",
+          android_scratch_sample_layout_log_count, uint32_t(fetch.format),
+          uint32_t(format), w, h, uint32_t(key_out.pitch), pitch_texels,
+          uint32_t(key_out.tiled), uint32_t(key_out.endianness),
+          int32_t(fetch.exp_adjust), uint32_t(fetch.sign_x),
+          uint32_t(fetch.sign_y), uint32_t(fetch.sign_z),
+          uint32_t(fetch.sign_w),
+          fetch_fi ? fetch_fi->bits_per_pixel : 0,
+          base_fi ? base_fi->bits_per_pixel : 0,
+          as16_fi ? as16_fi->bits_per_pixel : 0,
+          f26_fi ? f26_fi->bits_per_pixel : 0,
+          pitch_texels * ((base_fi ? base_fi->bits_per_pixel : 0) >> 3),
+          pitch_texels * ((as16_fi ? as16_fi->bits_per_pixel : 0) >> 3),
+          pitch_texels * ((f26_fi ? f26_fi->bits_per_pixel : 0) >> 3),
+          w * h * ((base_fi ? base_fi->bits_per_pixel : 0) >> 3),
+          w * h * ((as16_fi ? as16_fi->bits_per_pixel : 0) >> 3),
+          w * h * ((f26_fi ? f26_fi->bits_per_pixel : 0) >> 3));
+      ++android_scratch_sample_layout_log_count;
+    }
+  }
+#endif
+
   if (swizzled_signs_out != nullptr) {
     *swizzled_signs_out = texture_util::SwizzleSigns(fetch);
   }

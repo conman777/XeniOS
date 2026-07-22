@@ -35,6 +35,9 @@ class GraphicsUploadBufferPool {
   void ChangeSubmissionTimeline();
   void ClearCache();
 
+  size_t GetPageCount() const;
+  size_t GetMemoryUsage() const { return GetPageCount() * page_size_; }
+
   // Should be called before submitting anything using this pool, unless the
   // implementation doesn't require explicit flushing.
   void FlushWrites();

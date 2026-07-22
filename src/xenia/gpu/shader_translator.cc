@@ -10,6 +10,8 @@
 #include "xenia/gpu/shader_translator.h"
 
 #include <cstdarg>
+#include <mutex>
+#include <unordered_set>
 
 #include "xenia/base/logging.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -523,9 +525,23 @@ void Shader::GatherAluInstructionInformation(
     if (memexport_stream_constant != UINT32_MAX) {
       memexport_stream_constants_.insert(memexport_stream_constant);
     } else {
-      XELOGE(
-          "ShaderTranslator::GatherAluInstructionInformation: Couldn't extract "
-          "memexport stream constant index");
+      // Upstream also accepts noncanonical eA writes here. They can't be used
+      // for CPU memexport range tracking, but the guest shader instruction is
+      // still valid and must remain in the translated shader.
+      static std::mutex unrecognized_memexport_mutex;
+      static std::unordered_set<uint64_t> unrecognized_memexport_shaders;
+      bool log_warning;
+      {
+        std::lock_guard<std::mutex> lock(unrecognized_memexport_mutex);
+        log_warning =
+            unrecognized_memexport_shaders.insert(ucode_data_hash()).second;
+      }
+      if (log_warning) {
+        XELOGW(
+            "Shader 0x{:016X}: skipping an unrecognized eA write for CPU "
+            "memexport range tracking; shader translation continues",
+            ucode_data_hash());
+      }
     }
   }
 }

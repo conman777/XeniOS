@@ -32,6 +32,13 @@ class SharedMemory {
 
   void InvalidateAllPages();
 
+  uint32_t host_gpu_memory_sparse_used_bytes() const {
+    return host_gpu_memory_sparse_used_bytes_;
+  }
+  uint32_t host_gpu_memory_sparse_allocation_count() const {
+    return host_gpu_memory_sparse_allocations_;
+  }
+
   typedef void (*GlobalWatchCallback)(
       const global_unique_lock_type& global_lock, void* context,
       uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);

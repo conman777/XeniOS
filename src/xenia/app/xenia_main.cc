@@ -642,8 +642,11 @@ void ApplyAndroidCompatPresentationDefaults() {
   OverrideAndroidConfigVar<bool>("halo_android_diag_log_texture_bindings",
                                  false);
   OverrideAndroidConfigVar<bool>("halo_android_gpu_frame_dumps", false);
-  OverrideAndroidConfigVar<bool>("readback_memexport", true);
-  OverrideAndroidConfigVar<bool>("readback_memexport_fast", true);
+  // Reach consumes its high-volume memexports on the GPU. CPU readback creates
+  // large staging traffic and used to force a queue wait for every cold stream
+  // key. Keep it opt-in for titles that actually read exported data on the CPU.
+  OverrideAndroidConfigVar<bool>("readback_memexport", false);
+  OverrideAndroidConfigVar<bool>("readback_memexport_fast", false);
 }
 
 void ApplyAndroidProfileFileOverrides(
@@ -975,10 +978,9 @@ bool EmulatorApp::OnInitialize() {
   // Saved config files can override Android launch/default values. Keep the
   // mobile profile deterministic for compatibility and battery/thermal limits.
   OVERRIDE_bool(discord, false);
-  // Reach rewrites multi-gigabyte cache partition files during campaign load.
-  // On Android those mapped writes consume unified memory until the process is
-  // killed. The cache mount is optional and is already a Halo compatibility
-  // toggle on other mobile platforms.
+  // Keep the full three-device cache mount disabled by default on Android.
+  // WO39 independently mounts only the disk-backed cache1: device used by
+  // Reach's resume checkpoint when mount_cache_disk_backed is enabled.
   OVERRIDE_bool(mount_cache, false);
   // Async compilation keeps the frame loop alive through FSI's much larger
   // pipeline compilations (sync stalls there starve the watchdog into killing
@@ -1268,6 +1270,13 @@ void EmulatorApp::EmulatorThread(bool is_game_process) {
     }
   }
 
+#if XE_PLATFORM_ANDROID
+  const bool mount_cache1_disk_backed =
+      xe::gpu::vulkan::GetAndroidHaloExperiment()
+          .mount_cache_disk_backed;
+#else
+  constexpr bool mount_cache1_disk_backed = false;
+#endif
   if (cvars::mount_cache) {
     auto cache0_device = std::make_unique<xe::vfs::HostPathDevice>(
         "\\CACHE0", emulator_->storage_root() / "cache0", false);
@@ -1280,7 +1289,9 @@ void EmulatorApp::EmulatorThread(bool is_game_process) {
         fs->RegisterSymbolicLink("cache0:", "\\CACHE0");
       }
     }
+  }
 
+  if (cvars::mount_cache || mount_cache1_disk_backed) {
     auto cache1_device = std::make_unique<xe::vfs::HostPathDevice>(
         "\\CACHE1", emulator_->storage_root() / "cache1", false);
     if (!cache1_device->Initialize()) {
@@ -1290,9 +1301,16 @@ void EmulatorApp::EmulatorThread(bool is_game_process) {
         XELOGE("Unable to register cache1 path");
       } else {
         fs->RegisterSymbolicLink("cache1:", "\\CACHE1");
+#if XE_PLATFORM_ANDROID
+        XELOGI(
+            "Android cache1 mount: disk_backed=1 path={} full_cache_mount={}",
+            emulator_->storage_root() / "cache1", uint32_t(cvars::mount_cache));
+#endif
       }
     }
+  }
 
+  if (cvars::mount_cache) {
     // Some (older?) games try accessing cache:\ too
     // NOTE: this must be registered _after_ the cache0/cache1 devices, due to
     // substring/start_with logic inside VirtualFileSystem::ResolvePath, else

@@ -155,6 +155,55 @@ namespace xe {
 namespace gpu {
 namespace vulkan {
 
+namespace {
+
+spv::Id ConvertFloat32To7e3ForRenderTarget(
+    SpirvBuilder& builder, spv::Id f32_scalar,
+    spv::Id ext_inst_glsl_std_450, bool source_is_scaled_unorm) {
+  if (source_is_scaled_unorm) {
+    f32_scalar = builder.createBinOp(
+        spv::OpFMul, builder.makeFloatType(32), f32_scalar,
+        builder.makeFloatConstant(31.875f));
+  }
+#if XE_PLATFORM_ANDROID
+  if (GetAndroidHaloExperiment().arithmetic_7e3_conversion) {
+    return SpirvShaderTranslator::UnclampedFloat32To7e3Arithmetic(
+        builder, f32_scalar, ext_inst_glsl_std_450);
+  }
+#endif
+  return SpirvShaderTranslator::UnclampedFloat32To7e3(
+      builder, f32_scalar, ext_inst_glsl_std_450);
+}
+
+spv::Id Convert7e3ToFloat32ForRenderTarget(
+    SpirvBuilder& builder, spv::Id f10_uint_scalar, uint32_t f10_shift,
+    bool result_as_uint, spv::Id ext_inst_glsl_std_450,
+    bool result_is_scaled_unorm) {
+  spv::Id result;
+#if XE_PLATFORM_ANDROID
+  if (GetAndroidHaloExperiment().arithmetic_7e3_conversion) {
+    result = SpirvShaderTranslator::Float7e3To32Arithmetic(
+        builder, f10_uint_scalar, f10_shift, result_as_uint);
+  } else {
+    result = SpirvShaderTranslator::Float7e3To32(
+        builder, f10_uint_scalar, f10_shift, result_as_uint,
+        ext_inst_glsl_std_450);
+  }
+#else
+  result = SpirvShaderTranslator::Float7e3To32(
+      builder, f10_uint_scalar, f10_shift, result_as_uint,
+      ext_inst_glsl_std_450);
+#endif
+  if (result_is_scaled_unorm) {
+    assert_false(result_as_uint);
+    result = builder.createBinOp(spv::OpFMul, builder.makeFloatType(32), result,
+                                 builder.makeFloatConstant(1.0f / 31.875f));
+  }
+  return result;
+}
+
+}  // namespace
+
 // Generated with `xb buildshaders`.
 namespace shaders {
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/host_depth_store_1xmsaa_cs.h"
@@ -314,8 +363,9 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       vulkan_device->properties();
 
 #if XE_PLATFORM_ANDROID
-  // Experiment: force FSI without the interlock feature (bit-exact EDRAM;
-  // unordered fragment read-modify-write races accepted).
+  // Experiment: force the bit-exact EDRAM path without native interlock.
+  // Guest draws are serialized below to make their read-modify-write ordering
+  // deterministic across draw calls.
   const bool force_fsi_experiment = GetAndroidHaloExperiment().force_fsi;
 #else
   constexpr bool force_fsi_experiment = false;
@@ -444,6 +494,38 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
         VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+#if XE_PLATFORM_ANDROID
+    VkFormatProperties color_unorm10_properties, color_unorm16_properties;
+    ifn.vkGetPhysicalDeviceFormatProperties(
+        physical_device, VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+        &color_unorm10_properties);
+    ifn.vkGetPhysicalDeviceFormatProperties(
+        physical_device, VK_FORMAT_R16G16B16A16_UNORM,
+        &color_unorm16_properties);
+    const bool color_unorm10_supported =
+        (color_unorm10_properties.optimalTilingFeatures &
+         kUsedColorFormatFeatures) == kUsedColorFormatFeatures;
+    const bool color_unorm16_supported =
+        (color_unorm16_properties.optimalTilingFeatures &
+         kUsedColorFormatFeatures) == kUsedColorFormatFeatures;
+    const uint32_t requested_scaled_unorm_mode =
+        GetAndroidHaloExperiment().scaled_unorm_7e3_render_targets;
+    if (GetPath() == Path::kHostRenderTargets &&
+        ((requested_scaled_unorm_mode == 1 && color_unorm10_supported) ||
+         (requested_scaled_unorm_mode == 2 && color_unorm16_supported))) {
+      scaled_unorm_7e3_render_target_mode_ = requested_scaled_unorm_mode;
+    }
+    XELOGI(
+        "HaloCompat 7e3 host storage: requested={} effective={} "
+        "required_features=0x{:08X} A2B10G10R10_UNORM=0x{:08X} "
+        "RGBA16_UNORM=0x{:08X} float_fallback={}",
+        requested_scaled_unorm_mode,
+        scaled_unorm_7e3_render_target_mode_,
+        uint32_t(kUsedColorFormatFeatures),
+        uint32_t(color_unorm10_properties.optimalTilingFeatures),
+        uint32_t(color_unorm16_properties.optimalTilingFeatures),
+        uint32_t(scaled_unorm_7e3_render_target_mode_ == 0));
+#endif
     VkFormatProperties color_snorm16_properties_rg, color_snorm16_properties;
     ifn.vkGetPhysicalDeviceFormatProperties(
         physical_device, VK_FORMAT_R16G16_SNORM, &color_snorm16_properties_rg);
@@ -1290,6 +1372,10 @@ void VulkanRenderTargetCache::ClearCache() {
   }
   render_passes_.clear();
 
+  if (transfer_vertex_buffer_pool_) {
+    transfer_vertex_buffer_pool_->ClearCache();
+  }
+
 #if XE_PLATFORM_ANDROID
   android_depth_to_color_edram_fallback_source_ = nullptr;
   android_halo_presentable_color_rt_ = nullptr;
@@ -1354,6 +1440,56 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
     return true;
   }
 
+#if XE_PLATFORM_ANDROID
+  // Permanent, allocation-free telemetry for Reach's reused scene scratch
+  // range. Log each distinct register-derived resolve tuple at most once.
+  constexpr uint32_t kAndroidHaloSceneResolveStart = UINT32_C(0x02354000);
+  constexpr uint32_t kAndroidHaloSceneResolveEnd =
+      kAndroidHaloSceneResolveStart + UINT32_C(0x00654000);
+  const uint64_t android_resolve_dest_end =
+      uint64_t(resolve_info.copy_dest_extent_start) +
+      uint64_t(resolve_info.copy_dest_extent_length);
+  if (resolve_info.copy_dest_extent_length &&
+      !resolve_info.IsCopyingDepth() &&
+      resolve_info.copy_dest_extent_start < kAndroidHaloSceneResolveEnd &&
+      android_resolve_dest_end > kAndroidHaloSceneResolveStart) {
+    struct AndroidSceneResolveLogKey {
+      uint32_t dest;
+      uint32_t dest_format;
+      int32_t dest_exp_bias;
+      uint32_t source_format;
+      uint32_t source_base;
+    };
+    const AndroidSceneResolveLogKey key = {
+        resolve_info.copy_dest_extent_start,
+        uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+        int32_t(resolve_info.copy_dest_info.copy_dest_exp_bias),
+        uint32_t(resolve_info.color_edram_info.format),
+        uint32_t(resolve_info.color_edram_info.base_tiles)};
+    static AndroidSceneResolveLogKey logged_keys[32] = {};
+    static uint32_t logged_key_count = 0;
+    bool seen = false;
+    for (uint32_t i = 0; i < logged_key_count; ++i) {
+      const AndroidSceneResolveLogKey& logged = logged_keys[i];
+      if (logged.dest == key.dest && logged.dest_format == key.dest_format &&
+          logged.dest_exp_bias == key.dest_exp_bias &&
+          logged.source_format == key.source_format &&
+          logged.source_base == key.source_base) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen && logged_key_count < xe::countof(logged_keys)) {
+      logged_keys[logged_key_count++] = key;
+      XELOGI(
+          "HaloCompat scene resolve: dest=0x{:08X} dest_fmt={} "
+          "dest_exp_bias={} src_fmt={} src_base={}",
+          key.dest, key.dest_format, key.dest_exp_bias, key.source_format,
+          key.source_base);
+    }
+  }
+#endif
+
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1416,7 +1552,8 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
           XELOGI(
               "OWNSNAP_RESOLVE dest=0x{:08X} dump_tiles=[{},{}) "
               "dump_pitch={} reg_src_base={} reg_src_pitch={} reg_src_msaa={} "
-              "reg_src_depth={} reg_src_fmt={} reg_src_64bpp={}",
+              "reg_src_depth={} reg_src_fmt={} reg_src_64bpp={} "
+              "dest_fmt={} dest_endian={} dest_exp_bias={} dest_swap={}",
               resolve_info.copy_dest_extent_start, dump_base, dump_end_tiles,
               dump_pitch,
               uint32_t(resolve_info.color_edram_info.base_tiles),
@@ -1425,7 +1562,11 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
                   << uint32_t(resolve_info.color_edram_info.msaa_samples),
               uint32_t(resolve_info.color_edram_info.is_depth),
               uint32_t(resolve_info.color_edram_info.format),
-              uint32_t(resolve_info.color_edram_info.format_is_64bpp));
+              uint32_t(resolve_info.color_edram_info.format_is_64bpp),
+              uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+              uint32_t(resolve_info.copy_dest_info.copy_dest_endian),
+              int32_t(resolve_info.copy_dest_info.copy_dest_exp_bias),
+              uint32_t(resolve_info.copy_dest_info.copy_dest_swap));
           AndroidLogEdramOwnershipSnapshot(
               std::max(dump_base,
                        android_experiment.ownership_watch_start_tiles),
@@ -1435,8 +1576,22 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
         }
       }
 #endif
+#if XE_PLATFORM_ANDROID
+      AndroidHaloMaybeLogHost675Stats(
+          dump_base, dump_row_length_used, dump_rows, dump_pitch,
+          resolve_info.copy_dest_extent_start,
+          uint32_t(resolve_info.copy_dest_info.copy_dest_format));
+      android_prefer_7e3_dump_675_ =
+          GetAndroidHaloExperiment().dump_scene_675_prefer_7e3_float &&
+          !resolve_info.IsCopyingDepth() &&
+          resolve_info.copy_dest_extent_start == UINT32_C(0x02354000) &&
+          resolve_info.copy_dest_info.copy_dest_format ==
+              xenos::ColorFormat::k_16_16_16_16 &&
+          dump_base == 675;
+#endif
       DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
 #if XE_PLATFORM_ANDROID
+      android_prefer_7e3_dump_675_ = false;
       android_resolve_read_msaa_1x_ = false;
 #endif
       if (cvars::halo_android_diag_synthetic_edram_fill &&
@@ -1559,6 +1714,94 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
     draw_util::ResolveCopyShaderIndex copy_shader = resolve_info.GetCopyShader(
         draw_resolution_scale_x(), draw_resolution_scale_y(),
         copy_shader_constants, copy_group_count_x, copy_group_count_y);
+#if XE_PLATFORM_ANDROID
+    const uint32_t android_host_7e3_range_mode =
+        GetAndroidHaloExperiment().host_7e3_range_mode;
+    const bool android_normalize_7e3_resolve =
+        !UsesScaledUNorm7e3RenderTargets() &&
+        (android_host_7e3_range_mode == 1 ||
+         android_host_7e3_range_mode == 3) &&
+        !resolve_info.IsCopyingDepth() &&
+        (copy_shader_constants.dest_relative.edram_info.format ==
+             uint32_t(
+                 xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) ||
+         copy_shader_constants.dest_relative.edram_info.format ==
+             uint32_t(xenos::ColorRenderTargetFormat::
+                          k_2_10_10_10_FLOAT_AS_16_16_16_16)) &&
+        copy_shader_constants.dest_relative.dest_info.copy_dest_exp_bias == -5;
+    if (android_normalize_7e3_resolve) {
+      copy_shader_constants.dest_relative.dest_info.copy_dest_exp_bias = 0;
+      static uint32_t android_normalize_7e3_resolve_log_count = 0;
+      if (android_normalize_7e3_resolve_log_count++ < 32) {
+        XELOGI(
+            "HaloCompat normalized 7e3 resolve: mode={} dest=0x{:08X} "
+            "src_fmt={} exp_bias=-5->0",
+            android_host_7e3_range_mode,
+            resolve_info.copy_dest_extent_start,
+            uint32_t(copy_shader_constants.dest_relative.edram_info.format));
+      }
+    }
+    const AndroidHaloExperiment& android_experiment =
+        GetAndroidHaloExperiment();
+    const uint32_t android_resolve_source_format =
+        uint32_t(copy_shader_constants.dest_relative.edram_info.format);
+    const uint32_t android_resolve_dest_format = uint32_t(
+        copy_shader_constants.dest_relative.dest_info.copy_dest_format);
+    const bool android_7e3_to_fixed16_full_resolve =
+        !resolve_info.IsCopyingDepth() &&
+        copy_shader == draw_util::ResolveCopyShaderIndex::kFull64bpp &&
+        (android_resolve_source_format ==
+             uint32_t(
+                 xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) ||
+         android_resolve_source_format ==
+             uint32_t(xenos::ColorRenderTargetFormat::
+                          k_2_10_10_10_FLOAT_AS_16_16_16_16)) &&
+        (android_resolve_dest_format ==
+             uint32_t(xenos::TextureFormat::k_16_16_16_16_EDRAM) ||
+         android_resolve_dest_format ==
+             uint32_t(xenos::ColorFormat::k_16_16_16_16));
+    if (android_experiment.force_7e3_fixed16_resolve_exp_bias_minus5 &&
+        android_7e3_to_fixed16_full_resolve) {
+      const int32_t old_exp_bias =
+          copy_shader_constants.dest_relative.dest_info.copy_dest_exp_bias;
+      copy_shader_constants.dest_relative.dest_info.copy_dest_exp_bias = -5;
+      static uint32_t android_force_7e3_fixed16_bias_log_count = 0;
+      if (android_force_7e3_fixed16_bias_log_count++ < 16) {
+        XELOGI(
+            "HaloCompat forced 7e3 fixed16 resolve bias: dest=0x{:08X} "
+            "src_base={} dest_fmt={} exp_bias={}->-5",
+            resolve_info.copy_dest_extent_start,
+            uint32_t(copy_shader_constants.dest_relative.edram_info.base_tiles),
+            android_resolve_dest_format, old_exp_bias);
+      }
+    }
+    if (android_experiment.signed_fixed16_resolve_pack &&
+        android_7e3_to_fixed16_full_resolve) {
+      // resolve_full_64bpp packs formats 21/26 as UNORM16 after exp_bias.
+      // Optional A/B: further reduce bias by 1 to approximate SNORM codes.
+      const int32_t old_exp_bias =
+          copy_shader_constants.dest_relative.dest_info.copy_dest_exp_bias;
+      const bool can_emulate_signed_pack =
+          old_exp_bias <= -5 && old_exp_bias > -32;
+      if (can_emulate_signed_pack) {
+        copy_shader_constants.dest_relative.dest_info.copy_dest_exp_bias =
+            old_exp_bias - 1;
+      }
+      static uint32_t android_signed_fixed16_pack_log_count = 0;
+      if (android_signed_fixed16_pack_log_count++ < 16) {
+        XELOGI(
+            "HaloCompat signed fixed16 resolve pack emulation: "
+            "dest=0x{:08X} src_base={} dest_fmt={} exp_bias={}->{} "
+            "rgb_only=1 applied={}",
+            resolve_info.copy_dest_extent_start,
+            uint32_t(copy_shader_constants.dest_relative.edram_info.base_tiles),
+            android_resolve_dest_format, old_exp_bias,
+            int32_t(copy_shader_constants.dest_relative.dest_info
+                        .copy_dest_exp_bias),
+            uint32_t(can_emulate_signed_pack));
+      }
+    }
+#endif
     const uint32_t copy_width =
         resolve_info.coordinate_info.width_div_8
         << xenos::kResolveAlignmentPixelsLog2;
@@ -1567,6 +1810,44 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
     const FormatInfo& copy_dest_format_info = *FormatInfo::Get(
         xenos::TextureFormat(resolve_info.copy_dest_info.copy_dest_format));
     const uint32_t copy_bpp = copy_dest_format_info.bits_per_pixel >> 3;
+#if XE_PLATFORM_ANDROID
+    // Always-on layout census paired with SCRATCH_SAMPLE_LAYOUT (fmt54 loads).
+    if (!resolve_info.IsCopyingDepth() &&
+        resolve_info.copy_dest_extent_start == UINT32_C(0x02354000) &&
+        (copy_width == 1152 && copy_height == 720) &&
+        (uint32_t(resolve_info.copy_dest_info.copy_dest_format) ==
+             uint32_t(xenos::ColorFormat::k_16_16_16_16) ||
+         uint32_t(resolve_info.copy_dest_info.copy_dest_format) ==
+             uint32_t(xenos::ColorFormat::k_2_10_10_10_AS_16_16_16_16) ||
+         uint32_t(resolve_info.copy_dest_info.copy_dest_format) ==
+             uint32_t(xenos::ColorFormat::k_2_10_10_10) ||
+         uint32_t(resolve_info.copy_dest_info.copy_dest_format) ==
+             uint32_t(xenos::ColorFormat::k_8_8_8_8))) {
+      static uint32_t android_scratch_resolve_layout_log_count = 0;
+      if (android_scratch_resolve_layout_log_count < 64) {
+        XELOGI(
+            "SCRATCH_RESOLVE_LAYOUT {}: dest=0x02354000 {}x{} dest_fmt={} "
+            "dest_endian={} dest_exp_bias={} dest_swap={} copy_bpp={} "
+            "copy_bytes={} src_base={} src_pitch={} src_msaa={} src_fmt={} "
+            "src_64bpp={} copy_shader={}",
+            android_scratch_resolve_layout_log_count, copy_width, copy_height,
+            uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+            uint32_t(resolve_info.copy_dest_info.copy_dest_endian),
+            int32_t(resolve_info.copy_dest_info.copy_dest_exp_bias),
+            uint32_t(resolve_info.copy_dest_info.copy_dest_swap), copy_bpp,
+            copy_width * copy_height * copy_bpp,
+            uint32_t(copy_shader_constants.dest_relative.edram_info.base_tiles),
+            uint32_t(copy_shader_constants.dest_relative.edram_info.pitch_tiles),
+            UINT32_C(1) << uint32_t(
+                copy_shader_constants.dest_relative.edram_info.msaa_samples),
+            uint32_t(copy_shader_constants.dest_relative.edram_info.format),
+            uint32_t(
+                copy_shader_constants.dest_relative.edram_info.format_is_64bpp),
+            uint32_t(copy_shader));
+        ++android_scratch_resolve_layout_log_count;
+      }
+    }
+#endif
 #if XE_PLATFORM_ANDROID
     const bool android_override_base0_pitch29_to15 =
         GetAndroidHaloExperiment().resolve_base0_pitch29_to15 &&
@@ -1692,13 +1973,17 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
           (scaled_height +
            ((UINT32_C(1) << forced_shader_info.group_size_y_log2) - 1)) >>
           forced_shader_info.group_size_y_log2;
-      XELOGI(
-          "Android Halo resolve forcing full 32bpp shader: auto={} "
-          "width={} height={} bpp={} pitch_tiles={} fb=0x{:08X}",
-          uint32_t(android_halo_frontbuffer_resolve),
-          copy_width, copy_height, copy_bpp,
-          uint32_t(copy_shader_constants.dest_relative.edram_info.pitch_tiles),
-          resolve_info.copy_dest_extent_start);
+      static uint32_t android_force_full_resolve_log_count = 0;
+      if (android_force_full_resolve_log_count++ < 32) {
+        XELOGI(
+            "Android Halo resolve forcing full 32bpp shader: auto={} "
+            "width={} height={} bpp={} pitch_tiles={} fb=0x{:08X}",
+            uint32_t(android_halo_frontbuffer_resolve), copy_width, copy_height,
+            copy_bpp,
+            uint32_t(
+                copy_shader_constants.dest_relative.edram_info.pitch_tiles),
+            resolve_info.copy_dest_extent_start);
+      }
     }
     if (cvars::halo_android_diag_log_resolve_constants) {
       const uint32_t dest_pitch_pixels =
@@ -2282,6 +2567,22 @@ bool VulkanRenderTargetCache::Update(
       // For FSI, only the barrier is needed - already scheduled if required.
       // But the buffer will be used for FSI drawing now.
       UseEdramBuffer(EdramBufferUsage::kFragmentReadWrite);
+#if XE_PLATFORM_ANDROID
+      const ui::vulkan::VulkanDevice::Properties& device_properties =
+          command_processor_.GetVulkanDevice()->properties();
+      const bool emulating_fragment_shader_interlock =
+          GetAndroidHaloExperiment().force_fsi &&
+          !(device_properties.fragmentShaderSampleInterlock ||
+            device_properties.fragmentShaderPixelInterlock);
+      if (emulating_fragment_shader_interlock) {
+        // Native interlock orders overlapping fragment read-modify-writes both
+        // within and across guest draws. Without it, at least make every new
+        // guest draw observe all EDRAM writes from the preceding draw. The
+        // pending barrier is submitted before the draw pass is re-entered.
+        CommitEdramBufferShaderWrites(
+            EdramBufferModificationStatus::kViaFragmentShaderInterlock);
+      }
+#endif
       // Commit preceding unordered (but not FSI) writes like clears as they
       // aren't synchronized with FSI accesses.
       CommitEdramBufferShaderWrites(
@@ -2729,6 +3030,17 @@ VkFormat VulkanRenderTargetCache::GetColorVulkanFormat(
       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+#if XE_PLATFORM_ANDROID
+      if (scaled_unorm_7e3_render_target_mode_ == 1) {
+        return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+      }
+      if (scaled_unorm_7e3_render_target_mode_ == 2) {
+        return VK_FORMAT_R16G16B16A16_UNORM;
+      }
+      if (GetAndroidHaloExperiment().rgba32f_for_7e3_render_targets) {
+        return VK_FORMAT_R32G32B32A32_SFLOAT;
+      }
+#endif
       return VK_FORMAT_R16G16B16A16_SFLOAT;
     case xenos::ColorRenderTargetFormat::k_16_16:
       // SNORM16 color attachments are optional in Vulkan; fall back to float16
@@ -3227,6 +3539,76 @@ void StoreAndroidHalo1010102To8888ValueConvert(
 }
 
 }  // namespace
+
+VkImageView VulkanRenderTargetCache::RequestAndroidHaloHostSwapTexture(
+    uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+    uint32_t& width_scaled_out, uint32_t& height_scaled_out,
+    xenos::TextureFormat& format_out) {
+  static uint32_t request_count = 0;
+  static uint32_t success_count = 0;
+  ++request_count;
+  const bool log_request = request_count <= 16 || (request_count % 300) == 0;
+
+  const char* rejection = nullptr;
+  if (!IsAndroidHaloCompatActive()) {
+    rejection = "compat_inactive";
+  } else if (frontbuffer_width != 1152 || frontbuffer_height != 720) {
+    rejection = "frontbuffer_extent";
+  } else if (android_halo_presentable_color_rt_ == nullptr) {
+    rejection = "no_tracked_rt";
+  }
+
+  VulkanRenderTarget* source_rt = android_halo_presentable_color_rt_;
+  RenderTargetKey source_key{};
+  if (!rejection) {
+    source_key = source_rt->key();
+    if (!IsAndroidHaloPresentableColorKey(source_key) ||
+        !IsAndroidHalo8888ColorFormat(source_key.GetColorFormat())) {
+      rejection = "tracked_rt_not_8888";
+    } else if (source_rt->view_depth_color() == VK_NULL_HANDLE) {
+      rejection = "no_color_view";
+    }
+  }
+
+  if (rejection) {
+    if (log_request) {
+      XELOGI(
+          "HaloCompat host present fallback count={} reason={} fb={}x{} "
+          "tracked_rt=0x{:016X}",
+          request_count, rejection, frontbuffer_width, frontbuffer_height,
+          uint64_t(reinterpret_cast<uintptr_t>(source_rt)));
+    }
+    return VK_NULL_HANDLE;
+  }
+
+  command_processor_.PushImageMemoryBarrier(
+      source_rt->image(),
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
+      source_rt->current_stage_mask(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      source_rt->current_access_mask(), VK_ACCESS_SHADER_READ_BIT,
+      source_rt->current_layout(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, true);
+  source_rt->SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_SHADER_READ_BIT,
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+  width_scaled_out = frontbuffer_width * draw_resolution_scale_x();
+  height_scaled_out = frontbuffer_height * draw_resolution_scale_y();
+  format_out = xenos::TextureFormat::k_8_8_8_8;
+  ++success_count;
+  if (success_count <= 16 || (success_count % 300) == 0) {
+    XELOGI(
+        "HaloCompat host present source count={} request={} rt_base={} "
+        "rt_pitch={} rt_fmt={} rt_color_fmt={} source={}x{} output={}x{}",
+        success_count, request_count, uint32_t(source_key.base_tiles),
+        source_key.GetPitchTiles(), uint32_t(source_key.resource_format),
+        uint32_t(source_key.GetColorFormat()), source_key.GetWidth(),
+        GetRenderTargetHeight(source_key.pitch_tiles_at_32bpp,
+                              source_key.msaa_samples),
+        width_scaled_out, height_scaled_out);
+  }
+  return source_rt->view_depth_color();
+}
 
 bool VulkanRenderTargetCache::IsAndroidHaloCompatActive() const {
   return cvars::halo_android_compat_presentable_color_shadow &&
@@ -5255,13 +5637,15 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           for (uint32_t i = 0; i < 2; ++i) {
             // Float16 has a wider range for both color and alpha, also NaNs -
             // clamp and convert.
-            packed[i] = SpirvShaderTranslator::UnclampedFloat32To7e3(
-                builder, source_color[i][0], ext_inst_glsl_std_450);
+            packed[i] = ConvertFloat32To7e3ForRenderTarget(
+                builder, source_color[i][0], ext_inst_glsl_std_450,
+                UsesScaledUNorm7e3RenderTargets());
             for (uint32_t j = 1; j < 3; ++j) {
               packed[i] = builder.createQuadOp(
                   spv::OpBitFieldInsert, type_uint, packed[i],
-                  SpirvShaderTranslator::UnclampedFloat32To7e3(
-                      builder, source_color[i][j], ext_inst_glsl_std_450),
+                  ConvertFloat32To7e3ForRenderTarget(
+                      builder, source_color[i][j], ext_inst_glsl_std_450,
+                      UsesScaledUNorm7e3RenderTargets()),
                   builder.makeUintConstant(10 * j), width_rgb);
             }
             // Saturate and convert the alpha.
@@ -5629,15 +6013,17 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           } else {
             // Float16 has a wider range for both color and alpha, also NaNs -
             // clamp and convert.
-            packed = SpirvShaderTranslator::UnclampedFloat32To7e3(
-                builder, source_color[0][0], ext_inst_glsl_std_450);
+            packed = ConvertFloat32To7e3ForRenderTarget(
+                builder, source_color[0][0], ext_inst_glsl_std_450,
+                UsesScaledUNorm7e3RenderTargets());
             if (mode.output != TransferOutput::kStencilBit) {
               spv::Id width_rgb = builder.makeUintConstant(10);
               for (uint32_t i = 1; i < 3; ++i) {
                 packed = builder.createQuadOp(
                     spv::OpBitFieldInsert, type_uint, packed,
-                    SpirvShaderTranslator::UnclampedFloat32To7e3(
-                        builder, source_color[0][i], ext_inst_glsl_std_450),
+                    ConvertFloat32To7e3ForRenderTarget(
+                        builder, source_color[0][i], ext_inst_glsl_std_450,
+                        UsesScaledUNorm7e3RenderTargets()),
                     builder.makeUintConstant(10 * i), width_rgb);
               }
               // Saturate and convert the alpha.
@@ -5849,8 +6235,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
               // Color.
               spv::Id width_rgb = builder.makeUintConstant(10);
               for (uint32_t i = 0; i < 3; ++i) {
-                id_vector_temp.push_back(SpirvShaderTranslator::Float7e3To32(
-                    builder, packed, 10 * i, false, ext_inst_glsl_std_450));
+                id_vector_temp.push_back(Convert7e3ToFloat32ForRenderTarget(
+                    builder, packed, 10 * i, false,
+                    ext_inst_glsl_std_450,
+                    UsesScaledUNorm7e3RenderTargets()));
               }
               // Alpha.
               id_vector_temp.push_back(builder.createBinOp(
@@ -7682,6 +8070,65 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               continue;
             }
           }
+          // Protect Reach's base-675 7e3 scene owner from LDR clobber / steal.
+          // t134 blanket both dirs → energetic but cyan. Narrow ldr→hdr only
+          // ≈ baseline dull. HOSTDUMP t150: fmt26 resolves often dump from
+          // fixed 1010102 while FLOAT still holds HDR — block hdr→ldr steal.
+          if (IsAndroidHaloCompatActive() && !j &&
+              dest_rt_key.base_tiles == 675 &&
+              dest_rt_key.GetPitchTiles() == 15) {
+            const AndroidHaloExperiment& scene_675_xfer_exp =
+                GetAndroidHaloExperiment();
+            const auto is_7e3_fmt =
+                [](xenos::ColorRenderTargetFormat format) -> bool {
+              return format ==
+                         xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+                     format == xenos::ColorRenderTargetFormat::
+                                   k_2_10_10_10_FLOAT_AS_16_16_16_16;
+            };
+            const bool depth_into_scene =
+                scene_675_xfer_exp.skip_scene_675_hdr_format_alias &&
+                new_transfer_shader_key.mode == TransferMode::kDepthToColor &&
+                source_rt_key.is_depth && !dest_rt_key.is_depth;
+            const bool ldr_into_hdr =
+                scene_675_xfer_exp.skip_scene_675_hdr_format_alias &&
+                new_transfer_shader_key.mode == TransferMode::kColorToColor &&
+                !source_rt_key.is_depth && !dest_rt_key.is_depth &&
+                is_7e3_fmt(dest_rt_key.GetColorFormat()) &&
+                !is_7e3_fmt(source_rt_key.GetColorFormat());
+            const bool hdr_into_ldr =
+                scene_675_xfer_exp.skip_scene_675_hdr_to_ldr &&
+                new_transfer_shader_key.mode == TransferMode::kColorToColor &&
+                !source_rt_key.is_depth && !dest_rt_key.is_depth &&
+                is_7e3_fmt(source_rt_key.GetColorFormat()) &&
+                !is_7e3_fmt(dest_rt_key.GetColorFormat());
+            if (depth_into_scene || ldr_into_hdr || hdr_into_ldr) {
+              static uint32_t android_scene_675_alias_skip_log_count = 0;
+              if (android_scene_675_alias_skip_log_count < 128) {
+                XELOGI(
+                    "SCENE675_XFER_SKIP count={} mode={} src_base={} "
+                    "src_pitch={} src_fmt={} src_depth={} src_msaa={} "
+                    "dest_base={} dest_pitch={} dest_fmt={} dest_msaa={} "
+                    "tiles=[{}, {})",
+                    android_scene_675_alias_skip_log_count,
+                    depth_into_scene ? "depth_to_color"
+                    : ldr_into_hdr   ? "ldr_into_hdr"
+                                     : "hdr_into_ldr",
+                    uint32_t(source_rt_key.base_tiles),
+                    source_rt_key.GetPitchTiles(),
+                    uint32_t(source_rt_key.resource_format),
+                    uint32_t(source_rt_key.is_depth),
+                    uint32_t(1) << uint32_t(source_rt_key.msaa_samples),
+                    uint32_t(dest_rt_key.base_tiles),
+                    dest_rt_key.GetPitchTiles(),
+                    uint32_t(dest_rt_key.resource_format),
+                    uint32_t(1) << uint32_t(dest_rt_key.msaa_samples),
+                    transfer.start_tiles, transfer.end_tiles);
+                ++android_scene_675_alias_skip_log_count;
+              }
+              continue;
+            }
+          }
           const int32_t skip_color_src_fmt =
               GetAndroidHaloExperiment()
                   .skip_presentable_color_transfer_src_fmt;
@@ -8854,8 +9301,16 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   spv::Id packed[2] = {};
   spv::Builder::TextureParameters source_texture_parameters = {};
   spv::Id source_vec4 = spv::NoResult;
-  if (cvars::halo_android_diag_dump_shader_pattern && !key.is_depth &&
-      key.GetColorFormat() == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+  const bool android_dump_7e3_pattern =
+      GetAndroidHaloExperiment().dump_7e3_pattern && !key.is_depth &&
+      (key.GetColorFormat() ==
+           xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+       key.GetColorFormat() == xenos::ColorRenderTargetFormat::
+                                   k_2_10_10_10_FLOAT_AS_16_16_16_16);
+  if ((cvars::halo_android_diag_dump_shader_pattern && !key.is_depth &&
+       key.GetColorFormat() ==
+           xenos::ColorRenderTargetFormat::k_8_8_8_8) ||
+      android_dump_7e3_pattern) {
     spv::Id source_x_float = builder.createUnaryOp(
         spv::OpConvertUToF, type_float, source_pixel_x);
     spv::Id source_y_float = builder.createUnaryOp(
@@ -8866,6 +9321,23 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
     spv::Id source_g = builder.createBinOp(
         spv::OpFDiv, type_float, source_y_float,
         builder.makeFloatConstant(float(720 - 1)));
+    if (android_dump_7e3_pattern) {
+      const spv::Id hdr_scale = builder.makeFloatConstant(31.875f);
+      source_r = builder.createBinOp(spv::OpFMul, type_float, source_r,
+                                     hdr_scale);
+      source_g = builder.createBinOp(spv::OpFMul, type_float, source_g,
+                                     hdr_scale);
+#if XE_PLATFORM_ANDROID
+      if (UsesScaledUNorm7e3RenderTargets()) {
+        const spv::Id host_scale =
+            builder.makeFloatConstant(1.0f / 31.875f);
+        source_r = builder.createBinOp(spv::OpFMul, type_float, source_r,
+                                       host_scale);
+        source_g = builder.createBinOp(spv::OpFMul, type_float, source_g,
+                                       host_scale);
+      }
+#endif
+    }
     spv::Id source_tile_x = builder.createBinOp(
         spv::OpUDiv, type_uint, source_pixel_x,
         builder.makeUintConstant(xenos::kEdramTileWidthSamples));
@@ -8881,7 +9353,16 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
         spv::OpSelect, type_float,
         builder.createBinOp(spv::OpINotEqual, builder.makeBoolType(),
                             source_checker, const_uint_0),
-        builder.makeFloatConstant(1.0f), builder.makeFloatConstant(0.125f));
+        builder.makeFloatConstant(
+            android_dump_7e3_pattern &&
+                    UsesScaledUNorm7e3RenderTargets()
+                ? 28.0f / 31.875f
+                : android_dump_7e3_pattern ? 28.0f : 1.0f),
+        builder.makeFloatConstant(
+            android_dump_7e3_pattern &&
+                    UsesScaledUNorm7e3RenderTargets()
+                ? 4.0f / 31.875f
+                : android_dump_7e3_pattern ? 4.0f : 0.125f));
     id_vector_temp.clear();
     id_vector_temp.push_back(source_r);
     id_vector_temp.push_back(source_g);
@@ -9028,6 +9509,82 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
         source_vec4 =
             builder.createCompositeConstruct(type_float4, id_vector_temp);
       }
+      // Prefer the value baked into DumpPipelineKey (hot-reloadable). Fall
+      // back to the live experiment snapshot for keys built before WO40.
+      const bool android_normalize_7e3_enabled =
+          key.android_normalize_7e3 ||
+          (GetAndroidHaloExperiment().normalize_7e3_to_rgba8_repack);
+      if (android_normalize_7e3_enabled && !UsesScaledUNorm7e3RenderTargets() &&
+          (key.GetColorFormat() ==
+               xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+           key.GetColorFormat() == xenos::ColorRenderTargetFormat::
+                                       k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
+        const uint32_t curve =
+            key.android_normalize_7e3
+                ? uint32_t(key.android_normalize_7e3_curve)
+                : GetAndroidHaloExperiment().normalize_7e3_to_rgba8_repack_curve;
+        id_vector_temp.clear();
+        const spv::Id const_float_0 = builder.makeFloatConstant(0.0f);
+        const spv::Id const_float_1 = builder.makeFloatConstant(1.0f);
+        const spv::Id hdr_to_unorm_scale =
+            builder.makeFloatConstant(1.0f / 31.875f);
+        // Soft-knee constant for curve 3: c/(c+k) after linear scale. k=0.35
+        // keeps ~0.22 of a unit-midtone (vs 0.5 for pure Reinhard) while
+        // rolling off values that would otherwise clip to pure white.
+        const spv::Id soft_knee = builder.makeFloatConstant(0.35f);
+        for (uint32_t i = 0; i < 3; ++i) {
+          spv::Id component = builder.createCompositeExtract(
+              source_vec4, type_float, i);
+          if (curve == 2) {
+            // Display-space diagnostic shoulder. Unlike the linear mapping,
+            // this assigns useful 8-bit precision to values around 0..2 while
+            // retaining highlights above 1 instead of clipping them.
+            component = builder.createBinBuiltinCall(
+                type_float, ext_inst_glsl_std_450, GLSLstd450NMax, component,
+                const_float_0);
+            component = builder.createBinOp(
+                spv::OpFDiv, type_float, component,
+                builder.createBinOp(spv::OpFAdd, type_float, component,
+                                    const_float_1));
+          } else {
+            component = builder.createBinOp(
+                spv::OpFMul, type_float, component, hdr_to_unorm_scale);
+            component = builder.createBinBuiltinCall(
+                type_float, ext_inst_glsl_std_450, GLSLstd450NMax, component,
+                const_float_0);
+            if (curve == 1) {
+              // Compand before the unavoidable 8-bit quantization. Reach's
+              // visible scene values around 0..2 then occupy roughly 0..64
+              // instead of only 0..16 codes.
+              component = builder.createTriBuiltinCall(
+                  type_float, ext_inst_glsl_std_450, GLSLstd450NClamp,
+                  component, const_float_0, const_float_1);
+              component = builder.createUnaryBuiltinCall(
+                  type_float, ext_inst_glsl_std_450, GLSLstd450Sqrt,
+                  component);
+            } else if (curve == 3) {
+              // Soft knee after linear scale: preserves dark/mid foliage and
+              // armor while compressing HDR emissives that used to clip white.
+              component = builder.createBinOp(
+                  spv::OpFDiv, type_float, component,
+                  builder.createBinOp(spv::OpFAdd, type_float, component,
+                                      soft_knee));
+            }
+          }
+          id_vector_temp.push_back(component);
+        }
+        id_vector_temp.push_back(
+            builder.createCompositeExtract(source_vec4, type_float, 3));
+        source_vec4 =
+            builder.createCompositeConstruct(type_float4, id_vector_temp);
+        static uint32_t android_normalize_7e3_rgba8_repack_log_count = 0;
+        if (android_normalize_7e3_rgba8_repack_log_count++ < 16) {
+          XELOGI(
+              "HaloCompat normalized 7e3 RGBA8 dump repack: src_fmt={} "
+              "rgb_scale=1/31.875 curve={}",
+              uint32_t(key.GetColorFormat()), curve);
+        }
+      }
       // 7e3-float owners can exceed [0, 1]; saturate so values don't wrap in
       // the 8-bit BitFieldInsert. No-op for unorm owners.
       spv::Id const_float_0 = builder.makeFloatConstant(0.0f);
@@ -9129,17 +9686,18 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
         // Float16 has a wider range for both color and alpha, also NaNs - clamp
         // and convert.
-        packed[0] = SpirvShaderTranslator::UnclampedFloat32To7e3(
+        packed[0] = ConvertFloat32To7e3ForRenderTarget(
             builder, builder.createCompositeExtract(source_vec4, type_float, 0),
-            ext_inst_glsl_std_450);
+            ext_inst_glsl_std_450, UsesScaledUNorm7e3RenderTargets());
         spv::Id width_rgb = builder.makeUintConstant(10);
         for (uint32_t i = 1; i < 3; ++i) {
           packed[0] = builder.createQuadOp(
               spv::OpBitFieldInsert, type_uint, packed[0],
-              SpirvShaderTranslator::UnclampedFloat32To7e3(
+              ConvertFloat32To7e3ForRenderTarget(
                   builder,
                   builder.createCompositeExtract(source_vec4, type_float, i),
-                  ext_inst_glsl_std_450),
+                  ext_inst_glsl_std_450,
+                  UsesScaledUNorm7e3RenderTargets()),
               builder.makeUintConstant(10 * i), width_rgb);
         }
         // Saturate and convert the alpha.
@@ -9274,6 +9832,313 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   return pipeline;
 }
 
+#if XE_PLATFORM_ANDROID
+namespace {
+
+// IEEE 754 binary16 → float (Vulkan R16G16B16A16_SFLOAT host contents).
+float AndroidIeeeHalfToFloat(uint16_t bits) {
+  const uint32_t sign = (uint32_t(bits) & 0x8000u) << 16;
+  const uint32_t exp = (uint32_t(bits) >> 10) & 0x1Fu;
+  const uint32_t mant = uint32_t(bits) & 0x3FFu;
+  uint32_t fbits;
+  if (exp == 0) {
+    if (mant == 0) {
+      fbits = sign;
+    } else {
+      uint32_t m = mant;
+      uint32_t e = 127 - 15 + 1;
+      while ((m & 0x400u) == 0) {
+        m <<= 1;
+        --e;
+      }
+      m &= 0x3FFu;
+      fbits = sign | (e << 23) | (m << 13);
+    }
+  } else if (exp == 31) {
+    fbits = sign | 0x7F800000u | (mant << 13);
+  } else {
+    fbits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+  }
+  float value;
+  std::memcpy(&value, &fbits, sizeof(value));
+  return value;
+}
+
+}  // namespace
+
+void VulkanRenderTargetCache::AndroidHaloMaybeLogHost675Stats(
+    uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
+    uint32_t dump_pitch, uint32_t resolve_dest, uint32_t resolve_dest_fmt) {
+  static uint32_t host_675_stats_seen = 0;
+  static uint32_t host_675_stats_log_count = 0;
+  if (!GetAndroidHaloExperiment().dump_host_675_stats ||
+      dump_base != 675 || resolve_dest != UINT32_C(0x02354000) ||
+      resolve_dest_fmt != uint32_t(xenos::ColorFormat::k_16_16_16_16)) {
+    return;
+  }
+  // fmt26@675 resolves burst early; subsample so cinematic (~f1800) and
+  // gameplay (~f2100) are covered. Skip first 200, then log every 25th.
+  ++host_675_stats_seen;
+  if (host_675_stats_seen <= 200 || (host_675_stats_seen % 25) != 0 ||
+      host_675_stats_log_count >= 24) {
+    return;
+  }
+
+  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
+                                 dump_pitch, dump_rectangles_);
+  if (dump_rectangles_.empty()) {
+    XELOGI(
+        "HOSTDUMP_675 n={} frame={} dest=0x02354000 dest_fmt=26 dump_base=675 "
+        "rectangles=0",
+        host_675_stats_log_count, command_processor_.GetCurrentSubmission());
+    ++host_675_stats_log_count;
+    return;
+  }
+
+  VulkanRenderTarget* vulkan_rt = nullptr;
+  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+    auto* candidate =
+        static_cast<VulkanRenderTarget*>(rectangle.render_target);
+    if (!candidate->key().is_depth) {
+      vulkan_rt = candidate;
+      break;
+    }
+  }
+  if (!vulkan_rt) {
+    XELOGI(
+        "HOSTDUMP_675 n={} frame={} dest=0x02354000 dest_fmt=26 dump_base=675 "
+        "no_color_rt",
+        host_675_stats_log_count, command_processor_.GetCurrentSubmission());
+    ++host_675_stats_log_count;
+    return;
+  }
+
+  const RenderTargetKey rt_key = vulkan_rt->key();
+  const VkFormat vk_format = GetColorVulkanFormat(rt_key.GetColorFormat());
+  const bool is_f16 = vk_format == VK_FORMAT_R16G16B16A16_SFLOAT;
+  const bool is_f32 = vk_format == VK_FORMAT_R32G32B32A32_SFLOAT;
+  if (!is_f16 && !is_f32) {
+    XELOGI(
+        "HOSTDUMP_675 n={} frame={} rt={}/{}/{}/{}x vk_fmt={} unsupported "
+        "(want SFLOAT16/32)",
+        host_675_stats_log_count, command_processor_.GetCurrentSubmission(),
+        uint32_t(rt_key.base_tiles), rt_key.GetPitchTiles(),
+        rt_key.GetFormatName(), uint32_t(1) << uint32_t(rt_key.msaa_samples),
+        uint32_t(vk_format));
+    ++host_675_stats_log_count;
+    return;
+  }
+
+  const uint32_t image_width = rt_key.GetWidth() * draw_resolution_scale_x();
+  const uint32_t image_height =
+      GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples) *
+      draw_resolution_scale_y();
+  if (!image_width || !image_height) {
+    return;
+  }
+
+  // Reach scene resolves only use the top 1152x720 of the EDRAM surface; the
+  // host RT is taller (~2192). Center the crop in the *visible* rect or the
+  // probe reads empty padding below the game view.
+  constexpr uint32_t kVisibleW = 1152;
+  constexpr uint32_t kVisibleH = 720;
+  constexpr uint32_t kCropW = 160;
+  constexpr uint32_t kCropH = 90;
+  const uint32_t visible_w = std::min(kVisibleW, image_width);
+  const uint32_t visible_h = std::min(kVisibleH, image_height);
+  const uint32_t copy_w = std::min(kCropW, visible_w);
+  const uint32_t copy_h = std::min(kCropH, visible_h);
+  const int32_t copy_x = int32_t((visible_w - copy_w) / 2);
+  const int32_t copy_y = int32_t((visible_h - copy_h) / 2);
+  const uint32_t bpp = is_f32 ? 16u : 8u;
+  const VkDeviceSize buffer_size =
+      VkDeviceSize(copy_w) * VkDeviceSize(copy_h) * VkDeviceSize(bpp);
+
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  VkBuffer readback_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, buffer_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer,
+          readback_memory)) {
+    XELOGW("HOSTDUMP_675: failed to create readback buffer size={}",
+           uint64_t(buffer_size));
+    ++host_675_stats_log_count;
+    return;
+  }
+
+  if (rt_key.msaa_samples != xenos::MsaaSamples::k1X) {
+    XELOGI(
+        "HOSTDUMP_675 n={} frame={} rt={}/{}/{}/{}x vk_fmt={} skip_msaa "
+        "(1x-only probe)",
+        host_675_stats_log_count, command_processor_.GetCurrentSubmission(),
+        uint32_t(rt_key.base_tiles), rt_key.GetPitchTiles(),
+        rt_key.GetFormatName(), uint32_t(1) << uint32_t(rt_key.msaa_samples),
+        uint32_t(vk_format));
+    ++host_675_stats_log_count;
+    return;
+  }
+
+  command_processor_.PushImageMemoryBarrier(
+      vulkan_rt->image(),
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
+      vulkan_rt->current_stage_mask(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+      vulkan_rt->current_access_mask(), VK_ACCESS_TRANSFER_READ_BIT,
+      vulkan_rt->current_layout(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  vulkan_rt->SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_ACCESS_TRANSFER_READ_BIT,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+
+  DeferredCommandBuffer& command_buffer =
+      command_processor_.deferred_command_buffer();
+  VkBufferImageCopy copy_region = {};
+  copy_region.bufferOffset = 0;
+  copy_region.bufferRowLength = 0;
+  copy_region.bufferImageHeight = 0;
+  copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy_region.imageSubresource.mipLevel = 0;
+  copy_region.imageSubresource.baseArrayLayer = 0;
+  copy_region.imageSubresource.layerCount = 1;
+  copy_region.imageOffset = {copy_x, copy_y, 0};
+  copy_region.imageExtent = {copy_w, copy_h, 1};
+  command_buffer.CmdVkCopyImageToBuffer(
+      vulkan_rt->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      readback_buffer, 1, &copy_region);
+
+  if (!command_processor_.AndroidAwaitQueueAndResumeGuestSubmission()) {
+    XELOGW("HOSTDUMP_675: await/resume failed");
+    dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+    dfn.vkFreeMemory(device, readback_memory, nullptr);
+    ++host_675_stats_log_count;
+    return;
+  }
+
+  void* mapped = nullptr;
+  if (dfn.vkMapMemory(device, readback_memory, 0, buffer_size, 0, &mapped) !=
+          VK_SUCCESS ||
+      !mapped) {
+    XELOGW("HOSTDUMP_675: map failed");
+    dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+    dfn.vkFreeMemory(device, readback_memory, nullptr);
+    ++host_675_stats_log_count;
+    return;
+  }
+
+  uint32_t nonblack = 0;
+  uint32_t hdr_count = 0;
+  float min_r = 1.0e30f, min_g = 1.0e30f, min_b = 1.0e30f;
+  float max_r = -1.0e30f, max_g = -1.0e30f, max_b = -1.0e30f;
+  double sum_r = 0.0, sum_g = 0.0, sum_b = 0.0;
+
+  // Subsample every 8th pixel of the crop to keep CPU work light.
+  constexpr uint32_t kStride = 8;
+  uint32_t sample_count = 0;
+  if (is_f16) {
+    const uint16_t* pixels = reinterpret_cast<const uint16_t*>(mapped);
+    for (uint32_t y = 0; y < copy_h; y += kStride) {
+      for (uint32_t x = 0; x < copy_w; x += kStride) {
+        const uint32_t idx = (y * copy_w + x) * 4;
+        const float r = AndroidIeeeHalfToFloat(pixels[idx + 0]);
+        const float g = AndroidIeeeHalfToFloat(pixels[idx + 1]);
+        const float b = AndroidIeeeHalfToFloat(pixels[idx + 2]);
+        const bool finite =
+            (r == r) && (g == g) && (b == b) &&
+            r < 1.0e20f && g < 1.0e20f && b < 1.0e20f &&
+            r > -1.0e20f && g > -1.0e20f && b > -1.0e20f;
+        if (!finite) {
+          continue;
+        }
+        ++sample_count;
+        if (r != 0.0f || g != 0.0f || b != 0.0f) {
+          ++nonblack;
+        }
+        if (r > 1.0f || g > 1.0f || b > 1.0f) {
+          ++hdr_count;
+        }
+        min_r = std::min(min_r, r);
+        min_g = std::min(min_g, g);
+        min_b = std::min(min_b, b);
+        max_r = std::max(max_r, r);
+        max_g = std::max(max_g, g);
+        max_b = std::max(max_b, b);
+        sum_r += double(r);
+        sum_g += double(g);
+        sum_b += double(b);
+      }
+    }
+  } else {
+    const float* pixels = reinterpret_cast<const float*>(mapped);
+    for (uint32_t y = 0; y < copy_h; y += kStride) {
+      for (uint32_t x = 0; x < copy_w; x += kStride) {
+        const uint32_t idx = (y * copy_w + x) * 4;
+        const float r = pixels[idx + 0];
+        const float g = pixels[idx + 1];
+        const float b = pixels[idx + 2];
+        const bool finite =
+            (r == r) && (g == g) && (b == b) &&
+            r < 1.0e20f && g < 1.0e20f && b < 1.0e20f &&
+            r > -1.0e20f && g > -1.0e20f && b > -1.0e20f;
+        if (!finite) {
+          continue;
+        }
+        ++sample_count;
+        if (r != 0.0f || g != 0.0f || b != 0.0f) {
+          ++nonblack;
+        }
+        if (r > 1.0f || g > 1.0f || b > 1.0f) {
+          ++hdr_count;
+        }
+        min_r = std::min(min_r, r);
+        min_g = std::min(min_g, g);
+        min_b = std::min(min_b, b);
+        max_r = std::max(max_r, r);
+        max_g = std::max(max_g, g);
+        max_b = std::max(max_b, b);
+        sum_r += double(r);
+        sum_g += double(g);
+        sum_b += double(b);
+      }
+    }
+  }
+
+  dfn.vkUnmapMemory(device, readback_memory);
+  dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+  dfn.vkFreeMemory(device, readback_memory, nullptr);
+  // AndroidAwaitQueueAndResumeGuestSubmission already reopened the submission.
+
+  const float mean_r =
+      sample_count ? float(sum_r / double(sample_count)) : 0.0f;
+  const float mean_g =
+      sample_count ? float(sum_g / double(sample_count)) : 0.0f;
+  const float mean_b =
+      sample_count ? float(sum_b / double(sample_count)) : 0.0f;
+  const float hdr_pct =
+      sample_count ? (100.0f * float(hdr_count) / float(sample_count)) : 0.0f;
+  if (sample_count == 0) {
+    min_r = min_g = min_b = 0.0f;
+    max_r = max_g = max_b = 0.0f;
+  }
+
+  XELOGI(
+      "HOSTDUMP_675 n={} frame={} rt={}/{}/{}/{}x vk_fmt={} crop={}x{}@{},{} "
+      "samples={} nonblack={} min_rgb=({:.5g},{:.5g},{:.5g}) "
+      "max_rgb=({:.5g},{:.5g},{:.5g}) mean_rgb=({:.5g},{:.5g},{:.5g}) "
+      "hdr_pct={:.2f}",
+      host_675_stats_log_count, command_processor_.GetCurrentSubmission(),
+      uint32_t(rt_key.base_tiles), rt_key.GetPitchTiles(),
+      rt_key.GetFormatName(), uint32_t(1) << uint32_t(rt_key.msaa_samples),
+      uint32_t(vk_format), copy_w, copy_h, copy_x, copy_y, sample_count,
+      nonblack, min_r, min_g, min_b, max_r, max_g, max_b, mean_r, mean_g,
+      mean_b, hdr_pct);
+  ++host_675_stats_log_count;
+}
+#endif  // XE_PLATFORM_ANDROID
+
 void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
                                                 uint32_t dump_row_length_used,
                                                 uint32_t dump_rows,
@@ -9282,6 +10147,60 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
                                  dump_pitch, dump_rectangles_);
+#if XE_PLATFORM_ANDROID
+  if (android_prefer_7e3_dump_675_ && dump_base == 675 && dump_pitch == 15 &&
+      dump_row_length_used && dump_rows) {
+    const auto is_7e3_owner = [](const RenderTargetKey& key) -> bool {
+      if (key.is_depth) {
+        return false;
+      }
+      const auto fmt = key.GetColorFormat();
+      return fmt == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+             fmt == xenos::ColorRenderTargetFormat::
+                       k_2_10_10_10_FLOAT_AS_16_16_16_16;
+    };
+    bool owner_is_7e3 = !dump_rectangles_.empty();
+    for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+      if (!is_7e3_owner(rectangle.render_target->key())) {
+        owner_is_7e3 = false;
+        break;
+      }
+    }
+    if (!owner_is_7e3) {
+      RenderTargetKey float_key;
+      float_key.base_tiles = 675;
+      float_key.pitch_tiles_at_32bpp = 15;
+      float_key.msaa_samples = xenos::MsaaSamples::k1X;
+      float_key.is_depth = 0;
+      float_key.resource_format =
+          uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT);
+      RenderTarget* float_rt = FindRenderTarget(float_key);
+      if (float_rt) {
+        const uint32_t prev_fmt =
+            dump_rectangles_.empty()
+                ? UINT32_MAX
+                : uint32_t(dump_rectangles_.front()
+                               .render_target->key()
+                               .resource_format);
+        dump_rectangles_.clear();
+        dump_rectangles_.emplace_back(float_rt, 0, dump_rows, 0,
+                                      dump_row_length_used);
+        static uint32_t android_prefer_7e3_dump_log_count = 0;
+        static uint32_t android_prefer_7e3_dump_apply_count = 0;
+        ++android_prefer_7e3_dump_apply_count;
+        if (android_prefer_7e3_dump_log_count < 64) {
+          XELOGI(
+              "SCENE675_DUMP_PREFER_7E3 count={} applied={} prev_owner_fmt={} "
+              "dump_rows={} row_len={}",
+              android_prefer_7e3_dump_log_count,
+              android_prefer_7e3_dump_apply_count, prev_fmt, dump_rows,
+              dump_row_length_used);
+          ++android_prefer_7e3_dump_log_count;
+        }
+      }
+    }
+  }
+#endif
   if (dump_rectangles_.empty()) {
 #if XE_PLATFORM_ANDROID
     if (cvars::halo_android_diag_log_resolve_constants && dump_base == 1350 &&
@@ -9577,6 +10496,29 @@ void VulkanRenderTargetCache::ExecutePendingDumpRectanglesToEdram(
           GetAndroidHaloExperiment().repack_mode != 0));
     pipeline_key.android_force_8888_repack =
         !rt_key.is_depth && android_halo_force_8888_repack_;
+#if XE_PLATFORM_ANDROID
+    {
+      const AndroidHaloExperiment& normalize_experiment =
+          GetAndroidHaloExperiment();
+      const bool is_7e3_owner =
+          !rt_key.is_depth &&
+          (android_owner_format ==
+               xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+           android_owner_format == xenos::ColorRenderTargetFormat::
+                                       k_2_10_10_10_FLOAT_AS_16_16_16_16);
+      pipeline_key.android_normalize_7e3 =
+          is_7e3_owner && normalize_experiment.normalize_7e3_to_rgba8_repack &&
+          !UsesScaledUNorm7e3RenderTargets();
+      // Only bake the curve when normalize is active so inactive keys stay
+      // shared across curve experiment flips that don't affect this owner.
+      pipeline_key.android_normalize_7e3_curve =
+          pipeline_key.android_normalize_7e3
+              ? std::min(
+                    normalize_experiment.normalize_7e3_to_rgba8_repack_curve,
+                    uint32_t(3))
+              : 0;
+    }
+#endif
     if (pipeline_key.source_to_1x) {
       if (android_owner_format ==
               xenos::ColorRenderTargetFormat::k_2_10_10_10 ||

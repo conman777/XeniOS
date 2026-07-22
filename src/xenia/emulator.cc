@@ -44,6 +44,9 @@
 #include "xenia/cpu/thread_state.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
+#if XE_PLATFORM_ANDROID
+#include "xenia/gpu/vulkan/android_halo_experiment.h"
+#endif
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/kernel_state.h"
@@ -1712,6 +1715,12 @@ void Emulator::MountStandardDrives() {
     }
   }
 
+#if XE_PLATFORM_ANDROID
+  const bool mount_cache1_disk_backed =
+      gpu::vulkan::GetAndroidHaloExperiment().mount_cache_disk_backed;
+#else
+  constexpr bool mount_cache1_disk_backed = false;
+#endif
   if (cvars::mount_cache) {
     auto cache0_device = std::make_unique<xe::vfs::HostPathDevice>(
         "\\CACHE0", storage_root_ / "cache0", false);
@@ -1724,7 +1733,9 @@ void Emulator::MountStandardDrives() {
         fs->RegisterSymbolicLink("cache0:", "\\CACHE0");
       }
     }
+  }
 
+  if (cvars::mount_cache || mount_cache1_disk_backed) {
     auto cache1_device = std::make_unique<xe::vfs::HostPathDevice>(
         "\\CACHE1", storage_root_ / "cache1", false);
     if (!cache1_device->Initialize()) {
@@ -1734,9 +1745,16 @@ void Emulator::MountStandardDrives() {
         XELOGE("Unable to register cache1 path");
       } else {
         fs->RegisterSymbolicLink("cache1:", "\\CACHE1");
+#if XE_PLATFORM_ANDROID
+        XELOGI(
+            "Android cache1 mount: disk_backed=1 path={} full_cache_mount={}",
+            storage_root_ / "cache1", uint32_t(cvars::mount_cache));
+#endif
       }
     }
+  }
 
+  if (cvars::mount_cache) {
     // Some (older?) games try accessing cache:\ too
     // NOTE: this must be registered _after_ the cache0/cache1 devices, due to
     // substring/start_with logic inside VirtualFileSystem::ResolvePath, else

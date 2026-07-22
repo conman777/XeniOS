@@ -9,6 +9,7 @@
 
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <set>
@@ -563,12 +564,15 @@ bool VulkanPipelineCache::ConfigurePipeline(
           description)) {
     return false;
   }
+  const uint64_t usage_sequence = ++pipeline_usage_sequence_;
   if (last_pipeline_ && last_pipeline_->first == description) {
+    last_pipeline_->second.last_used_sequence = usage_sequence;
     *pipeline_out = &last_pipeline_->second;
     return true;
   }
   auto it = pipelines_.find(description);
   if (it != pipelines_.end()) {
+    it->second.last_used_sequence = usage_sequence;
     last_pipeline_ = &*it;
     *pipeline_out = &it->second;
     return true;
@@ -624,6 +628,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
 
   auto& pipeline_pair =
       *pipelines_.emplace(description, Pipeline(pipeline_layout)).first;
+  pipeline_pair.second.last_used_sequence = usage_sequence;
 
   if (storage_writer_.is_active()) {
     VulkanShader& vs = static_cast<VulkanShader&>(vertex_shader->shader());
@@ -760,6 +765,15 @@ bool VulkanPipelineCache::ConfigurePipeline(
   return true;
 }
 
+void VulkanPipelineCache::CompletedSubmissionUpdated() {
+  ProcessDeferredDestructions();
+}
+
+size_t VulkanPipelineCache::deferred_pipeline_count() {
+  std::lock_guard<std::mutex> lock(deferred_destroy_mutex_);
+  return deferred_destroy_pipelines_.size();
+}
+
 void VulkanPipelineCache::EndSubmission() {
   if (shader_storage_file_flush_needed_ ||
       pipeline_storage_file_flush_needed_) {
@@ -862,6 +876,158 @@ void VulkanPipelineCache::ClearCache() {
   }
   XELOGW("Vulkan pipeline cache reclaimed {} guest pipelines",
          destroyed_pipeline_count);
+}
+
+size_t VulkanPipelineCache::TrimCache(size_t max_pipeline_count,
+                                      bool reset_driver_cache) {
+  const bool trim_pipeline_entries = pipelines_.size() > max_pipeline_count;
+  if (!trim_pipeline_entries && !reset_driver_cache) {
+    return 0;
+  }
+
+  // Pipeline creation requests contain pointers into pipelines_. Drain every
+  // worker before erasing map entries, even during non-blocking startup load.
+  if (!creation_threads_.empty()) {
+    bool await_creation_completion_event;
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      await_creation_completion_event =
+          !creation_queue_.empty() || creation_threads_busy_ != 0;
+      if (await_creation_completion_event) {
+        creation_completion_event_->Reset();
+        creation_completion_set_event_.store(true, std::memory_order_release);
+      }
+    }
+    if (await_creation_completion_event) {
+      creation_request_cond_.notify_one();
+      xe::threading::Wait(creation_completion_event_.get(), false);
+    }
+  }
+
+  ProcessDeferredDestructions();
+
+  std::vector<decltype(pipelines_)::iterator> pipelines_by_age;
+  pipelines_by_age.reserve(pipelines_.size());
+  for (auto it = pipelines_.begin(); it != pipelines_.end(); ++it) {
+    pipelines_by_age.push_back(it);
+  }
+  std::sort(pipelines_by_age.begin(), pipelines_by_age.end(),
+            [](const auto& a, const auto& b) {
+              if (a->second.last_used_sequence !=
+                  b->second.last_used_sequence) {
+                return a->second.last_used_sequence <
+                       b->second.last_used_sequence;
+              }
+              return a->first.GetHash() < b->first.GetHash();
+            });
+
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  const size_t pipeline_entries_to_trim =
+      trim_pipeline_entries ? pipelines_.size() - max_pipeline_count : 0;
+  size_t pipeline_handles_destroyed = 0;
+  last_pipeline_ = nullptr;
+  for (size_t i = 0; i < pipeline_entries_to_trim; ++i) {
+    auto pipeline_it = pipelines_by_age[i];
+    VkPipeline pipeline =
+        pipeline_it->second.pipeline.load(std::memory_order_acquire);
+    if (pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, pipeline, nullptr);
+      ++pipeline_handles_destroyed;
+    }
+    pipelines_.erase(pipeline_it);
+  }
+
+  if (reset_driver_cache) {
+    // This doesn't invalidate the recently used VkPipeline objects retained
+    // above, but it discards driver compiler data that can speed recreation.
+    if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipelineCache(device, vk_pipeline_cache_, nullptr);
+      vk_pipeline_cache_ = VK_NULL_HANDLE;
+    }
+    VkPipelineCacheCreateInfo pipeline_cache_create_info = {};
+    pipeline_cache_create_info.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    if (dfn.vkCreatePipelineCache(device, &pipeline_cache_create_info, nullptr,
+                                  &vk_pipeline_cache_) != VK_SUCCESS) {
+      XELOGW("VulkanPipelineCache: Failed to recreate cache after LRU trim");
+      vk_pipeline_cache_ = VK_NULL_HANDLE;
+    }
+  }
+
+  XELOGW(
+      "Vulkan pipeline LRU trim evicted {} entries ({} live handles), "
+      "retained {}, reset_driver_cache={}",
+      pipeline_entries_to_trim, pipeline_handles_destroyed, pipelines_.size(),
+      uint32_t(reset_driver_cache));
+  return pipeline_entries_to_trim;
+}
+
+size_t VulkanPipelineCache::TrimCacheAfterSubmission(
+    size_t max_pipeline_count, uint64_t submission_index) {
+  // Release handles deferred by earlier submissions before deciding how much
+  // more work is needed. This method runs on the command processor thread.
+  ProcessDeferredDestructions();
+  if (pipelines_.size() <= max_pipeline_count) {
+    return 0;
+  }
+
+  // Storage loading and asynchronous creation requests keep pointers into the
+  // map. Skip this submission rather than stalling it to drain workers.
+  std::unique_lock<std::mutex> creation_lock;
+  if (!creation_threads_.empty()) {
+    creation_lock = std::unique_lock<std::mutex>(creation_request_lock_);
+    if (!creation_queue_.empty() || creation_threads_busy_ != 0) {
+      return 0;
+    }
+  }
+
+  std::vector<decltype(pipelines_)::iterator> pipelines_by_age;
+  pipelines_by_age.reserve(pipelines_.size());
+  for (auto it = pipelines_.begin(); it != pipelines_.end(); ++it) {
+    pipelines_by_age.push_back(it);
+  }
+  std::sort(pipelines_by_age.begin(), pipelines_by_age.end(),
+            [](const auto& a, const auto& b) {
+              if (a->second.last_used_sequence !=
+                  b->second.last_used_sequence) {
+                return a->second.last_used_sequence <
+                       b->second.last_used_sequence;
+              }
+              return a->first.GetHash() < b->first.GetHash();
+            });
+
+  const size_t pipeline_entries_to_trim =
+      pipelines_.size() - max_pipeline_count;
+  size_t pipeline_handles_deferred = 0;
+  last_pipeline_ = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(deferred_destroy_mutex_);
+    for (size_t i = 0; i < pipeline_entries_to_trim; ++i) {
+      auto pipeline_it = pipelines_by_age[i];
+      VkPipeline pipeline =
+          pipeline_it->second.pipeline.load(std::memory_order_acquire);
+      if (pipeline != VK_NULL_HANDLE) {
+        deferred_destroy_pipelines_.emplace_back(pipeline, submission_index);
+        ++pipeline_handles_deferred;
+      }
+      pipelines_.erase(pipeline_it);
+    }
+  }
+
+  static uint64_t proactive_trim_sequence = 0;
+  const uint64_t trim_sequence = ++proactive_trim_sequence;
+  if (trim_sequence <= 16 || (trim_sequence & 63) == 0) {
+    XELOGW(
+        "Vulkan pipeline proactive LRU #{} evicted {} entries ({} handles "
+        "deferred), retained {}",
+        trim_sequence, pipeline_entries_to_trim, pipeline_handles_deferred,
+        pipelines_.size());
+  }
+  return pipeline_entries_to_trim;
 }
 
 bool VulkanPipelineCache::IsCreatingPipelines() {

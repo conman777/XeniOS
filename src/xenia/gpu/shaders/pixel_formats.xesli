@@ -272,6 +272,10 @@ void XePack64bpp4Pixels(float4_xe pixel_0, float4_xe pixel_1,
   switch (format) {
     case kXenosFormat_16_16_16_16_EDRAM:
     case kXenosFormat_16_16_16_16:
+      // Resolve path applies dest exp_bias (typically -5 for 7e3→fixed16) so
+      // values land in [0,1], then UNorm-packs. Guest samples as signed with
+      // matching exp_adjust. Do not switch to Edram pack without also changing
+      // the bias contract — that combination washed Reach cinematics (t120).
       packed_01.xy = XePackR16G16B16A16UNorm(pixel_0);
       packed_01.zw = XePackR16G16B16A16UNorm(pixel_1);
       packed_23.xy = XePackR16G16B16A16UNorm(pixel_2);
@@ -317,44 +321,39 @@ float4_xe XeUnpackR10G10B10A2UNorm(uint p) {
 }
 
 float4_xe XeUnpackR10FloatX4(uint4_xe p) {
-  // https://github.com/Microsoft/DirectXTex/blob/master/DirectXTex/DirectXTexConvert.cpp
   uint4_xe f10u32 = p & 0x3FFu;
   uint4_xe mantissa = f10u32 & 0x7Fu;
   uint4_xe exponent = f10u32 >> 7u;
-  // Normalize the values for the denormalized components.
-  // Exponent = 1;
-  // do { Exponent--; Mantissa <<= 1; } while ((Mantissa & 0x80) == 0);
-  bool4_xe is_denormalized = equal_xe(exponent, uint_x4_xe(0u));
-  uint4_xe mantissa_lzcnt = uint_x4_xe(7u) - first_one_bit_high_xe(mantissa);
-  exponent = select_xe(is_denormalized, (uint_x4_xe(1u) - mantissa_lzcnt),
-                       exponent);
-  mantissa = select_xe(is_denormalized, ((mantissa << mantissa_lzcnt) & 0x7Fu),
-                       mantissa);
-  // Combine into 32-bit float bits and clear zeros.
-  return uint_bits_to_float_xe(select_xe(
-      equal_xe(f10u32, uint_x4_xe(0u)), uint_x4_xe(0u),
-      ((exponent + 124u) << 23u) | (mantissa << 16u)));
+
+  // Decode arithmetically rather than reconstructing IEEE-754 bits with a
+  // bit scan and variable shifts. This is equivalent for all 1024 values and
+  // avoids a problematic integer path in some mobile Vulkan drivers.
+  float4_xe exponent_scale = float_x4_xe(0.25f);
+  exponent_scale = select_xe(equal_xe(exponent, uint_x4_xe(2u)),
+                             float_x4_xe(0.5f), exponent_scale);
+  exponent_scale = select_xe(equal_xe(exponent, uint_x4_xe(3u)),
+                             float_x4_xe(1.0f), exponent_scale);
+  exponent_scale = select_xe(equal_xe(exponent, uint_x4_xe(4u)),
+                             float_x4_xe(2.0f), exponent_scale);
+  exponent_scale = select_xe(equal_xe(exponent, uint_x4_xe(5u)),
+                             float_x4_xe(4.0f), exponent_scale);
+  exponent_scale = select_xe(equal_xe(exponent, uint_x4_xe(6u)),
+                             float_x4_xe(8.0f), exponent_scale);
+  exponent_scale = select_xe(equal_xe(exponent, uint_x4_xe(7u)),
+                             float_x4_xe(16.0f), exponent_scale);
+
+  float4_xe mantissa_float = float4_xe(mantissa);
+  float4_xe normal =
+      (float_x4_xe(1.0f) + mantissa_float * (1.0f / 128.0f)) *
+      exponent_scale;
+  float4_xe denormal = mantissa_float * (1.0f / 512.0f);
+  return select_xe(equal_xe(exponent, uint_x4_xe(0u)), denormal, normal);
 }
 
 float4_xe XeUnpackR10G10B10A2Float(uint p) {
-  // https://github.com/Microsoft/DirectXTex/blob/master/DirectXTex/DirectXTexConvert.cpp
-  uint3_xe rgb_f10u32 = (uint_x3_xe(p) >> uint3_xe(0u, 10u, 20u)) & 0x3FFu;
-  uint3_xe mantissa = rgb_f10u32 & 0x7Fu;
-  uint3_xe exponent = rgb_f10u32 >> 7u;
-  // Normalize the values for the denormalized components.
-  // Exponent = 1;
-  // do { Exponent--; Mantissa <<= 1; } while ((Mantissa & 0x80) == 0);
-  bool3_xe is_denormalized = equal_xe(exponent, uint_x3_xe(0u));
-  uint3_xe mantissa_lzcnt = uint_x3_xe(7u) - first_one_bit_high_xe(mantissa);
-  exponent = select_xe(is_denormalized, (uint_x3_xe(1u) - mantissa_lzcnt),
-                       exponent);
-  mantissa = select_xe(is_denormalized, ((mantissa << mantissa_lzcnt) & 0x7Fu),
-                       mantissa);
-  // Combine into 32-bit float bits and clear zeros.
-  uint3_xe rgb_f32u32 = select_xe(
-      equal_xe(rgb_f10u32, uint_x3_xe(0u)), uint_x3_xe(0u),
-      ((exponent + 124u) << 23u) | (mantissa << 16u));
-  return float4_xe(uint_bits_to_float_xe(rgb_f32u32),
+  uint4_xe rgb_f10u32 =
+      (uint_x4_xe(p) >> uint4_xe(0u, 10u, 20u, 0u)) & 0x3FFu;
+  return float4_xe(XeUnpackR10FloatX4(rgb_f10u32).xyz,
                    float(p >> 30u) * (1.0f / 3.0f));
 }
 
