@@ -68,6 +68,8 @@ class AudioSystem {
 
   bool is_paused() const { return paused_.load(std::memory_order_acquire); }
   void Pause();
+  bool PauseForSaveState(std::chrono::milliseconds timeout,
+                         std::string* error_message);
   void Resume();
 
  protected:
@@ -113,6 +115,7 @@ class AudioSystem {
 
   std::atomic<bool> paused_ = false;
   threading::Fence pause_fence_;
+  std::unique_ptr<threading::Event> pause_event_;
   std::unique_ptr<threading::Event> resume_event_;
 };
 

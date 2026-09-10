@@ -192,9 +192,19 @@ void CommandProcessor::Shutdown() {
   EndTracing();
 
   worker_running_ = false;
+  save_state_command_admission_.CancelWorkerParkForShutdown();
   write_ptr_index_event_->Set();
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
+  {
+    std::lock_guard<std::mutex> lock(save_state_pm4_pending_mutex_);
+    save_state_pm4_pending_admission_.Reset();
+  }
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    std::queue<PendingFunction> empty;
+    pending_fns_.swap(empty);
+  }
 }
 
 void CommandProcessor::InitializeShaderStorage(
@@ -283,12 +293,24 @@ void CommandProcessor::RestoreGammaRamp(
 }
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() &&
-      kernel::XThread::IsInThread(worker_thread_.get())) {
-    fn();
-  } else {
-    pending_fns_.push(std::move(fn));
+  auto producer_admission =
+      save_state_command_admission_.EnterPendingCallback();
+  // Callable from any thread (e.g. Android memory-pressure callbacks), so the
+  // queue must be locked against the worker thread's drain.
+  {
+    std::unique_lock<std::mutex> lock(pending_fns_mutex_);
+    if (!pending_fns_.empty() ||
+        !kernel::XThread::IsInThread(worker_thread_.get())) {
+      pending_fns_.emplace(std::move(fn), std::move(producer_admission));
+      return;
+    }
   }
+  fn();
+}
+
+bool CommandProcessor::HasPendingFns() {
+  std::unique_lock<std::mutex> lock(pending_fns_mutex_);
+  return !pending_fns_.empty();
 }
 
 void CommandProcessor::ClearCaches() {}
@@ -407,10 +429,21 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
-      fn();
+    save_state_command_admission_.PollWorkerPark();
+    if (!worker_running_) {
+      break;
+    }
+    for (;;) {
+      PendingFunction pending_function;
+      {
+        std::unique_lock<std::mutex> lock(pending_fns_mutex_);
+        if (pending_fns_.empty()) {
+          break;
+        }
+        pending_function = std::move(pending_fns_.front());
+        pending_fns_.pop();
+      }
+      pending_function.function();
     }
 
     uint32_t write_ptr_index = write_ptr_index_.load();
@@ -435,10 +468,12 @@ void CommandProcessor::WorkerThreadMain() {
         write_ptr_index = write_ptr_index_.load();
         read_ptr_index = read_ptr_index_.load(std::memory_order_relaxed);
       } while (
-          worker_running_ && pending_fns_.empty() &&
+          worker_running_ && !HasPendingFns() &&
+          !save_state_command_admission_.WorkerParkRequested() &&
           (write_ptr_index == 0xBAADF00D || read_ptr_index == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || HasPendingFns() ||
+          save_state_command_admission_.WorkerParkRequested()) {
         continue;
       }
     }
@@ -458,6 +493,7 @@ void CommandProcessor::WorkerThreadMain() {
       xe::store_and_swap<uint32_t>(
           memory_->TranslatePhysical(read_ptr_writeback_ptr), read_ptr_index);
     }
+    ReleaseSaveStatePm4AdmissionIfDrained(read_ptr_index);
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
     // but no games seem to actually use it.
@@ -481,17 +517,126 @@ void CommandProcessor::Pause() {
   fence.Wait();
 }
 
+bool CommandProcessor::PauseForSaveState(std::string* error_message) {
+  if (paused_) {
+    if (error_message) {
+      *error_message = "The command processor is already paused.";
+    }
+    return false;
+  }
+  paused_ = true;
+  save_state_pause_requested_.store(true, std::memory_order_release);
+
+  struct PauseRequest {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool canceled = false;
+    bool done = false;
+    bool prepared = false;
+    std::string error;
+  };
+  auto request = std::make_shared<PauseRequest>();
+  // Halo's Android Vulkan command stream can spend more than five seconds
+  // draining a large PM4 batch (especially immediately after restore) while
+  // still making forward progress. Keep the rendezvous bounded and
+  // cancellation-safe, but don't reject a healthy worker prematurely.
+  constexpr auto kSaveStateWorkerDeadline = std::chrono::seconds(15);
+  const auto deadline =
+      std::chrono::steady_clock::now() + kSaveStateWorkerDeadline;
+  CallInThread([this, request, deadline]() {
+    {
+      std::lock_guard<std::mutex> lock(request->mutex);
+      if (request->canceled) {
+        request->done = true;
+        request->condition.notify_all();
+        return;
+      }
+    }
+
+    std::string prepare_error;
+    const bool prepared = PrepareForSaveState(deadline, &prepare_error);
+    bool canceled = false;
+    {
+      std::lock_guard<std::mutex> lock(request->mutex);
+      canceled = request->canceled;
+      request->prepared = prepared && !canceled;
+      request->error = std::move(prepare_error);
+      request->done = true;
+    }
+    request->condition.notify_all();
+
+    if (canceled) {
+      if (prepared) {
+        ResumeAfterSaveState();
+        SetSaveStateEdramSnapshot({});
+      }
+      return;
+    }
+    if (prepared) {
+      threading::Thread::GetCurrentThread()->Suspend();
+    }
+  });
+
+  bool prepared = false;
+  std::string prepare_error;
+  {
+    std::unique_lock<std::mutex> lock(request->mutex);
+    if (!request->condition.wait_until(
+            lock, deadline, [&request]() { return request->done; })) {
+      request->canceled = true;
+      save_state_pause_requested_.store(false, std::memory_order_release);
+      paused_ = false;
+      if (error_message) {
+        *error_message =
+            "The GPU command worker did not reach a safe boundary in time.";
+      }
+      return false;
+    }
+    prepared = request->prepared;
+    prepare_error = std::move(request->error);
+  }
+  if (!prepared) {
+    save_state_pause_requested_.store(false, std::memory_order_release);
+    paused_ = false;
+    if (error_message) {
+      *error_message = prepare_error.empty()
+                           ? "The GPU did not reach a safe save boundary."
+                           : std::move(prepare_error);
+    }
+    return false;
+  }
+  paused_for_save_state_ = true;
+  return true;
+}
+
+bool CommandProcessor::PrepareForSaveState(
+    std::chrono::steady_clock::time_point deadline,
+    std::string* error_message) {
+  if (error_message) {
+    *error_message = "The active graphics backend does not support safe saves.";
+  }
+  return false;
+}
+
 void CommandProcessor::Resume() {
   if (!paused_) {
     return;
   }
   paused_ = false;
+  save_state_pause_requested_.store(false, std::memory_order_release);
 
   worker_thread_->thread()->Resume();
+  if (paused_for_save_state_) {
+    paused_for_save_state_ = false;
+    ResumeAfterSaveState();
+  }
 }
 
 bool CommandProcessor::Save(ByteStream* stream) {
   assert_true(paused_);
+
+  constexpr uint32_t kCommandProcessorSaveSignature = 0x32555047;  // GPU2
+  stream->Write<uint32_t>(kCommandProcessorSaveSignature);
 
   stream->Write<uint32_t>(primary_buffer_ptr_.load(std::memory_order_relaxed));
   stream->Write<uint32_t>(primary_buffer_size_.load(std::memory_order_relaxed));
@@ -502,11 +647,28 @@ bool CommandProcessor::Save(ByteStream* stream) {
       read_ptr_writeback_ptr_.load(std::memory_order_relaxed));
   stream->Write<uint32_t>(write_ptr_index_.load());
 
-  return true;
+  stream->Write(register_file_->values,
+                sizeof(uint32_t) * RegisterFile::kRegisterCount);
+  stream->Write(gamma_ramp_256_entry_table_,
+                sizeof(gamma_ramp_256_entry_table_));
+  stream->Write(gamma_ramp_pwl_rgb_, sizeof(gamma_ramp_pwl_rgb_));
+  stream->Write<uint32_t>(gamma_ramp_rw_component_);
+  stream->Write<uint32_t>(uint32_t(save_state_edram_snapshot_.size()));
+  if (!save_state_edram_snapshot_.empty()) {
+    stream->Write(save_state_edram_snapshot_.data(),
+                  save_state_edram_snapshot_.size());
+  }
+
+  return !save_state_edram_snapshot_.empty();
 }
 
 bool CommandProcessor::Restore(ByteStream* stream) {
   assert_true(paused_);
+
+  constexpr uint32_t kCommandProcessorSaveSignature = 0x32555047;  // GPU2
+  if (stream->Read<uint32_t>() != kCommandProcessorSaveSignature) {
+    return false;
+  }
 
   primary_buffer_ptr_.store(stream->Read<uint32_t>(),
                             std::memory_order_relaxed);
@@ -519,7 +681,22 @@ bool CommandProcessor::Restore(ByteStream* stream) {
                                 std::memory_order_relaxed);
   write_ptr_index_.store(stream->Read<uint32_t>());
 
-  return true;
+  stream->Read(register_file_->values,
+               sizeof(uint32_t) * RegisterFile::kRegisterCount);
+  stream->Read(gamma_ramp_256_entry_table_,
+               sizeof(gamma_ramp_256_entry_table_));
+  stream->Read(gamma_ramp_pwl_rgb_, sizeof(gamma_ramp_pwl_rgb_));
+  gamma_ramp_rw_component_ = stream->Read<uint32_t>();
+  const uint32_t edram_size = stream->Read<uint32_t>();
+  if (edram_size != xenos::kEdramSizeBytes) {
+    return false;
+  }
+  save_state_edram_snapshot_.resize(edram_size);
+  stream->Read(save_state_edram_snapshot_.data(),
+               save_state_edram_snapshot_.size());
+  RestoreGammaRamp(gamma_ramp_256_entry_table_, gamma_ramp_pwl_rgb_[0],
+                   gamma_ramp_rw_component_);
+  return RestoreSaveStateEdramSnapshot(save_state_edram_snapshot_.data());
 }
 
 bool CommandProcessor::SetupContext() { return true; }
@@ -527,6 +704,11 @@ bool CommandProcessor::SetupContext() { return true; }
 void CommandProcessor::ShutdownContext() {}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+  auto producer_admission =
+      save_state_command_admission_.EnterPm4Producer();
+  std::lock_guard<std::mutex> pending_lock(
+      save_state_pm4_pending_mutex_);
+  save_state_pm4_pending_admission_.Reset();
   read_ptr_index_.store(0, std::memory_order_relaxed);
   const uint32_t buffer_ptr = ptr;
   const uint32_t buffer_size = uint32_t(1) << (size_log2 + 3);
@@ -539,6 +721,8 @@ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr,
                                                   uint32_t block_size_log2) {
+  auto producer_admission =
+      save_state_command_admission_.EnterPm4Producer();
   // CP_RB_RPTR_ADDR Ring Buffer Read Pointer Address 0x70C
   // ptr = RB_RPTR_ADDR, pointer to write back the address to.
   read_ptr_writeback_ptr_.store(ptr, std::memory_order_relaxed);
@@ -572,11 +756,30 @@ XE_NOINLINE XE_COLD void CommandProcessor::LogKickoffInitator(uint32_t value) {
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
+  auto producer_admission =
+      save_state_command_admission_.EnterPm4Producer();
   XE_UNLIKELY_IF(cvars::log_ringbuffer_kickoff_initiator_bts) {
     LogKickoffInitator(value);
   }
-  write_ptr_index_ = value;
+  {
+    std::lock_guard<std::mutex> lock(save_state_pm4_pending_mutex_);
+    register_file_->values[0x01C5] = value;
+    write_ptr_index_ = value;
+    if (read_ptr_index_.load(std::memory_order_acquire) == value) {
+      save_state_pm4_pending_admission_.Reset();
+    } else if (!save_state_pm4_pending_admission_) {
+      save_state_pm4_pending_admission_ = std::move(producer_admission);
+    }
+  }
   write_ptr_index_event_->SetBoostPriority();
+}
+
+void CommandProcessor::ReleaseSaveStatePm4AdmissionIfDrained(
+    uint32_t read_ptr_index) {
+  std::lock_guard<std::mutex> lock(save_state_pm4_pending_mutex_);
+  if (write_ptr_index_.load(std::memory_order_acquire) == read_ptr_index) {
+    save_state_pm4_pending_admission_.Reset();
+  }
 }
 
 void CommandProcessor::LogRegisterSet(uint32_t register_index, uint32_t value) {

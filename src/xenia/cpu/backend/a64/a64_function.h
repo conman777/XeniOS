@@ -31,6 +31,12 @@ class A64Function : public GuestFunction {
   size_t machine_code_length() const override {
     return machine_code_length_.load(std::memory_order_acquire);
   }
+  uint32_t host_stack_size() const {
+    return host_stack_size_.load(std::memory_order_acquire);
+  }
+  void set_host_stack_size(uint32_t value) {
+    host_stack_size_.store(value, std::memory_order_release);
+  }
 
   void Setup(uint8_t* machine_code, size_t machine_code_length);
 
@@ -40,6 +46,7 @@ class A64Function : public GuestFunction {
  private:
   std::atomic<uint8_t*> machine_code_{nullptr};
   std::atomic<size_t> machine_code_length_{0};
+  std::atomic<uint32_t> host_stack_size_{0};
 };
 
 }  // namespace a64

@@ -250,7 +250,7 @@ X_HRESULT_result_t XamInputNonControllerGetRaw_entry(
   auto input_system = kernel_state()->emulator()->input_system();
 
   std::vector<uint8_t> data(data_size, 0);
-  const auto result = input_system->GetSkylanderPortal()->read(data);
+  const auto result = input_system->ReadSkylanderPortal(data);
   *state_ptr = 1;
   memcpy(buffer_ptr, data.data(), data.size());
 
@@ -269,7 +269,7 @@ X_HRESULT_result_t XamInputNonControllerSetRaw_entry(dword_t buffer_length,
   std::vector<uint8_t> data(buffer_length, 0);
   memcpy(data.data(), buffer_ptr, buffer_length);
 
-  return input_system->GetSkylanderPortal()->write(data);
+  return input_system->WriteSkylanderPortal(data);
 }
 DECLARE_XAM_EXPORT1(XamInputNonControllerSetRaw, kInput, kStub);
 

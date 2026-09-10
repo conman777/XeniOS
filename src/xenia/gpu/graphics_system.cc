@@ -182,6 +182,24 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
 #endif
 
             while (frame_limiter_worker_running_) {
+              {
+                std::unique_lock<std::mutex> lock(
+                    frame_limiter_save_state_mutex_);
+                if (frame_limiter_save_state_pause_requested_) {
+                  frame_limiter_save_state_paused_ = true;
+                  frame_limiter_save_state_condition_.notify_all();
+                  frame_limiter_save_state_condition_.wait(lock, [this]() {
+                    return !frame_limiter_save_state_pause_requested_ ||
+                           !frame_limiter_worker_running_;
+                  });
+                  frame_limiter_save_state_paused_ = false;
+                  frame_limiter_save_state_condition_.notify_all();
+                  if (!frame_limiter_worker_running_) {
+                    break;
+                  }
+                }
+              }
+
               // Read guest_display_refresh_cap cvar each frame to allow
               // runtime changes
               // true: Fire vblanks at fixed rate (50Hz PAL, 60Hz NTSC)
@@ -253,6 +271,11 @@ void GraphicsSystem::Shutdown() {
   // Stop vblank generation before destroying the command processor it touches.
   if (frame_limiter_worker_thread_) {
     frame_limiter_worker_running_ = false;
+    {
+      std::lock_guard<std::mutex> lock(frame_limiter_save_state_mutex_);
+      frame_limiter_save_state_pause_requested_ = false;
+    }
+    frame_limiter_save_state_condition_.notify_all();
     frame_limiter_worker_thread_->Wait(0, 0, 0, nullptr);
     frame_limiter_worker_thread_.reset();
   }
@@ -334,7 +357,7 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
   switch (r) {
     case 0x01C5:  // CP_RB_WPTR
       command_processor_->UpdateWritePointer(value);
-      break;
+      return;
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
       break;
     default:
@@ -391,6 +414,11 @@ void GraphicsSystem::InvalidateGpuMemory() {
       [&]() { command_processor_->InvalidateGpuMemory(); });
 }
 
+void GraphicsSystem::BeginPostRestoreWarmup() {
+  command_processor_->CallInThread(
+      [&]() { command_processor_->BeginPostRestoreWarmup(); });
+}
+
 void GraphicsSystem::InitializeShaderStorage(
     const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
     std::function<void()> completion_callback) {
@@ -443,10 +471,52 @@ void GraphicsSystem::Pause() {
   command_processor_->Pause();
 }
 
+bool GraphicsSystem::PauseForSaveState(std::string* error_message) {
+  if (paused_) {
+    if (error_message) {
+      *error_message = "The graphics system is already paused.";
+    }
+    return false;
+  }
+  // Keep vblank delivery live while the command processor drains. PM4 may be
+  // inside WAIT_REG_MEM for a value advanced by the vblank worker; parking
+  // vblank first makes that wait unsatisfiable and prevents the worker from
+  // ever reaching its save callback.
+  if (!command_processor_->PauseForSaveState(error_message)) {
+    return false;
+  }
+  {
+    std::unique_lock<std::mutex> lock(frame_limiter_save_state_mutex_);
+    frame_limiter_save_state_pause_requested_ = true;
+    frame_limiter_save_state_condition_.notify_all();
+    if (!frame_limiter_save_state_condition_.wait_for(
+            lock, std::chrono::seconds(5), [this]() {
+              return frame_limiter_save_state_paused_;
+            })) {
+      frame_limiter_save_state_pause_requested_ = false;
+      lock.unlock();
+      frame_limiter_save_state_condition_.notify_all();
+      if (error_message) {
+        *error_message =
+            "The vblank interrupt worker did not reach a safe boundary.";
+      }
+      command_processor_->Resume();
+      return false;
+    }
+  }
+  paused_ = true;
+  return true;
+}
+
 void GraphicsSystem::Resume() {
   paused_ = false;
 
   command_processor_->Resume();
+  {
+    std::lock_guard<std::mutex> lock(frame_limiter_save_state_mutex_);
+    frame_limiter_save_state_pause_requested_ = false;
+  }
+  frame_limiter_save_state_condition_.notify_all();
 }
 
 bool GraphicsSystem::Save(ByteStream* stream) {

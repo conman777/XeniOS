@@ -21,6 +21,7 @@
 
 #include "xenia/base/memory.h"
 #include "xenia/base/mutex.h"
+#include "xenia/cpu/backend/a64/a64_code_generation.h"
 #include "xenia/cpu/backend/code_cache.h"
 
 namespace xe {
@@ -90,6 +91,33 @@ class A64CodeCache : public CodeCache {
   uint32_t PlaceData(const void* data, size_t length);
 
   GuestFunction* LookupFunction(uint64_t host_pc) override;
+
+  // Finds an exact guest source-map entry only among already published
+  // functions. This holds the code-cache lock and never resolves, compiles, or
+  // writes an indirection.
+  bool LookupExistingGuestCode(uint32_t guest_pc, uintptr_t* host_entry,
+                               uint32_t* host_stack_size);
+
+  // The assembler must hold this across the complete publication lifetime,
+  // from before emitter placement through source-map/function setup and
+  // indirection installation.
+  A64CodeGenerationGate::PublicationLease BeginCodePublication() {
+    return code_generation_gate_.BeginPublication();
+  }
+
+  bool AcquireCodeGenerationFreeze(std::chrono::milliseconds timeout,
+                                   uint64_t* generation) {
+    return code_generation_gate_.AcquireFreeze(timeout, generation);
+  }
+  bool ValidateCodeGenerationFreeze(uint64_t generation) const {
+    return code_generation_gate_.ValidateFreeze(generation);
+  }
+  bool ReleaseCodeGenerationFreeze(uint64_t generation) {
+    return code_generation_gate_.ReleaseFreeze(generation);
+  }
+  bool LookupExistingGuestCodeFrozen(uint64_t generation, uint32_t guest_pc,
+                                     uintptr_t* host_entry,
+                                     uint32_t* host_stack_size);
 
   // Access to indirection table base for emitter
   uint8_t* indirection_table_base() const { return indirection_table_base_; }
@@ -229,6 +257,8 @@ class A64CodeCache : public CodeCache {
   // This can be used to bsearch on host PC to find the guest function.
   // The key is [start address | end address].
   std::vector<std::pair<uint64_t, GuestFunction*>> generated_code_map_;
+
+  A64CodeGenerationGate code_generation_gate_;
 };
 
 }  // namespace a64

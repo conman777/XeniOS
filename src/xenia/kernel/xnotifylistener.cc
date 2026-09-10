@@ -20,7 +20,15 @@ namespace kernel {
 XNotifyListener::XNotifyListener(KernelState* kernel_state)
     : XObject(kernel_state, kObjectType) {}
 
-XNotifyListener::~XNotifyListener() {}
+XNotifyListener::~XNotifyListener() {
+  if (!kernel_state_ || notifications_.empty()) {
+    return;
+  }
+  auto notification_admission =
+      kernel_state_->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kNotification);
+  notification_admission.RecordDequeued(notifications_.size());
+}
 
 void XNotifyListener::Initialize(uint64_t mask, uint32_t max_version) {
   assert_false(wait_handle_);
@@ -34,6 +42,9 @@ void XNotifyListener::Initialize(uint64_t mask, uint32_t max_version) {
 }
 
 void XNotifyListener::EnqueueNotification(XNotificationID id, uint32_t data) {
+  auto notification_admission =
+      kernel_state()->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kNotification);
   auto key = XNotificationKey(id);
   // Ignore if the notification doesn't match our mask.
   if ((mask_ & uint64_t(1ULL << key.mask_index)) == 0) {
@@ -45,11 +56,15 @@ void XNotifyListener::EnqueueNotification(XNotificationID id, uint32_t data) {
   }
   auto global_lock = global_critical_region_.Acquire();
   notifications_.push_back(std::pair<XNotificationID, uint32_t>(id, data));
+  notification_admission.RecordEnqueued();
   wait_handle_->Set();
 }
 
 bool XNotifyListener::DequeueNotification(XNotificationID* out_id,
                                           uint32_t* out_data) {
+  auto notification_admission =
+      kernel_state()->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kNotification);
   auto global_lock = global_critical_region_.Acquire();
   bool dequeued = false;
   if (notifications_.size()) {
@@ -58,6 +73,7 @@ bool XNotifyListener::DequeueNotification(XNotificationID* out_id,
     *out_id = it->first;
     *out_data = it->second;
     notifications_.erase(it);
+    notification_admission.RecordDequeued();
     if (!notifications_.size()) {
       wait_handle_->Reset();
     }
@@ -67,6 +83,9 @@ bool XNotifyListener::DequeueNotification(XNotificationID* out_id,
 
 bool XNotifyListener::DequeueNotification(XNotificationID id,
                                           uint32_t* out_data) {
+  auto notification_admission =
+      kernel_state()->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kNotification);
   auto global_lock = global_critical_region_.Acquire();
   if (!notifications_.size()) {
     return false;
@@ -79,6 +98,7 @@ bool XNotifyListener::DequeueNotification(XNotificationID id,
     dequeued = true;
     *out_data = it->second;
     notifications_.erase(it);
+    notification_admission.RecordDequeued();
     if (!notifications_.size()) {
       wait_handle_->Reset();
     }

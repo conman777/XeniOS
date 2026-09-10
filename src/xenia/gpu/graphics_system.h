@@ -11,6 +11,7 @@
 #define XENIA_GPU_GRAPHICS_SYSTEM_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -97,6 +98,7 @@ class GraphicsSystem {
   virtual void ClearCaches();
 
   void InvalidateGpuMemory();
+  void BeginPostRestoreWarmup();
 
   void InitializeShaderStorage(
       const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
@@ -108,6 +110,7 @@ class GraphicsSystem {
 
   bool is_paused() const { return paused_; }
   void Pause();
+  bool PauseForSaveState(std::string* error_message);
   void Resume();
 
   bool Save(ByteStream* stream);
@@ -148,6 +151,10 @@ class GraphicsSystem {
 
   std::atomic<bool> frame_limiter_worker_running_;
   kernel::object_ref<kernel::XHostThread> frame_limiter_worker_thread_;
+  std::mutex frame_limiter_save_state_mutex_;
+  std::condition_variable frame_limiter_save_state_condition_;
+  bool frame_limiter_save_state_pause_requested_ = false;
+  bool frame_limiter_save_state_paused_ = false;
 
   RegisterFile* register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;

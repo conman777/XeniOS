@@ -9,6 +9,7 @@
 
 #include "xenia/base/mapped_memory.h"
 
+#include <algorithm>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -135,6 +136,12 @@ class PosixMappedMemory : public MappedMemory {
 
   void Flush() override { msync(data(), size(), MS_ASYNC); }
   void FlushSync() override { msync(data(), size(), MS_SYNC); }
+  void FlushSync(size_t offset, size_t length) override {
+    if (offset >= size() || !length) {
+      return;
+    }
+    msync(data() + offset, std::min(length, size() - offset), MS_SYNC);
+  }
 
  private:
   int file_descriptor_;

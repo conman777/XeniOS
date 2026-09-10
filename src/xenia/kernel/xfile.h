@@ -142,6 +142,11 @@ class XFile : public XObject {
 
   const std::string& path() const { return file_->entry()->path(); }
   const std::string& name() const { return file_->entry()->name(); }
+  // Keep the path independently of the VFS entry. Host-backed entries may be
+  // removed from the directory tree by delete-on-close while another guest
+  // handle is still alive, so diagnostics must not dereference the entry just
+  // to identify the file.
+  const std::string& absolute_path() const { return absolute_path_; }
 
   uint64_t position() const { return position_; }
   void set_position(uint64_t value) { position_ = value; }
@@ -191,6 +196,7 @@ class XFile : public XObject {
                         uint32_t apc_context, bool notify_completion);
 
   vfs::File* file_ = nullptr;
+  std::string absolute_path_;
   std::unique_ptr<threading::Event> async_event_ = nullptr;
 
   std::mutex file_lock_;

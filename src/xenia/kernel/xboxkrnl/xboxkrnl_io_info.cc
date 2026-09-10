@@ -340,6 +340,21 @@ dword_result_t NtSetInformationFile_entry(
     return X_STATUS_INVALID_HANDLE;
   }
 
+  const bool mutates_vfs =
+      info_class == XFileBasicInformation ||
+      info_class == XFileRenameInformation ||
+      info_class == XFileDispositionInformation ||
+      info_class == XFileAllocationInformation ||
+      info_class == XFileEndOfFileInformation;
+  ReversibleAdmissionGate::Lease kernel_completion_admission;
+  ReversibleAdmissionGate::Lease vfs_write_admission;
+  if (mutates_vfs) {
+    kernel_completion_admission =
+        kernel_state()->AcquireSaveStateKernelDispatchTimerAdmission();
+    vfs_write_admission =
+        kernel_state()->file_system()->AcquireSaveStateGuestWriteAdmission();
+  }
+
   X_STATUS result = X_STATUS_SUCCESS;
   uint32_t out_length;
   uint64_t log_value0 = 0;
@@ -475,18 +490,18 @@ dword_result_t NtSetInformationFile_entry(
   }
 
   if (info_class == XFilePositionInformation) {
-    TrackHaloFilePosition(file->entry()->absolute_path(), result,
-                          position_before, file->position());
+    TrackHaloFilePosition(file->absolute_path(), result, position_before,
+                          file->position());
   }
 
-  if (ShouldLogHaloIoInfoPath(file->entry()->absolute_path()) &&
+  if (ShouldLogHaloIoInfoPath(file->absolute_path()) &&
       (cvars::halo_android_io_verbose || XFAILED(result) ||
        info_class != XFilePositionInformation)) {
     XELOGI(
         "HaloReach NtSetInformationFile path='{}' class={}({}) "
         "result=0x{:08X} info=0x{:X} {}=0x{:X} {}=0x{:X} "
         "pos=0x{:X}->0x{:X} size=0x{:X}",
-        file->entry()->absolute_path(), static_cast<uint32_t>(info_class),
+        file->absolute_path(), static_cast<uint32_t>(info_class),
         FileInformationClassName(info_class), static_cast<uint32_t>(result),
         out_length, log_value0_name, log_value0, log_value1_name, log_value1,
         position_before, file->position(), file->entry()->size());

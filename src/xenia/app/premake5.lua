@@ -61,6 +61,7 @@ project("xenia-app")
       "../ui/windowed_app_main_qt.cc",
     })
   filter("platforms:Android-*")
+    links({ "OpenSLES" })
     files({
       "../ui/windowed_app_main_android.cc",
     })

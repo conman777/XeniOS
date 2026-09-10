@@ -10,6 +10,7 @@
 #include "xenia/emulator.h"
 
 #include <algorithm>
+#include <chrono>
 #include "config.h"
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/tabulate/single_include/tabulate/tabulate.hpp"
@@ -30,6 +31,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
 #include "xenia/base/system.h"
+#include "xenia/base/xxhash.h"
 #if XE_PLATFORM_IOS
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -1515,6 +1517,64 @@ void Emulator::Pause() {
   XELOGD("! EMULATOR PAUSED !");
 }
 
+bool Emulator::PauseForSaveState(std::string* error_message) {
+  if (paused_) {
+    if (error_message) {
+      *error_message = "The emulator is already paused.";
+    }
+    return false;
+  }
+  paused_ = true;
+
+  // Stop guest producers before asking the command processor to close its
+  // current Vulkan submission. Host threads (including the GPU worker) are
+  // intentionally excluded.
+  XELOGI("Diagnostic save state: pausing audio");
+  if (!audio_system_->PauseForSaveState(std::chrono::seconds(5),
+                                        error_message)) {
+    paused_ = false;
+    return false;
+  }
+  // Drain GPU work while the guest can still satisfy memory waits already in
+  // the command stream. The command ingress remains represented by the saved
+  // ring indices; CPU execution is stopped immediately after the worker parks.
+  XELOGI("Diagnostic save state: quiescing graphics");
+  if (!graphics_system_->PauseForSaveState(error_message)) {
+    Resume();
+    return false;
+  }
+  XELOGI("Diagnostic save state: acquiring guest CPU safe points");
+  if (!processor_->AcquireSaveStateBoundary(std::chrono::seconds(5),
+                                            error_message)) {
+    Resume();
+    return false;
+  }
+  XELOGI("Diagnostic save state: parking kernel dispatch");
+  if (!kernel_state_->PauseDispatchWorkerForSaveState(
+          std::chrono::seconds(5), error_message)) {
+    Resume();
+    return false;
+  }
+  XELOGI("Diagnostic save state: parking kernel timestamp updates");
+  if (!kernel_state_->PauseTimestampUpdatesForSaveState(
+          std::chrono::seconds(5), error_message)) {
+    Resume();
+    return false;
+  }
+  GuestClockState frozen_clock;
+  if (!Clock::FreezeGuestTime(&frozen_clock)) {
+    if (error_message) {
+      *error_message = "The guest clock could not be frozen.";
+    }
+    Resume();
+    return false;
+  }
+  save_state_guest_clock_frozen_ = true;
+  XELOGI("Diagnostic save state: all live producers quiesced");
+  XELOGD("! EMULATOR PAUSED FOR DIAGNOSTIC SAVE !");
+  return true;
+}
+
 void Emulator::Resume() {
   if (!paused_) {
     return;
@@ -1524,6 +1584,13 @@ void Emulator::Resume() {
 
   graphics_system_->Resume();
   audio_system_->Resume();
+  if (save_state_guest_clock_frozen_) {
+    Clock::UnfreezeGuestTime();
+    save_state_guest_clock_frozen_ = false;
+  }
+  kernel_state_->ResumeTimestampUpdatesAfterSaveState();
+  kernel_state_->ResumeDispatchWorkerAfterSaveState();
+  processor_->ReleaseSaveStateBoundary();
 
   auto threads =
       kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(
@@ -1534,97 +1601,298 @@ void Emulator::Resume() {
       continue;
     }
 
-    if (!thread->is_running()) {
+    // Running guest threads are host-created in a suspended state by
+    // XThread::Restore. Non-running saved threads intentionally have no host
+    // thread and must not be dereferenced here.
+    if (thread->is_running() && thread->thread()) {
       thread->thread()->Resume(nullptr);
     }
   }
 }
 
-bool Emulator::SaveToFile(const std::filesystem::path& path) {
-  Pause();
+bool Emulator::SaveToFile(const std::filesystem::path& path,
+                          std::string* error_message) {
+  std::filesystem::path temporary_path = path;
+  temporary_path += ".tmp";
+  std::error_code file_error;
+  std::filesystem::remove(temporary_path, file_error);
 
-  filesystem::CreateEmptyFile(path);
-  auto map = MappedMemory::Open(path, MappedMemory::Mode::kReadWrite, 0, 2_GiB);
-  if (!map) {
+  std::string pause_error;
+  if (!PauseForSaveState(&pause_error)) {
+    if (error_message) {
+      *error_message = std::move(pause_error);
+    }
     return false;
   }
 
-  // Save the emulator state to a file
+  if (!filesystem::CreateEmptyFile(temporary_path)) {
+    Resume();
+    if (error_message) {
+      *error_message = "Could not create the temporary save-state file.";
+    }
+    return false;
+  }
+  auto map = MappedMemory::Open(temporary_path, MappedMemory::Mode::kReadWrite,
+                                0, 2_GiB);
+  if (!map) {
+    Resume();
+    std::filesystem::remove(temporary_path, file_error);
+    if (error_message) {
+      *error_message = "Could not map the temporary save-state file.";
+    }
+    return false;
+  }
+
+  constexpr uint32_t kDiagnosticSaveVersion = 6;
   ByteStream stream(map->data(), map->size());
   stream.Write(kEmulatorSaveSignature);
+  stream.Write<uint32_t>(kDiagnosticSaveVersion);
+  const size_t payload_size_offset = stream.offset();
+  stream.Write<uint64_t>(0);
+  const size_t payload_hash_offset = stream.offset();
+  stream.Write<uint64_t>(0);
+  const size_t payload_offset = stream.offset();
   stream.Write(title_id_.has_value());
   if (title_id_.has_value()) {
     stream.Write(title_id_.value());
   }
 
-  // It's important we don't hold the global lock here! XThreads need to step
-  // forward (possibly through guarded regions) without worry!
-  processor_->Save(&stream);
-  graphics_system_->Save(&stream);
-  audio_system_->Save(&stream);
-  kernel_state_->Save(&stream);
-  memory_->Save(&stream);
-  map->Close(stream.offset());
+  GuestClockState frozen_clock;
+  if (!Clock::CaptureFrozenGuestTime(&frozen_clock)) {
+    map.reset();
+    std::filesystem::remove(temporary_path, file_error);
+    Resume();
+    if (error_message) {
+      *error_message = "The frozen guest clock could not be captured.";
+    }
+    return false;
+  }
+  stream.Write<uint64_t>(frozen_clock.guest_tick_count);
+  stream.Write<uint64_t>(frozen_clock.guest_tick_frequency);
+  stream.Write<uint64_t>(frozen_clock.tick_ratio_numerator);
+  stream.Write<uint64_t>(frozen_clock.tick_ratio_denominator);
+  stream.Write<uint64_t>(frozen_clock.guest_system_time_base);
+  stream.Write<uint64_t>(frozen_clock.guest_interrupt_time);
+  stream.Write<double>(frozen_clock.guest_time_scalar);
 
+  auto save_phase = [&stream](const char* name, auto&& save) {
+    const size_t start_offset = stream.offset();
+    const auto started_at = std::chrono::steady_clock::now();
+    XELOGI("Diagnostic save state: serializing {}", name);
+    const bool success = save();
+    const auto duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started_at)
+            .count();
+    XELOGI(
+        "Diagnostic save state: serialized {} success={} bytes={} "
+        "duration_ms={}",
+        name, success, stream.offset() - start_offset, duration_ms);
+    return success;
+  };
+  const bool saved =
+      save_phase("processor", [&] { return processor_->Save(&stream); }) &&
+      save_phase("graphics", [&] { return graphics_system_->Save(&stream); }) &&
+      save_phase("audio", [&] { return audio_system_->Save(&stream); }) &&
+      save_phase("kernel", [&] { return kernel_state_->Save(&stream); }) &&
+      save_phase("memory", [&] { return memory_->Save(&stream); });
+  if (!saved) {
+    map.reset();
+    std::filesystem::remove(temporary_path, file_error);
+    Resume();
+    if (error_message) {
+      *error_message = "A subsystem rejected the diagnostic save.";
+    }
+    return false;
+  }
+  const uint64_t payload_size = stream.offset() - payload_offset;
+  auto hash_started_at = std::chrono::steady_clock::now();
+  XELOGI("Diagnostic save state: hashing payload bytes={}", payload_size);
+  const uint64_t payload_hash =
+      XXH3_64bits(map->data() + payload_offset, size_t(payload_size));
+  XELOGI(
+      "Diagnostic save state: hashed payload duration_ms={}",
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - hash_started_at)
+          .count());
+  std::memcpy(map->data() + payload_size_offset, &payload_size,
+              sizeof(payload_size));
+  std::memcpy(map->data() + payload_hash_offset, &payload_hash,
+              sizeof(payload_hash));
+  auto flush_started_at = std::chrono::steady_clock::now();
+  XELOGI("Diagnostic save state: flushing bytes={}", stream.offset());
+  map->FlushSync(0, stream.offset());
+  XELOGI(
+      "Diagnostic save state: flushed duration_ms={}",
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - flush_started_at)
+          .count());
+  map->Close(stream.offset());
+  map.reset();
   Resume();
+
+#if XE_PLATFORM_WIN32
+  // std::filesystem::rename doesn't replace on Windows. The diagnostic UI is
+  // Android-only, but retain predictable behavior for developer invocations.
+  std::filesystem::remove(path, file_error);
+  file_error.clear();
+#endif
+  std::filesystem::rename(temporary_path, path, file_error);
+  if (file_error) {
+    if (error_message) {
+      *error_message = "The completed save could not be published: " +
+                       file_error.message();
+    }
+    return false;
+  }
   return true;
 }
 
-bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
-  // Restore the emulator state from a file
-  auto map = MappedMemory::Open(path, MappedMemory::Mode::kReadWrite);
+bool Emulator::RestoreFromFile(const std::filesystem::path& path,
+                               std::string* error_message) {
+  auto map = MappedMemory::Open(path, MappedMemory::Mode::kRead);
   if (!map) {
+    if (error_message) {
+      *error_message = "The diagnostic save slot could not be opened.";
+    }
     return false;
   }
 
-  restoring_ = true;
+  constexpr size_t kDiagnosticSaveHeaderSize =
+      sizeof(uint32_t) * 2 + sizeof(uint64_t) * 2;
+  if (map->size() < kDiagnosticSaveHeaderSize + sizeof(bool)) {
+    if (error_message) {
+      *error_message = "The diagnostic save is incomplete or corrupted.";
+    }
+    return false;
+  }
 
-  // Terminate any loaded titles.
-  Pause();
-  kernel_state_->TerminateTitle();
-
-  auto lock = global_critical_region::AcquireDirect();
   ByteStream stream(map->data(), map->size());
   if (stream.Read<uint32_t>() != kEmulatorSaveSignature) {
+    if (error_message) {
+      *error_message = "The file is not a XeniOS diagnostic save.";
+    }
+    return false;
+  }
+  constexpr uint32_t kDiagnosticSaveVersion = 6;
+  if (stream.Read<uint32_t>() != kDiagnosticSaveVersion) {
+    if (error_message) {
+      *error_message = "The diagnostic save version is not supported.";
+    }
+    return false;
+  }
+  const uint64_t payload_size = stream.Read<uint64_t>();
+  const uint64_t payload_hash = stream.Read<uint64_t>();
+  const size_t payload_offset = stream.offset();
+  constexpr uint64_t kSavedClockSize = sizeof(uint64_t) * 6 + sizeof(double);
+  if (payload_size < sizeof(bool) + kSavedClockSize ||
+      payload_size > map->size() - payload_offset ||
+      XXH3_64bits(map->data() + payload_offset, size_t(payload_size)) !=
+          payload_hash) {
+    if (error_message) {
+      *error_message = "The diagnostic save is incomplete or corrupted.";
+    }
     return false;
   }
 
-  auto has_title_id = stream.Read<bool>();
+  const bool has_title_id = stream.Read<bool>();
   std::optional<uint32_t> title_id;
-  if (!has_title_id) {
-    title_id = {};
-  } else {
+  if (has_title_id) {
+    if (payload_size < sizeof(bool) + sizeof(uint32_t) + kSavedClockSize) {
+      if (error_message) {
+        *error_message = "The diagnostic save is incomplete or corrupted.";
+      }
+      return false;
+    }
     title_id = stream.Read<uint32_t>();
   }
   if (title_id_.has_value() != title_id.has_value() ||
-      title_id_.value() != title_id.value()) {
-    // Swapping between titles is unsupported at the moment.
-    assert_always();
+      (title_id_.has_value() && title_id_.value() != title_id.value())) {
+    if (error_message) {
+      *error_message =
+          "The save belongs to a different title and cannot be restored.";
+    }
     return false;
   }
 
+  GuestClockState saved_clock;
+  saved_clock.guest_tick_count = stream.Read<uint64_t>();
+  saved_clock.guest_tick_frequency = stream.Read<uint64_t>();
+  saved_clock.tick_ratio_numerator = stream.Read<uint64_t>();
+  saved_clock.tick_ratio_denominator = stream.Read<uint64_t>();
+  saved_clock.guest_system_time_base = stream.Read<uint64_t>();
+  saved_clock.guest_interrupt_time = stream.Read<uint64_t>();
+  saved_clock.guest_time_scalar = stream.Read<double>();
+
+  std::string pause_error;
+  if (!PauseForSaveState(&pause_error)) {
+    if (error_message) {
+      *error_message = std::move(pause_error);
+    }
+    return false;
+  }
+  if (!Clock::RestoreFrozenGuestTime(saved_clock)) {
+    Resume();
+    if (error_message) {
+      *error_message = "The diagnostic save contains invalid guest clock state.";
+    }
+    return false;
+  }
+  restoring_ = true;
+  // Convert the cooperative boundary into host suspension before destroying
+  // the old title. Releasing the barrier then can't let guest code execute,
+  // and teardown won't block on a frozen enrollment set.
+  {
+    auto threads =
+        kernel_state_->object_table()->GetObjectsByType<kernel::XThread>();
+    for (auto thread : threads) {
+      if (thread->is_guest_thread() && thread->is_running()) {
+        thread->thread()->Suspend(nullptr);
+      }
+    }
+  }
+  processor_->ReleaseSaveStateBoundary();
+  kernel_state_->TerminateTitle(true);
+  auto lock = global_critical_region::AcquireDirect();
+
+  auto restore_failed = [&](const char* subsystem) {
+    restoring_ = false;
+    if (error_message) {
+      *error_message = fmt::format(
+          "{} restore failed; emulation remains paused for safety.",
+          subsystem);
+    }
+    return false;
+  };
+  XELOGI("Diagnostic restore state: restoring processor");
   if (!processor_->Restore(&stream)) {
-    XELOGE("Could not restore processor!");
-    return false;
+    return restore_failed("Processor");
   }
+  XELOGI("Diagnostic restore state: restoring graphics");
   if (!graphics_system_->Restore(&stream)) {
-    XELOGE("Could not restore graphics system!");
-    return false;
+    return restore_failed("GPU");
   }
+  XELOGI("Diagnostic restore state: restoring audio");
   if (!audio_system_->Restore(&stream)) {
-    XELOGE("Could not restore audio system!");
-    return false;
+    return restore_failed("Audio");
   }
+  XELOGI("Diagnostic restore state: restoring kernel");
   if (!kernel_state_->Restore(&stream)) {
-    XELOGE("Could not restore kernel state!");
-    return false;
+    return restore_failed("Kernel");
   }
+  XELOGI("Diagnostic restore state: restoring memory");
   if (!memory_->Restore(&stream)) {
-    XELOGE("Could not restore memory!");
-    return false;
+    return restore_failed("Memory");
   }
+  // Memory::Restore replaces guest RAM after the backend has restored EDRAM.
+  // Host GPU caches may therefore still contain data from the pre-restore
+  // timeline. Queue invalidation before the command processor is resumed so
+  // the first restored PM4 work observes the restored guest memory image.
+  XELOGI("Diagnostic restore state: invalidating post-memory GPU caches");
+  graphics_system_->ClearCaches();
+  graphics_system_->InvalidateGpuMemory();
+  graphics_system_->BeginPostRestoreWarmup();
 
-  // Update the main thread.
   auto threads =
       kernel_state_->object_table()->GetObjectsByType<kernel::XThread>();
   for (auto thread : threads) {
@@ -1634,11 +1902,11 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
     }
   }
 
+  lock.unlock();
   Resume();
-
   restore_fence_.Signal();
   restoring_ = false;
-
+  XELOGI("Diagnostic restore state: complete");
   return true;
 }
 

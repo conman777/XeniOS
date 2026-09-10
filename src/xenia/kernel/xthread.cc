@@ -816,6 +816,8 @@ uint32_t XThread::SelfSuspend() {
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
                         uint64_t interval) {
+  auto wait_admission = kernel_state()->AcquireSaveStateKernelAsyncAdmission(
+      save_state::KernelAsyncDomain::kWait);
   int64_t timeout_ticks = interval;
   uint32_t timeout_ms;
   if (timeout_ticks > 0) {
@@ -831,6 +833,24 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
   }
 
   timeout_ms = Clock::ScaleGuestDurationMillis(timeout_ms);
+  struct SaveStateDelayScope {
+    explicit SaveStateDelayScope(XThread* thread) : thread(thread) {
+      if (thread->is_guest_thread()) {
+        thread->emulator()->processor()->OnThreadEnteringWait(
+            thread->thread_id());
+        active = true;
+      }
+    }
+    ~SaveStateDelayScope() {
+      if (active) {
+        thread->emulator()->processor()->OnThreadLeavingWait(
+            thread->thread_id());
+      }
+    }
+    XThread* thread;
+    bool active = false;
+  } save_state_delay_scope(this);
+
   if (alertable) {
     auto result =
         xe::threading::AlertableSleep(std::chrono::milliseconds(timeout_ms));
@@ -898,7 +918,15 @@ bool XThread::Save(ByteStream* stream) {
 
   uint32_t pc = 0;
   if (running_) {
-    pc = emulator()->processor()->StepToGuestSafePoint(thread_id_);
+    if (emulator()->processor()->has_save_state_boundary()) {
+      // The cooperative boundary parks running A64 guest threads immediately
+      // after architectural registers and last_guest_pc have been
+      // synchronized. Waiting guest threads are frozen out of re-enrollment
+      // for the same boundary lifetime.
+      pc = thread_state_->context()->last_guest_pc;
+    } else {
+      pc = emulator()->processor()->StepToGuestSafePoint(thread_id_);
+    }
     if (!pc) {
       XELOGE("XThread {:08X} failed to save: could not step to a safe point!",
              handle());
@@ -973,9 +1001,23 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
 
   XELOGD("XThread {:08X}", thread->handle());
 
-  thread->thread_name_ = stream->Read<std::string>();
+  const uint32_t thread_name_length = stream->Read<uint32_t>();
+  const size_t remaining = stream->data_length() - stream->offset();
+  if (thread_name_length > remaining || thread_name_length > 64 * 1024) {
+    XELOGE("Invalid saved XThread name length {} at offset={}",
+           thread_name_length, stream->offset() - sizeof(uint32_t));
+    return nullptr;
+  }
+  thread->thread_name_.assign(
+      reinterpret_cast<const char*>(stream->data() + stream->offset()),
+      thread_name_length);
+  stream->Advance(thread_name_length);
 
-  ThreadSavedState state;
+  ThreadSavedState state{};
+  if (sizeof(ThreadSavedState) > stream->data_length() - stream->offset()) {
+    XELOGE("Truncated saved XThread state at offset={}", stream->offset());
+    return nullptr;
+  }
   stream->Read(&state, sizeof(ThreadSavedState));
   thread->thread_id_ = state.thread_id;
   thread->main_thread_ = state.is_main_thread;
@@ -1050,12 +1092,28 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state,
 
 #if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID || XE_PLATFORM_APPLE
       pthread_cleanup_push(HostThreadExitCleanupThunk, thread);
-      uint32_t pc = state.context.pc;
-      thread->kernel_state_->processor()->ExecuteRaw(thread->thread_state_, pc);
+      uint32_t next_address = state.context.pc;
+      while (next_address != 0) {
+        if (setjmp(thread->reentry_jmp_buf_) != 0) {
+          next_address = thread->reentry_address_;
+        } else {
+          thread->kernel_state_->processor()->ExecuteRaw(thread->thread_state_,
+                                                         next_address);
+          next_address = 0;
+        }
+      }
       pthread_cleanup_pop(1);
 #else
-      uint32_t pc = state.context.pc;
-      thread->kernel_state_->processor()->ExecuteRaw(thread->thread_state_, pc);
+      uint32_t next_address = state.context.pc;
+      while (next_address != 0) {
+        if (setjmp(thread->reentry_jmp_buf_) != 0) {
+          next_address = thread->reentry_address_;
+        } else {
+          thread->kernel_state_->processor()->ExecuteRaw(thread->thread_state_,
+                                                         next_address);
+          next_address = 0;
+        }
+      }
       thread->OnHostThreadExitCleanup();
 #endif
     });

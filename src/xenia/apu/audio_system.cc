@@ -66,6 +66,8 @@ AudioSystem::AudioSystem(cpu::Processor* processor)
 
   resume_event_ = xe::threading::Event::CreateAutoResetEvent(false);
   assert_not_null(resume_event_);
+  pause_event_ = xe::threading::Event::CreateAutoResetEvent(false);
+  assert_not_null(pause_event_);
 }
 
 AudioSystem::~AudioSystem() {
@@ -108,6 +110,17 @@ void AudioSystem::WorkerThreadMain() {
     // (signaling a sample has finished playing)
     auto result =
         xe::threading::WaitAny(wait_handles_, xe::countof(wait_handles_), true);
+
+    // Client semaphores may remain continuously signaled (especially with the
+    // silent Android backend), and WaitAny is allowed to select them before
+    // the shutdown event. Honor the pause request after any wakeup so the
+    // shutdown event can't be starved.
+    if (paused_.load(std::memory_order_acquire)) {
+      pause_event_->Set();
+      threading::Wait(resume_event_.get(), false);
+      continue;
+    }
+
     if (result.first == xe::threading::WaitResult::kFailed) {
       // TODO: Assert?
       continue;
@@ -116,11 +129,6 @@ void AudioSystem::WorkerThreadMain() {
     if (result.first == threading::WaitResult::kSuccess &&
         result.second == kMaximumClientCount) {
       // Shutdown event signaled.
-      if (paused_.load(std::memory_order_acquire)) {
-        pause_fence_.Signal();
-        threading::Wait(resume_event_.get(), false);
-      }
-
       continue;
     }
 
@@ -388,15 +396,49 @@ bool AudioSystem::Restore(ByteStream* stream) {
 }
 
 void AudioSystem::Pause() {
+  std::string ignored_error;
+  if (!PauseForSaveState(std::chrono::milliseconds::max(), &ignored_error)) {
+    XELOGE("Audio pause failed: {}", ignored_error);
+  }
+}
+
+bool AudioSystem::PauseForSaveState(std::chrono::milliseconds timeout,
+                                    std::string* error_message) {
   if (paused_.exchange(true, std::memory_order_acq_rel)) {
-    return;
+    return true;
   }
 
-  // Kind of a hack, but it works.
-  shutdown_event_->Set();
-  pause_fence_.Wait();
+  // Discard acknowledgements from a prior timed-out request before starting a
+  // new handshake.
+  threading::Wait(pause_event_.get(), false, std::chrono::milliseconds(0));
+  threading::Wait(resume_event_.get(), false, std::chrono::milliseconds(0));
 
-  xma_decoder_->Pause();
+  shutdown_event_->Set();
+  const bool infinite_timeout = timeout == std::chrono::milliseconds::max();
+  const auto started_at = std::chrono::steady_clock::now();
+  if (threading::Wait(pause_event_.get(), false, timeout) !=
+      threading::WaitResult::kSuccess) {
+    paused_.store(false, std::memory_order_release);
+    resume_event_->Set();
+    if (error_message) {
+      *error_message = "The audio callback worker did not quiesce in time.";
+    }
+    return false;
+  }
+
+  auto remaining = timeout;
+  if (!infinite_timeout) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started_at);
+    remaining = elapsed < timeout ? timeout - elapsed
+                                  : std::chrono::milliseconds(0);
+  }
+  if (!xma_decoder_->PauseForSaveState(remaining, error_message)) {
+    paused_.store(false, std::memory_order_release);
+    resume_event_->Set();
+    return false;
+  }
+  return true;
 }
 
 void AudioSystem::Resume() {

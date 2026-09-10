@@ -194,7 +194,7 @@ class XObject {
   void Release();
   X_STATUS Delete();
 
-  virtual bool Save(ByteStream* stream) { return false; }
+  virtual bool Save(ByteStream* stream);
   static object_ref<XObject> Restore(KernelState* kernel_state, Type type,
                                      ByteStream* stream);
 

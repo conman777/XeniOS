@@ -34,6 +34,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
+#include "xenia/cpu/backend/a64/a64_function.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/module.h"
 
@@ -1271,6 +1272,12 @@ void A64CodeCache::PlaceGuestCode(uint32_t guest_address, void* machine_code,
 
     high_mark = generated_code_offset_;
 
+    if (function_info) {
+      assert_true(func_info.stack_size <= UINT32_MAX);
+      static_cast<A64Function*>(function_info)
+          ->set_host_stack_size(uint32_t(func_info.stack_size));
+    }
+
     // Store in map. It is maintained in sorted order of host PC dependent on
     // us also being append-only.
     generated_code_map_.emplace_back(
@@ -1532,6 +1539,59 @@ GuestFunction* A64CodeCache::LookupFunction(uint64_t host_pc) {
   } else {
     return nullptr;
   }
+}
+
+bool A64CodeCache::LookupExistingGuestCode(uint32_t guest_pc,
+                                           uintptr_t* host_entry,
+                                           uint32_t* host_stack_size) {
+  if (!guest_pc || (guest_pc & 3) != 0 || !host_entry || !host_stack_size) {
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  uintptr_t found_entry = 0;
+  uint32_t found_stack_size = 0;
+  for (const auto& record : generated_code_map_) {
+    auto* function = static_cast<A64Function*>(record.second);
+    // Setup publishes machine_code with release semantics only after the
+    // source map has been cloned. Do not inspect a partially published
+    // function record.
+    if (!function || !function->machine_code()) {
+      continue;
+    }
+    const uintptr_t candidate =
+        function->MapGuestAddressToMachineCode(guest_pc);
+    if (!candidate) {
+      continue;
+    }
+    const uint32_t candidate_stack_size = function->host_stack_size();
+    if (!candidate_stack_size || (candidate_stack_size & 15) != 0 ||
+        (found_entry && (found_entry != candidate ||
+                         found_stack_size != candidate_stack_size))) {
+      return false;
+    }
+    found_entry = candidate;
+    found_stack_size = candidate_stack_size;
+  }
+  if (!found_entry) {
+    return false;
+  }
+  *host_entry = found_entry;
+  *host_stack_size = found_stack_size;
+  return true;
+}
+
+bool A64CodeCache::LookupExistingGuestCodeFrozen(
+    uint64_t generation, uint32_t guest_pc, uintptr_t* host_entry,
+    uint32_t* host_stack_size) {
+  if (!code_generation_gate_.ValidateFreeze(generation)) {
+    return false;
+  }
+  if (!LookupExistingGuestCode(guest_pc, host_entry, host_stack_size)) {
+    return false;
+  }
+  // A correct freeze prevents publication throughout lookup. Revalidate so
+  // stale or incorrectly released tokens fail closed.
+  return code_generation_gate_.ValidateFreeze(generation);
 }
 
 }  // namespace a64

@@ -777,6 +777,11 @@ uint32_t XmaContextOld::GetPacketFirstFrameOffset(
 
 size_t XmaContextOld::GetNextFrame(uint8_t* block, size_t size,
                                    size_t bit_offset) {
+  // A frame may end exactly at the input buffer boundary. There is no next
+  // packet there, and GetFramePacketNumber requires an in-range bit offset.
+  if ((bit_offset >> 3) >= size) {
+    return 0;
+  }
   // offset = xma::GetPacketFrameOffset(packet);
   // TODO meh
   // auto next_packet = bit_offset - bit_offset % kBitsPerPacket +
@@ -791,14 +796,13 @@ size_t XmaContextOld::GetNextFrame(uint8_t* block, size_t size,
   }
 
   uint64_t len = stream.Read(15);
-  if ((len - 15) > stream.BitsRemaining()) {
+  if (len < 16 || (len - 15) > stream.BitsRemaining()) {
     // assert_always("TODO");
     // *bit_offset = next_packet;
     // return false;
     // return next_packet;
     return 0;
   } else if (len >= xma::kMaxFrameLength) {
-    assert_always("TODO");
     // *bit_offset = next_packet;
     // return false;
     return 0;
@@ -812,7 +816,8 @@ size_t XmaContextOld::GetNextFrame(uint8_t* block, size_t size,
   }
 
   bit_offset += len;
-  if (packet_idx < GetFramePacketNumber(block, size, bit_offset)) {
+  if ((bit_offset >> 3) >= size ||
+      packet_idx < GetFramePacketNumber(block, size, bit_offset)) {
     return 0;
   }
   return bit_offset;

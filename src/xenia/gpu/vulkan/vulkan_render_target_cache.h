@@ -107,6 +107,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool Initialize(uint32_t shared_memory_binding_count);
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
+  void ClearCache(const char* reason);
   VkDeviceSize render_target_memory_usage_bytes() const {
     return render_target_memory_usage_bytes_;
   }
@@ -122,6 +123,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   Path GetPath() const override { return path_; }
 
   VkBuffer edram_buffer() const { return edram_buffer_; }
+
+  // Records a bit-exact 10 MiB EDRAM transfer for the diagnostic save-state
+  // path. The command processor owns the staging buffers and submission.
+  bool SaveStateSubmitEdramDownload(VkBuffer destination);
+  void SaveStateSubmitEdramUpload(VkBuffer source);
 
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
@@ -786,13 +792,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // EDRAM, used to test whether the final-presentable writer is the menu
       // channel-order root cause.
       uint32_t android_writer_gb_fix : 1;
-      // Force a collapsed color source to be packed as guest 8888. Used by
-      // the narrow Android Halo direct-MSAA presentation path.
+      // Explicitly convert a collapsed color source to guest 8888. Set by
+      // repack_mode or the direct-MSAA presentation experiment.
       uint32_t android_force_8888_repack : 1;
-      // WO40: bake normalize_7e3_to_rgba8_repack_curve into the dump pipeline
-      // so hot-reloading the curve builds a new shader instead of silently
-      // reusing the launch-time SPIR-V (curve was previously init-only for
-      // this reason). 0-3, see android_halo_experiment.h.
+      // Include the optional display curve in the cache key so a configuration
+      // change cannot silently reuse a shader with different behavior.
       uint32_t android_normalize_7e3_curve : 2;
       uint32_t android_normalize_7e3 : 1;
       // Last bit because this affects the pipeline - after sorting, only change
@@ -1131,6 +1135,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
   VkAccessFlags android_halo_present_shadow_access_mask_ = 0;
   bool android_halo_present_shadow_valid_ = false;
+  bool android_halo_reclaim_shadow_required_ = false;
   VkDeviceMemory android_halo_menu_scene_shadow_memory_ = VK_NULL_HANDLE;
   VkBuffer android_halo_menu_scene_shadow_buffer_ = VK_NULL_HANDLE;
   VkPipelineStageFlags android_halo_menu_scene_shadow_stage_mask_ =
@@ -1150,6 +1155,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t android_halo_present_shadow_override_count_ = 0;
   uint32_t android_halo_direct_presentable_resolve_count_ = 0;
   uint32_t android_halo_present_shadow_skip_log_count_ = 0;
+  uint64_t android_halo_cache_reclaim_generation_ = 0;
 #endif
 
   // For pixel (fragment) shader interlock.

@@ -55,11 +55,13 @@ class ByteStream {
     Write(uint32_t(str.length()));
     Write(str.data(), str.length() * sizeof(char));
   }
+  void Write(const std::string& str) { Write(std::string_view(str)); }
 
   void Write(const std::u16string_view str) {
     Write(uint32_t(str.length()));
     Write(str.data(), str.length() * sizeof(char16_t));
   }
+  void Write(const std::u16string& str) { Write(std::u16string_view(str)); }
 
  private:
   uint8_t* data_ = nullptr;

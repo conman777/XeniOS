@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -101,6 +102,22 @@ uint64_t ReadAndroidKgslProcessMemoryUsage() {
   std::ifstream memory_file("/d/kgsl/proc/" + std::to_string(getpid()) +
                             "/mem");
   if (!memory_file) {
+    // WO44: on retail builds SELinux denies debugfs access (avc: denied for
+    // comm="GPU Commands" in every logcat since t160). Returning a bare 0
+    // made every kgsl_limit_exceeded check permanently false, so the GPU
+    // memory reclaim valve never fired while Adreno compiler memory grew
+    // unbounded during the flyover compile burst. Callers now fall back to
+    // the Vulkan heap budget when this returns 0 - see
+    // ReadAndroidGpuMemoryUsageWithFallback below.
+    static std::atomic<bool> kgsl_failure_logged{false};
+    bool expected = false;
+    if (kgsl_failure_logged.compare_exchange_strong(expected, true,
+                                                    std::memory_order_acq_rel)) {
+      XELOGW(
+          "KGSL debugfs /d/kgsl/proc/<pid>/mem is not readable (SELinux "
+          "denied). Falling back to Vulkan heap usage as the GPU memory "
+          "signal for reclamation.");
+    }
     return 0;
   }
   uint64_t total_bytes = 0;
@@ -116,6 +133,16 @@ uint64_t ReadAndroidKgslProcessMemoryUsage() {
     }
   }
   return total_bytes;
+}
+
+// WO44: KGSL totals when debugfs is readable, otherwise the driver-visible
+// Vulkan heap usage from VMA (VK_EXT_memory_budget is enabled in the texture
+// cache allocator). This keeps the kgsl-limit reclaim logic meaningful on
+// devices where SELinux blocks /d/kgsl. Pass the heap bytes currently
+// available from texture_cache_->GetAllocatorMemoryUsage().
+uint64_t ReadAndroidGpuMemoryUsageWithFallback(uint64_t vulkan_heap_bytes) {
+  const uint64_t kgsl_bytes = ReadAndroidKgslProcessMemoryUsage();
+  return kgsl_bytes ? kgsl_bytes : vulkan_heap_bytes;
 }
 
 struct AndroidRawImageStats {
@@ -546,9 +573,56 @@ void VulkanCommandProcessor::ClearCaches() {
   cache_clear_requested_ = true;
 }
 
+bool VulkanCommandProcessor::Save(ByteStream* stream) {
+  // Emulator::SaveToFile calls this only after the CPU, GPU, audio and kernel
+  // producers have stopped. Old per-resolve readback buffers may overlap or
+  // refer to memory that the CPU has reused. Capture the current GPU-owned
+  // pages instead, including memexport data when ordinary readback is disabled.
+  assert_true(is_paused());
+  if (!BeginSubmission(false)) {
+    return false;
+  }
+  bool capture_success = false;
+  const bool submitted =
+      shared_memory_->InitializeTraceSubmitDownloads(&capture_success);
+  if (!capture_success) {
+    return false;
+  }
+  if (submitted &&
+      (!AwaitAllQueueOperationsCompletion() ||
+       !shared_memory_->InitializeTraceCompleteDownloads(true))) {
+    return false;
+  }
+  return CommandProcessor::Save(stream);
+}
+
 void VulkanCommandProcessor::InvalidateGpuMemory() {
   shared_memory_->InvalidateAllPages();
 }
+
+void VulkanCommandProcessor::BeginPostRestoreWarmup() {
+#if XE_PLATFORM_ANDROID
+  if (pipeline_cache_) {
+    pipeline_cache_->BeginPostRestoreWarmup();
+  }
+#endif
+}
+
+void VulkanCommandProcessor::DrainPipelineCreationThreads() {
+  if (pipeline_cache_) {
+    pipeline_cache_->DrainCreationThreads();
+  }
+}
+
+#if XE_PLATFORM_ANDROID
+void VulkanCommandProcessor::LockAsyncPipelineCreate() {
+  android_pipeline_create_mutex_.lock();
+}
+
+void VulkanCommandProcessor::UnlockAsyncPipelineCreate() {
+  android_pipeline_create_mutex_.unlock();
+}
+#endif
 
 void VulkanCommandProcessor::ClearReadbackBuffers() {
   if (readback_buffers_.empty() && memexport_readback_buffers_.empty() &&
@@ -604,7 +678,192 @@ void VulkanCommandProcessor::InitializeShaderStorage(
                                            std::move(completion_callback));
 }
 
-void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {}
+void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+  // Trace playback retains the legacy void interface. The checked path is
+  // also used by live restoration and logs individual backend failures.
+  RestoreSaveStateEdramSnapshot(snapshot);
+}
+
+bool VulkanCommandProcessor::RestoreSaveStateEdramSnapshot(
+    const void* snapshot) {
+  if (!snapshot || device_lost_ || !render_target_cache_ ||
+      render_target_cache_->IsDrawResolutionScaled()) {
+    XELOGE("Vulkan save state: EDRAM restore is unavailable");
+    return false;
+  }
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkBuffer upload_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory upload_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, xenos::kEdramSizeBytes,
+          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+          ui::vulkan::util::MemoryPurpose::kUpload, upload_buffer,
+          upload_memory)) {
+    XELOGE("Vulkan save state: failed to allocate EDRAM upload buffer");
+    return false;
+  }
+  void* mapping = nullptr;
+  if (dfn.vkMapMemory(device, upload_memory, 0, VK_WHOLE_SIZE, 0, &mapping) !=
+      VK_SUCCESS) {
+    dfn.vkDestroyBuffer(device, upload_buffer, nullptr);
+    dfn.vkFreeMemory(device, upload_memory, nullptr);
+    XELOGE("Vulkan save state: failed to map EDRAM upload buffer");
+    return false;
+  }
+  std::memcpy(mapping, snapshot, xenos::kEdramSizeBytes);
+  dfn.vkUnmapMemory(device, upload_memory);
+
+  render_target_cache_->ClearCache("save-state restore");
+  if (!BeginSubmission(true)) {
+    dfn.vkDestroyBuffer(device, upload_buffer, nullptr);
+    dfn.vkFreeMemory(device, upload_memory, nullptr);
+    return false;
+  }
+  // Once recorded, keep the staging allocation alive until its submission
+  // completes, including on failure/timeout. Shutdown also drains these queues.
+  const uint64_t target = GetCurrentSubmission();
+  destroy_buffers_.emplace_back(target, upload_buffer);
+  destroy_memory_.emplace_back(target, upload_memory);
+  render_target_cache_->SaveStateSubmitEdramUpload(upload_buffer);
+  if (!EndSubmission(false)) {
+    return false;
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (completion_timeline_.UpdateAndGetCompletedSubmission() < target &&
+         std::chrono::steady_clock::now() <= deadline &&
+         !vulkan_device->IsLost()) {
+    std::this_thread::yield();
+  }
+  if (GetCompletedSubmission() < target || vulkan_device->IsLost()) {
+    device_lost_ = vulkan_device->IsLost();
+    XELOGE("Vulkan save state: EDRAM restore did not complete");
+    return false;
+  }
+  CheckSubmissionCompletionAndDeviceLoss(0);
+  return !device_lost_;
+}
+
+bool VulkanCommandProcessor::PrepareForSaveState(
+    std::chrono::steady_clock::time_point deadline,
+    std::string* error_message) {
+  if (device_lost_ || GetVulkanDevice()->IsLost()) {
+    if (error_message) {
+      *error_message = "The Vulkan device is lost.";
+    }
+    return false;
+  }
+  if (render_target_cache_->IsDrawResolutionScaled()) {
+    if (error_message) {
+      *error_message =
+          "Diagnostic saves currently require native (1x) resolution.";
+    }
+    return false;
+  }
+  while (pipeline_cache_->IsCreatingPipelines() &&
+         std::chrono::steady_clock::now() <= deadline) {
+    std::this_thread::yield();
+  }
+  if (pipeline_cache_->IsCreatingPipelines()) {
+    if (error_message) {
+      *error_message = "Vulkan pipeline creation did not become idle.";
+    }
+    return false;
+  }
+
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkBuffer download_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory download_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, xenos::kEdramSizeBytes,
+          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, download_buffer,
+          download_memory)) {
+    if (error_message) {
+      *error_message = "Failed to allocate the Vulkan EDRAM readback.";
+    }
+    return false;
+  }
+  uint64_t target = 0;
+  auto destroy_download = [&]() {
+    if (target > GetCompletedSubmission()) {
+      destroy_buffers_.emplace_back(target, download_buffer);
+      destroy_memory_.emplace_back(target, download_memory);
+    } else {
+      dfn.vkDestroyBuffer(device, download_buffer, nullptr);
+      dfn.vkFreeMemory(device, download_memory, nullptr);
+    }
+  };
+
+  if (!BeginSubmission(true)) {
+    destroy_download();
+    if (error_message) {
+      *error_message = "Failed to begin the Vulkan save-state readback.";
+    }
+    return false;
+  }
+  target = GetCurrentSubmission();
+  if (!render_target_cache_->SaveStateSubmitEdramDownload(download_buffer) ||
+      !EndSubmission(false)) {
+    destroy_download();
+    if (error_message) {
+      *error_message = "Failed to submit the Vulkan save-state readback.";
+    }
+    return false;
+  }
+  while (completion_timeline_.UpdateAndGetCompletedSubmission() < target &&
+         std::chrono::steady_clock::now() <= deadline &&
+         !vulkan_device->IsLost()) {
+    std::this_thread::yield();
+  }
+  if (GetCompletedSubmission() < target || vulkan_device->IsLost()) {
+    destroy_download();
+    if (error_message) {
+      *error_message = vulkan_device->IsLost()
+                           ? "The Vulkan device was lost during capture."
+                           : "Vulkan work did not complete before the deadline.";
+    }
+    return false;
+  }
+  CheckSubmissionCompletionAndDeviceLoss(0);
+
+  void* mapping = nullptr;
+  if (dfn.vkMapMemory(device, download_memory, 0, VK_WHOLE_SIZE, 0, &mapping) !=
+      VK_SUCCESS) {
+    destroy_download();
+    if (error_message) {
+      *error_message = "Failed to map the Vulkan EDRAM readback.";
+    }
+    return false;
+  }
+  std::vector<uint8_t> snapshot(xenos::kEdramSizeBytes);
+  std::memcpy(snapshot.data(), mapping, snapshot.size());
+  dfn.vkUnmapMemory(device, download_memory);
+  destroy_download();
+  SetSaveStateEdramSnapshot(std::move(snapshot));
+
+  constexpr uint64_t kPresenterSaveStateOwner = 0x58454E494F535356ull;
+  if (!graphics_system_->presenter()->QuiesceForSaveState(
+          kPresenterSaveStateOwner, deadline)) {
+    SetSaveStateEdramSnapshot({});
+    if (error_message) {
+      *error_message =
+          "Presentation work did not complete before the deadline.";
+    }
+    return false;
+  }
+  return true;
+}
+
+void VulkanCommandProcessor::ResumeAfterSaveState() noexcept {
+  constexpr uint64_t kPresenterSaveStateOwner = 0x58454E494F535356ull;
+  graphics_system_->presenter()->ReopenAfterSaveState(
+      kPresenterSaveStateOwner);
+}
 
 void VulkanCommandProcessor::PrepareForWait() {
   CheckSubmissionCompletionAndDeviceLoss(GetCompletedSubmission());
@@ -2685,6 +2944,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
       });
 
 #if XE_PLATFORM_ANDROID
+  if (guest_output_refreshed) {
+    pipeline_cache_->EndPostRestoreWarmup();
+  }
   if (cvars::halo_android_diagnostics) {
     static uint32_t android_swap_total = 0;
     static uint32_t android_swap_refreshed_total = 0;
@@ -2711,15 +2973,116 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           android_swap_refreshed_total - android_swap_last_refreshed;
       uint64_t dt_ms = now_ms - android_swap_last_summary_ms;
       double dt_seconds = dt_ms ? static_cast<double>(dt_ms) / 1000.0 : 1.0;
+      VulkanPipelineCache::CreationStats pipeline_stats;
+      if (pipeline_cache_) {
+        pipeline_stats = pipeline_cache_->GetCreationStats();
+      }
       XELOGI(
           "HaloReach SwapSummary dt_ms={} swaps={} (+{}) refreshed={} (+{}) "
           "swap_fps={:.1f} refresh_fps={:.1f} frontbuffer={}x{} format={} "
-          "refreshed_last={}",
+          "refreshed_last={} pipelines live={} placeholders={} null={} "
+          "queued={} busy={} deferred={}",
           dt_ms, android_swap_total, delta_swaps,
           android_swap_refreshed_total, delta_refreshed,
           delta_swaps / dt_seconds, delta_refreshed / dt_seconds,
           frontbuffer_width_scaled, frontbuffer_height_scaled,
-          uint32_t(frontbuffer_format), uint32_t(guest_output_refreshed));
+          uint32_t(frontbuffer_format), uint32_t(guest_output_refreshed),
+          pipeline_stats.live, pipeline_stats.placeholders,
+          pipeline_stats.null_handles, pipeline_stats.queued,
+          pipeline_stats.busy, pipeline_stats.deferred);
+      if (pipeline_cache_ &&
+          GetAndroidHaloExperiment().log_pipeline_key_census) {
+        pipeline_cache_->LogPipelineKeyCensus("swap");
+      }
+      // Attribute GPU memory per category every summary interval, not only
+      // when a pressure limit fires, so growth curves exist for post-mortem
+      // analysis even if the device dies before any limit is reached.
+      {
+        VulkanTextureCache::AllocatorMemoryUsage texture_allocator_usage;
+        if (texture_cache_) {
+          texture_allocator_usage = texture_cache_->GetAllocatorMemoryUsage();
+        }
+        uint64_t texture_payload_usage =
+            texture_cache_ ? texture_cache_->GetTotalHostMemoryUsage() : 0;
+        uint64_t readback_memory_usage = memexport_readback_buffer_size_;
+        for (const auto& pair : readback_buffers_) {
+          readback_memory_usage +=
+              uint64_t(pair.second.sizes[0]) + uint64_t(pair.second.sizes[1]);
+        }
+        for (const auto& pair : memexport_readback_buffers_) {
+          readback_memory_usage +=
+              uint64_t(pair.second.sizes[0]) + uint64_t(pair.second.sizes[1]);
+        }
+        uint64_t host_rss_bytes = 0;
+        std::ifstream statm_file("/proc/self/statm");
+        if (statm_file) {
+          uint64_t total_pages = 0, resident_pages = 0;
+          if (statm_file >> total_pages >> resident_pages) {
+            host_rss_bytes =
+                resident_pages * uint64_t(sysconf(_SC_PAGESIZE));
+          }
+        }
+        const uint64_t mb_round = UINT64_C(1) << 20;
+        XELOGI(
+            "HaloReach MemSummary host_rss={} MB kgsl={} MB "
+            "tex_payload={} MB (hard {} MB) vma_blocks={} MB vma_allocs={} MB "
+            "({} blocks {} allocs) vma_heap={} MB rt={} MB rt_upload={} MB "
+            "uniform={} MB prim_upload={} MB shared_upload={} MB "
+            "sparse_shared={} MB/{} allocs scratch={} MB readback={} MB/{} "
+            "keys",
+            (host_rss_bytes + mb_round - 1) >> 20,
+            (ReadAndroidKgslProcessMemoryUsage() + mb_round - 1) >> 20,
+            (texture_payload_usage + mb_round - 1) >> 20,
+            texture_cache_ ? texture_cache_->GetHostMemoryHardLimitMB() : 0,
+            (uint64_t(texture_allocator_usage.block_bytes) + mb_round - 1) >>
+                20,
+            (uint64_t(texture_allocator_usage.allocation_bytes) + mb_round -
+             1) >>
+                20,
+            texture_allocator_usage.block_count,
+            texture_allocator_usage.allocation_count,
+            (uint64_t(texture_allocator_usage.heap_usage_bytes) + mb_round -
+             1) >>
+                20,
+            (uint64_t(render_target_cache_
+                          ? render_target_cache_
+                                ->render_target_memory_usage_bytes()
+                          : 0) +
+             mb_round - 1) >>
+                20,
+            (uint64_t(render_target_cache_
+                          ? render_target_cache_->transfer_upload_memory_usage()
+                          : 0) +
+             mb_round - 1) >>
+                20,
+            (uint64_t(uniform_buffer_pool_
+                          ? uniform_buffer_pool_->GetMemoryUsage()
+                          : 0) +
+             mb_round - 1) >>
+                20,
+            (uint64_t(primitive_processor_
+                          ? primitive_processor_->upload_buffer_memory_usage()
+                          : 0) +
+             mb_round - 1) >>
+                20,
+            (uint64_t(shared_memory_
+                          ? shared_memory_->upload_buffer_memory_usage()
+                          : 0) +
+             mb_round - 1) >>
+                20,
+            (uint64_t(shared_memory_
+                          ? shared_memory_->host_gpu_memory_sparse_used_bytes()
+                          : 0) +
+             mb_round - 1) >>
+                20,
+            shared_memory_
+                ? shared_memory_->host_gpu_memory_sparse_allocation_count()
+                : 0,
+            (uint64_t(scratch_buffer_size_) + mb_round - 1) >> 20,
+            (readback_memory_usage + mb_round - 1) >> 20,
+            readback_buffers_.size() + memexport_readback_buffers_.size() +
+                size_t(memexport_readback_buffer_ != VK_NULL_HANDLE));
+      }
       android_swap_last_summary_ms = now_ms;
       android_swap_last_total = android_swap_total;
       android_swap_last_refreshed = android_swap_refreshed_total;
@@ -3505,6 +3868,40 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   }
 
 #if XE_PLATFORM_ANDROID
+  // WO44 guest backpressure: the opening flyover requests ~130 unique
+  // pipelines in ~6 s while one creation worker drains them one Adreno
+  // compile at a time. When the backlog is deep, briefly stall the command
+  // processor here (no locks held, bounded) so unique-state requests arrive
+  // no faster than compiles complete. This caps how many pipelines - and how
+  // much driver compiler memory - can be in flight, which is what pushed the
+  // device into system-wide critical memory pressure (t160-t166).
+  if (pipeline_cache_) {
+    constexpr size_t kBacklogThrottleThreshold = 12;
+    constexpr size_t kBacklogThrottleResume = 4;
+    constexpr uint64_t kBacklogThrottleMaxMillis = 6;
+    VulkanPipelineCache::CreationStats throttle_stats =
+        pipeline_cache_->GetCreationStats();
+    if (throttle_stats.queued >= kBacklogThrottleThreshold) {
+      const uint64_t throttle_deadline_ms =
+          xe::Clock::QueryHostUptimeMillis() + kBacklogThrottleMaxMillis;
+      for (;;) {
+        if (throttle_stats.queued < kBacklogThrottleResume) {
+          break;
+        }
+        const uint64_t now_ms = xe::Clock::QueryHostUptimeMillis();
+        if (now_ms >= throttle_deadline_ms) {
+          XELOGI(
+              "Android pipeline backlog throttle: queued={} busy={} after {} "
+              "ms stall",
+              throttle_stats.queued, throttle_stats.busy,
+              uint32_t(kBacklogThrottleMaxMillis));
+          break;
+        }
+        xe::threading::Sleep(std::chrono::milliseconds(1));
+        throttle_stats = pipeline_cache_->GetCreationStats();
+      }
+    }
+  }
   // Reach can load hundreds of megabytes of textures without closing a frame.
   // Texture eviction is submission-completion based, and VMA block bytes may
   // greatly exceed the sum of live allocation bytes on Adreno. Split at this
@@ -3526,15 +3923,27 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   static uint64_t android_kgsl_last_check_millis = 0;
   static uint64_t android_memory_last_reclaim_millis = 0;
   static uint64_t android_kgsl_usage = 0;
+  // WO44: consistent KGSL-with-heap-fallback reads for every refresh inside
+  // the reclaim cascade, so post-clear decisions use the same signal as the
+  // trigger even when debugfs is SELinux-blocked.
+  const auto read_android_gpu_memory_usage = [this]() {
+    VulkanTextureCache::AllocatorMemoryUsage allocator_usage =
+        texture_cache_ ? texture_cache_->GetAllocatorMemoryUsage()
+                       : VulkanTextureCache::AllocatorMemoryUsage{};
+    return ReadAndroidGpuMemoryUsageWithFallback(allocator_usage.heap_usage_bytes);
+  };
   const uint64_t android_kgsl_now_millis =
       xe::Clock::QueryHostUptimeMillis();
-  if (android_kgsl_limit &&
-      android_kgsl_now_millis >= android_kgsl_last_check_millis + 500) {
-    android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
-    android_kgsl_last_check_millis = android_kgsl_now_millis;
-  }
   if (texture_cache_) {
     texture_allocator_usage = texture_cache_->GetAllocatorMemoryUsage();
+  }
+  if (android_kgsl_limit &&
+      android_kgsl_now_millis >= android_kgsl_last_check_millis + 500) {
+    // WO44: on SELinux-blocked devices this returns the Vulkan heap usage
+    // instead of a bare 0, so the kgsl-limit reclaim valve stays live.
+    android_kgsl_usage = ReadAndroidGpuMemoryUsageWithFallback(
+        texture_allocator_usage.heap_usage_bytes);
+    android_kgsl_last_check_millis = android_kgsl_now_millis;
   }
   const uint64_t sparse_shared_memory_usage =
       shared_memory_ ? shared_memory_->host_gpu_memory_sparse_used_bytes() : 0;
@@ -3563,10 +3972,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   const bool android_kgsl_limit_exceeded_raw =
       android_kgsl_limit &&
       android_kgsl_usage_reclaimable > android_kgsl_limit;
+  // Give actual in-flight compilation a short grace period, not abandoned
+  // null entries. Persistent pressure must eventually reach reclamation.
+  const bool android_kgsl_emergency_pressure =
+      android_kgsl_limit &&
+      android_kgsl_usage_reclaimable >=
+          android_kgsl_limit +
+              std::max(uint64_t(64) << 20, android_kgsl_limit / 8);
+  bool skip_kgsl_reclaim_for_growth = false;
+  if (pipeline_cache_ && android_kgsl_limit_exceeded_raw &&
+      !texture_payload_limit_exceeded) {
+    if (!android_pipeline_pressure_deadline_ms_) {
+      android_pipeline_pressure_deadline_ms_ = android_kgsl_now_millis + 5000;
+    }
+    const VulkanPipelineCache::CreationStats creation_stats =
+        pipeline_cache_->GetCreationStats();
+    const bool creating = creation_stats.queued || creation_stats.busy;
+    skip_kgsl_reclaim_for_growth =
+        creating && !android_kgsl_emergency_pressure &&
+        android_kgsl_now_millis < android_pipeline_pressure_deadline_ms_;
+  } else {
+    android_pipeline_pressure_deadline_ms_ = 0;
+  }
   // WO36: all persistent pressure sources share one cooldown. Previously only
   // KGSL did, so a global Vulkan heap above its threshold submitted and waited
   // on every draw even while the live texture payload was only a few MiB.
   const bool android_memory_reclaim_cooldown_elapsed =
+      android_kgsl_emergency_pressure ||
       android_kgsl_now_millis >=
           android_memory_last_reclaim_millis +
               (android_kgsl_preserve_pipeline_cache
@@ -3580,7 +4012,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       android_memory_reclaim_cooldown_elapsed;
   const bool android_kgsl_limit_exceeded =
       android_kgsl_limit_exceeded_raw &&
-      android_memory_reclaim_cooldown_elapsed;
+      android_memory_reclaim_cooldown_elapsed &&
+      !skip_kgsl_reclaim_for_growth;
   const bool texture_payload_pressure =
       texture_payload_limit_exceeded &&
       android_memory_reclaim_cooldown_elapsed;
@@ -3710,7 +4143,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
          vulkan_heap_after_reclaimable > vulkan_heap_limit) ||
         android_kgsl_limit_exceeded) {
       texture_cache_->ClearCache();
-      render_target_cache_->ClearCache();
+      render_target_cache_->ClearCache("kgsl");
       if (!android_kgsl_preserve_pipeline_cache) {
         pipeline_cache_->ClearCache();
         pipeline_cache_cleared = true;
@@ -3721,7 +4154,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         // Reclaim textures and render targets first. Only trim pipelines when
         // KGSL is still above the configured limit so short-lived spikes don't
         // force shader recompilation.
-        android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
+        android_kgsl_usage = read_android_gpu_memory_usage();
         android_kgsl_last_check_millis = android_kgsl_now_millis;
         texture_allocator_after = texture_cache_->GetAllocatorMemoryUsage();
         const uint64_t android_kgsl_after_reclaimable =
@@ -3755,7 +4188,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
             current_guest_graphics_pipeline_layout_ = nullptr;
             current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-            android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
+            android_kgsl_usage = read_android_gpu_memory_usage();
             android_kgsl_last_check_millis = android_kgsl_now_millis;
           }
         }
@@ -3786,11 +4219,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
               android_kgsl_emergency_limit >> 20,
               pipeline_keep_count, pipeline_count_before);
           pipelines_trimmed +=
-              pipeline_cache_->TrimCache(pipeline_keep_count, true);
+              pipeline_cache_->TrimCache(pipeline_keep_count, true, false);
           current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
           current_guest_graphics_pipeline_layout_ = nullptr;
           current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-          android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
+          android_kgsl_usage = read_android_gpu_memory_usage();
           android_kgsl_last_check_millis = android_kgsl_now_millis;
         }
       }
@@ -3798,7 +4231,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       texture_allocator_after = texture_cache_->GetAllocatorMemoryUsage();
     }
     android_memory_last_reclaim_millis = android_kgsl_now_millis;
-    android_kgsl_usage = ReadAndroidKgslProcessMemoryUsage();
+    android_kgsl_usage = read_android_gpu_memory_usage();
     android_kgsl_last_check_millis = android_kgsl_now_millis;
     const uint64_t usage_after = texture_cache_->GetTotalHostMemoryUsage();
     const uint64_t android_kgsl_after_reclaimable =
@@ -4454,13 +4887,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   VkPipeline current_pipeline =
       pipeline->pipeline.load(std::memory_order_acquire);
   if (current_pipeline == VK_NULL_HANDLE) {
-    // Pipeline is not ready yet - wait for it to be created.
-    pipeline_cache_->EndSubmission();
-    current_pipeline = pipeline->pipeline.load(std::memory_order_acquire);
-    if (current_pipeline == VK_NULL_HANDLE) {
-      // Still not ready - something is wrong.
-      return false;
-    }
+    // t164: waiting here serialized the flyover behind Adreno compiles and
+    // the device stopped responding. Skip this draw; the worker will store a
+    // handle and later draws of this state will proceed.
+    return true;
   }
   // If async mode is active, this may be a placeholder pipeline. The real
   // pipeline will be swapped in by the creation thread when ready.
@@ -6727,8 +7157,16 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 }
 
 bool VulkanCommandProcessor::CanEndSubmissionImmediately() {
-  return !submission_open_ || !pipeline_cache_ ||
-         !pipeline_cache_->IsCreatingPipelines();
+  if (!submission_open_ || !pipeline_cache_) {
+    return true;
+  }
+  // Placeholders make the recorded command buffer valid before the real
+  // pipeline exists. Waiting here would batch the whole compile storm into
+  // one submit and stall presentation.
+  if (cvars::async_shader_compilation) {
+    return true;
+  }
+  return !pipeline_cache_->IsCreatingPipelines();
 }
 
 bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
@@ -6902,6 +7340,11 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &command_buffer.buffer;
+    // WO44 revert of t166: serializing vkQueueSubmit against pipeline
+    // creation made every frame wait a full Adreno compile (swap_fps
+    // 0.7-0.8) without preventing the flyover hang. Async compiles now stay
+    // bounded via the capped creation queue and the IssueDraw backlog
+    // throttle instead.
     const VkResult submit_result = completion_timeline_.AcquireFenceAndSubmit(
         vulkan_device->queue_family_graphics_compute(), 0, 1, &submit_info);
     if (submit_result != VK_SUCCESS) {
@@ -6940,6 +7383,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // this submission. Reclaim pipelines retired by older submissions even
     // when proactive LRU is disabled.
     pipeline_cache_->CompletedSubmissionUpdated();
+    pipeline_cache_->EndSubmission();
 
 #if XE_PLATFORM_ANDROID
     const AndroidHaloExperiment& android_halo_experiment =

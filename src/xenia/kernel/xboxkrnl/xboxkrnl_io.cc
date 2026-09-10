@@ -227,12 +227,24 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
     root_entry = root_file->entry();
   }
 
+  ReversibleAdmissionGate::Lease kernel_completion_admission;
+  ReversibleAdmissionGate::Lease vfs_write_admission;
+  const auto disposition =
+      vfs::FileDisposition(static_cast<uint32_t>(creation_disposition));
+  if (disposition != vfs::FileDisposition::kOpen) {
+    // Retain kernel ownership through the guest-visible I/O status update, then
+    // the VFS ownership through every possible delete/create/open mutation.
+    kernel_completion_admission =
+        kernel_state()->AcquireSaveStateKernelDispatchTimerAdmission();
+    vfs_write_admission =
+        kernel_state()->file_system()->AcquireSaveStateGuestWriteAdmission();
+  }
+
   // Attempt open (or create).
   vfs::File* vfs_file = nullptr;
   vfs::FileAction file_action = vfs::FileAction::kDoesNotExist;
   X_STATUS result = kernel_state()->file_system()->OpenFile(
-      root_entry, target_path,
-      vfs::FileDisposition((uint32_t)creation_disposition), desired_access,
+      root_entry, target_path, disposition, desired_access,
       (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
       (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file,
       &file_action);
@@ -521,8 +533,19 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
     result = X_STATUS_INVALID_HANDLE;
   }
 
+  ReversibleAdmissionGate::Lease kernel_completion_admission;
+  ReversibleAdmissionGate::Lease vfs_write_admission;
+
   // Execute write.
   if (XSUCCEEDED(result)) {
+    // Dependency order matches the future coordinator: kernel completion
+    // ownership first, VFS mutation ownership second. Both remain held until
+    // completion ports, I/O status, APC, and event publication are finished.
+    kernel_completion_admission =
+        kernel_state()->AcquireSaveStateKernelDispatchTimerAdmission();
+    vfs_write_admission =
+        kernel_state()->file_system()->AcquireSaveStateGuestWriteAdmission();
+
     // TODO(benvanik): async path.
     if (true || file->is_synchronous()) {
       // Synchronous request.

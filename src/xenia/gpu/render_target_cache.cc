@@ -559,6 +559,26 @@ void RenderTargetCache::ClearCache() {
           render_targets_.erase(it);
           continue;
         }
+#if XE_PLATFORM_ANDROID
+        // Reach's base-675 7e3 scene RT is usually NOT the ownership-map
+        // owner when the prefer-7e3 resolve redirect needs it (that mismatch
+        // is the redirect's whole premise), so an unpinned trim would delete
+        // exactly this RT and disarm the color fix until the next HDR pass -
+        // with wrong resolves in between.
+        if (vulkan::GetAndroidHaloExperiment().dump_scene_675_prefer_7e3_float) {
+          const RenderTargetKey& pin_key = it->second->key();
+          if (!pin_key.is_depth && pin_key.base_tiles == 675 &&
+              pin_key.pitch_tiles_at_32bpp == 15 &&
+              pin_key.msaa_samples == xenos::MsaaSamples::k1X &&
+              (pin_key.GetColorFormat() ==
+                   xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+               pin_key.GetColorFormat() ==
+                   xenos::ColorRenderTargetFormat::
+                       k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
+            continue;
+          }
+        }
+#endif
         if (used_render_targets.find(it->second->key()) ==
             used_render_targets.end()) {
           delete it->second;

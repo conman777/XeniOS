@@ -12,14 +12,10 @@
 
 // Halo: Reach Android frontbuffer experiment switches.
 //
-// The cvar/profile override path (OverrideAndroidConfigVar) has proven
-// unreliable at runtime on the Android build (silent no-op on dynamic_cast or
-// registry misses), which has repeatedly invalidated device experiments. This
-// reader bypasses the cvar system entirely: it parses
-// files/halo_experiment.txt directly and logs every launch value so each run
-// is self-verifying from logcat alone. WO39 also polls the file contents every
-// two seconds and atomically publishes reload-safe changes. Defaults encode
-// the current best fix configuration, so no file is required on the device.
+// Reads files/halo_experiment.txt separately from the cvar profile. Launch
+// values are logged; reload-safe fields are published at polling boundaries.
+// Defaults are retained compatibility experiments, not verified game support.
+// See docs/android-development.md for current status and configuration rules.
 
 #include <algorithm>
 #include <atomic>
@@ -147,7 +143,7 @@ struct AndroidHaloExperiment {
   // for diagnostics, but the GPU stalls on every resolve - the dominant
   // performance cost). Set to 0 for performance A/B runs; note the GUESTDUMP
   // .ppm oracle reads stale data when off - judge by the screen only.
-  bool readback_resolve_full = true;
+  bool readback_resolve_full = false;
   // Disable the guest display refresh cap so the vblank worker can fire at
   // the Android uncapped path rate instead of locking guest pacing to 60Hz
   // divisors.
@@ -157,11 +153,9 @@ struct AndroidHaloExperiment {
   // scrambles every presented frame and was the top CPU hotspot (~20%).
   // Default OFF; kept only as a diagnostic switch.
   bool linear_to_tiled_frontbuffer = false;
-  // Force the FSI (pixel-shader-interlock) render target path even though the
-  // device lacks VK_EXT_fragment_shader_interlock. EDRAM becomes a raw
-  // storage buffer with bit-exact format aliasing. Shader codegen omits
-  // interlock ops when the feature is absent, and the render-target cache
-  // serializes guest draws with fragment read/write barriers.
+  // Legacy alias for requesting the FSI render target path. Unsupported
+  // devices fall back to host render targets; barriers cannot replace
+  // interlock.
   bool force_fsi = false;
   // Silence info/debug logs during load and shader-compile storms so logd
   // traffic does not contribute to Android watchdog kills.
@@ -182,9 +176,9 @@ struct AndroidHaloExperiment {
   bool kgsl_reclaim_retained_pools = true;
   // Runtime-tunable KGSL pipeline reclamation policy. These are intentionally
   // external-profile settings so device A/B runs don't require a rebuild.
-  uint32_t kgsl_reclaim_cooldown_ms = 5000;
-  uint32_t kgsl_pipeline_keep_percent = 50;
-  uint32_t kgsl_pipeline_min_count = 64;
+  uint32_t kgsl_reclaim_cooldown_ms = 15000;
+  uint32_t kgsl_pipeline_keep_percent = 85;
+  uint32_t kgsl_pipeline_min_count = 192;
   // If ordinary pressure reclamation is not enough, retain only this many hot
   // pipelines and reset the driver compiler cache instead of clearing every
   // guest pipeline and starting a full recompilation storm.
@@ -200,10 +194,18 @@ struct AndroidHaloExperiment {
   // Keeping the Vulkan binary cache makes an evicted pipeline much cheaper to
   // recreate. Emergency LRU reclamation always resets it regardless of this
   // flag while retaining the configured hot guest-pipeline subset.
-  bool kgsl_reset_driver_pipeline_cache_on_trim = true;
+  // t160: resetting on every ordinary trim forced a recompile storm and
+  // dropped the flyover to 0.1 fps. Ordinary pressure keeps the cache.
+  bool kgsl_reset_driver_pipeline_cache_on_trim = false;
   // Per-run diagnostic logging switches. These intentionally live in
   // halo_experiment.txt rather than xenios_android_profile.txt because private
   // saved profiles can shadow the pushed external profile on Android.
+  // Census of the live pipeline set: how many distinct shader programs those
+  // pipelines actually represent, and which PipelineDescription state fields
+  // generate the permutations. Answers whether the pipeline count - and so the
+  // Adreno driver memory it costs - is reducible via dynamic state or is
+  // irreducibly one pipeline per shader.
+  bool log_pipeline_key_census = false;
   bool log_draws = false;
   bool log_texture_bindings = false;
   uint32_t log_texture_binding_skip_draws = 0;
@@ -293,25 +295,25 @@ struct AndroidHaloExperiment {
   bool menu_skip_base0_triangle_list_draw = false;
   // Force fixed-point RG16/RGBA16 textures through the float conversion shader
   // even when native SNORM/UNORM sampling and filtering are advertised.
-  // Default ON for Reach: Adreno sampling of scene scratch (0x02354000) is
-  // unreliable for both signed and unsigned views; load as SFLOAT so
-  // exp_adjust +5 sees the intended [-32,32] / [0,32] range.
+  // Retained compatibility default. Correctness on the Android scene path
+  // remains unverified; this flag is not evidence of a driver defect.
   bool rgba16_fixed_texture_float_fallback = true;
-  // Obsolete: resolve shaders now use true Edram fixed16 pack. Kept so old
-  // experiment files still parse; has no effect.
+  // Experimental bias adjustment in full 7e3-to-fixed16 resolves. This is
+  // active code: it subtracts one from biases in (-32, -5], rather than
+  // selecting a signed packing shader. Keep off for an unmodified resolve.
   bool signed_fixed16_resolve_pack = false;
-  // Force exp_bias -5 for 7e3→fixed16 (old UNORM(f/32) path). Default OFF:
-  // with Edram pack, bias 0 preserves the full [0, 32) HDR range.
+  // Override the guest's 7e3-to-fixed16 resolve bias with -5. Experimental;
+  // the current XePack64bpp4Pixels shader uses UNORM packing for formats 21/26.
   bool force_7e3_fixed16_resolve_exp_bias_minus5 = false;
-  // Preserve the full 7e3 RGB range when an ownership dump is repacked to an
-  // RGBA8 consumer view instead of clamping all HDR values above 1 to white.
-  // WO35 promoted this after the Reach scene was verified on device.
+  // Optional display transform for explicitly requested RGBA8 repacking.
+  // This changes guest color values and is not an accurate native-format dump.
   bool normalize_7e3_to_rgba8_repack = true;
-  // WO36/40 low-range + highlight recovery for the RGBA8 compatibility path:
+  // Display curves used only by the RGBA8 repacking experiment:
   // 0 = linear /31.875
-  // 1 = sqrt(linear) — midtone lift (playability default; WO39 baseline)
+  // 1 = sqrt(linear) — midtone lift
   // 2 = Reinhard x/(1+x) — soft global shoulder
-  // 3 = linear /31.875 then soft knee c/(c+0.35) — experimental highlight roll-off
+  // 3 = linear /31.875 then soft knee c/(c+0.35) — experimental highlight
+  // roll-off
   uint32_t normalize_7e3_to_rgba8_repack_curve = 1;
   // Load Reach's RGBA8 scene view using the k8in16 byte swap used by the
   // fixed16 view instead of the fetch constant's k8in32 operation.
@@ -356,7 +358,7 @@ struct AndroidHaloExperiment {
   // Prefer dumping the existing 7e3 FLOAT RT at base 675 for HDR scene
   // resolves (dest 0x02354000 fmt26) when LDR currently owns the tiles.
   // Keeps LDR transfers working for lighting while fixing fmt26 dump source.
-  bool dump_scene_675_prefer_7e3_float = false;
+  bool dump_scene_675_prefer_7e3_float = true;
   // Diagnostic A/B: skip ColorToColor transfers from a single source RT format
   // into the presentable base-1350 8888 target. -1 disables the skip.
   int32_t skip_presentable_color_transfer_src_fmt = -1;
@@ -381,7 +383,7 @@ struct AndroidHaloExperiment {
   // Guest addresses dumped at the oracle frames, in addition to the swap
   // texture itself. The latest resolve writer overrides the configured bpp
   // because these scratch addresses are reused across formats.
-  bool dump_files = true;
+  bool dump_files = false;
   static constexpr uint32_t kMaxDumpAddresses = 8;
   uint32_t dump_addresses[kMaxDumpAddresses] = {0x02354000, 0x02D08000,
                                                 0x03044000};
@@ -534,6 +536,8 @@ inline AndroidHaloExperiment LoadAndroidHaloExperiment(
           parse_bool(result.kgsl_exclude_sparse_shared_memory);
         } else if (name == "kgsl_reclaim_retained_pools") {
           parse_bool(result.kgsl_reclaim_retained_pools);
+        } else if (name == "log_pipeline_key_census") {
+          parse_bool(result.log_pipeline_key_census);
         } else if (name == "kgsl_reclaim_cooldown_ms") {
           result.kgsl_reclaim_cooldown_ms = std::clamp(
               uint32_t(std::strtoul(value.c_str(), nullptr, 0)), uint32_t(500),
@@ -947,6 +951,7 @@ inline AndroidHaloExperiment LoadAndroidHaloExperiment(
   X(kgsl_preserve_pipeline_cache)                                  \
   X(kgsl_exclude_sparse_shared_memory)                             \
   X(kgsl_reclaim_retained_pools)                                   \
+  X(log_pipeline_key_census)                                       \
   X(kgsl_reclaim_cooldown_ms)                                      \
   X(kgsl_pipeline_keep_percent)                                    \
   X(kgsl_pipeline_min_count)                                       \

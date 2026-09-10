@@ -16,6 +16,7 @@
 #include <memory>
 #include <vector>
 #include "xenia/base/mutex.h"
+#include "xenia/base/reversible_admission_gate.h"
 #include "xenia/hid/input.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/skylander/skylander_portal.h"
@@ -59,13 +60,25 @@ class InputSystem {
   bool GetVibrationCvar();
   void ToggleVibration();
 
+  X_STATUS ReadSkylanderPortal(std::vector<uint8_t>& data);
+  X_STATUS WriteSkylanderPortal(std::vector<uint8_t>& data);
+
+  AdmissionGateResult CloseSaveStateInputAdmission(
+      uint64_t owner_id, std::chrono::steady_clock::time_point deadline) {
+    return save_state_admission_gate_.CloseAndWait(owner_id, deadline);
+  }
+  bool ReopenSaveStateInputAdmission(uint64_t owner_id) noexcept {
+    return save_state_admission_gate_.Reopen(owner_id);
+  }
+  AdmissionGateSnapshot GetSaveStateInputAdmissionState() const {
+    return save_state_admission_gate_.Snapshot();
+  }
+
   const std::bitset<XUserMaxUserCount> GetConnectedSlots() const {
     return connected_slots;
   }
 
   uint32_t GetLastUsedSlot() const { return last_used_slot; }
-
-  SkylanderPortal* GetSkylanderPortal() { return skylander_portal_.get(); }
 
   std::unique_lock<xe_unlikely_mutex> lock();
 
@@ -79,6 +92,10 @@ class InputSystem {
   void UpdateUsedSlot(InputDriver* driver, uint8_t slot, bool connected);
   void AdjustDeadzoneLevels(const uint8_t slot, X_INPUT_GAMEPAD* gamepad);
   X_INPUT_VIBRATION ModifyVibrationLevel(X_INPUT_VIBRATION* vibration);
+  X_RESULT GetStateForUIImpl(uint32_t user_index, uint32_t flags,
+                             X_INPUT_STATE* out_state);
+  X_RESULT SetStateImpl(uint32_t user_index,
+                        X_INPUT_VIBRATION* vibration);
 
   std::vector<InputDriver*> FilterDrivers(uint32_t flags);
 
@@ -102,6 +119,12 @@ class InputSystem {
   // This prevents button presses used to close UI dialogs from being
   // seen by the game immediately after the dialog closes.
   std::array<uint16_t, XUserMaxUserCount> consumed_buttons_{};
+
+  // Tracks every InputSystem-owned driver poll, portal access, connection
+  // update, keystroke dequeue, and vibration write. It is not registered as a
+  // complete input save-state participant because driver-internal background
+  // state has not yet joined this boundary.
+  ReversibleAdmissionGate save_state_admission_gate_;
 };
 
 }  // namespace hid

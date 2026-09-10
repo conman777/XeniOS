@@ -34,6 +34,22 @@ Entry::Entry(Device* device, Entry* parent, const std::string_view path)
 
 Entry::~Entry() = default;
 
+void Entry::AcquireOpenFileReference() {
+  auto global_lock = global_critical_region_.Acquire();
+  ++open_file_reference_count_;
+}
+
+void Entry::ReleaseOpenFileReference() {
+  auto global_lock = global_critical_region_.Acquire();
+  assert_not_zero(open_file_reference_count_);
+  --open_file_reference_count_;
+  if (!open_file_reference_count_ && delete_on_close_ && parent_) {
+    // parent_->Delete erases and destroys this entry. Don't access members
+    // after this call.
+    parent_->Delete(this);
+  }
+}
+
 void Entry::Dump(xe::StringBuffer* string_buffer, int indent) {
   for (int i = 0; i < indent; ++i) {
     string_buffer->Append(' ');
@@ -110,6 +126,11 @@ bool Entry::Delete(Entry* entry) {
     return false;
   }
   if (entry->parent() != this) {
+    return false;
+  }
+  // File objects contain raw pointers to entries. Deleting an entry while any
+  // file is still open makes later reads, writes or metadata updates a UAF.
+  if (entry->open_file_reference_count_) {
     return false;
   }
   if (!DeleteEntryInternal(entry)) {

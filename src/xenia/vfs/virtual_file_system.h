@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "xenia/base/mutex.h"
+#include "xenia/base/reversible_admission_gate.h"
 #include "xenia/vfs/device.h"
 #include "xenia/vfs/entry.h"
 #include "xenia/vfs/file.h"
@@ -50,6 +51,21 @@ class VirtualFileSystem {
                     bool is_non_directory, File** out_file,
                     FileAction* out_action);
 
+  ReversibleAdmissionGate::Lease AcquireSaveStateGuestWriteAdmission() {
+    return save_state_guest_write_admission_gate_.Enter();
+  }
+  AdmissionGateResult CloseSaveStateGuestWriteAdmission(
+      uint64_t owner_id, std::chrono::steady_clock::time_point deadline) {
+    return save_state_guest_write_admission_gate_.CloseAndWait(owner_id,
+                                                               deadline);
+  }
+  bool ReopenSaveStateGuestWriteAdmission(uint64_t owner_id) noexcept {
+    return save_state_guest_write_admission_gate_.Reopen(owner_id);
+  }
+  AdmissionGateSnapshot GetSaveStateGuestWriteAdmissionState() const {
+    return save_state_guest_write_admission_gate_.Snapshot();
+  }
+
   static X_STATUS ExtractContentFile(Entry* entry,
                                      std::filesystem::path base_path,
                                      uint64_t& progress,
@@ -64,6 +80,11 @@ class VirtualFileSystem {
   xe::global_critical_region global_critical_region_;
   std::vector<std::unique_ptr<Device>> devices_;
   std::unordered_map<std::string, std::string> symlinks_;
+
+  // Covers only bounded synchronous guest XFile mutations. Direct VFS writes,
+  // writable mappings, backend async I/O, and external host writers do not
+  // participate yet, so this is not a complete VFS save-state boundary.
+  ReversibleAdmissionGate save_state_guest_write_admission_gate_;
 
   bool ResolveSymbolicLink(const std::string_view path, std::string& result);
 };

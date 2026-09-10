@@ -32,6 +32,8 @@
 #include "xenia/cpu/thread.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/cpu/xex_module.h"
+#include "xenia/kernel/xthread.h"
+#include "xenia/save_state_runtime.h"
 
 // TODO(benvanik): based on compiler support
 #if XE_ARCH_AMD64
@@ -87,9 +89,12 @@ class BuiltinModule : public Module {
 };
 
 Processor::Processor(xe::Memory* memory, ExportResolver* export_resolver)
-    : memory_(memory), export_resolver_(export_resolver) {}
+    : memory_(memory),
+      live_guest_runtime_(std::make_unique<save_state::LiveGuestRuntime>()),
+      export_resolver_(export_resolver) {}
 
 Processor::~Processor() {
+  ReleaseSaveStateBoundary();
   {
     auto global_lock = global_critical_region_.Acquire();
     modules_.clear();
@@ -103,6 +108,60 @@ Processor::~Processor() {
     functions_trace_file_.reset();
   }
 }
+
+bool Processor::AcquireSaveStateBoundary(std::chrono::milliseconds timeout,
+                                         std::string* error_message) {
+  if (save_state_boundary_) {
+    if (error_message) {
+      *error_message = "A guest CPU save boundary is already held.";
+    }
+    return false;
+  }
+  save_state::LiveBoundaryError boundary_error =
+      save_state::LiveBoundaryError::kNone;
+  save_state_boundary_ =
+      live_guest_runtime_->AcquireBoundary(timeout, &boundary_error);
+  if (!save_state_boundary_) {
+    const save_state::BarrierStatus barrier_status =
+        live_guest_runtime_->barrier_status();
+    XELOGE(
+        "Guest CPU save boundary failed: error={} generation={} phase={} "
+        "participants={} arrived={} waiters={}",
+        uint32_t(boundary_error), barrier_status.generation,
+        uint32_t(barrier_status.phase), barrier_status.participant_count,
+        barrier_status.arrived_count, barrier_status.waiter_count);
+    if (error_message) {
+      switch (boundary_error) {
+        case save_state::LiveBoundaryError::kBusy:
+          *error_message =
+              "A previous guest CPU safe-point boundary is still active.";
+          break;
+        case save_state::LiveBoundaryError::kTimedOut:
+          *error_message =
+              "Guest CPU threads did not reach safe points in time.";
+          break;
+        case save_state::LiveBoundaryError::kInvalidTimeout:
+          *error_message = "The guest CPU safe-point timeout is invalid.";
+          break;
+        case save_state::LiveBoundaryError::kNoParticipants:
+          *error_message =
+              "No guest CPU threads are available for the save boundary.";
+          break;
+        case save_state::LiveBoundaryError::kBarrierRejected:
+          *error_message = "The guest CPU safe-point boundary was rejected.";
+          break;
+        case save_state::LiveBoundaryError::kNone:
+        default:
+          *error_message = "The guest CPU safe-point boundary failed.";
+          break;
+      }
+    }
+    return false;
+  }
+  return true;
+}
+
+void Processor::ReleaseSaveStateBoundary() { save_state_boundary_.Reset(); }
 
 bool Processor::Setup(std::unique_ptr<backend::Backend> backend) {
   // TODO(benvanik): query mode from debugger?
@@ -447,10 +506,15 @@ bool Processor::Restore(ByteStream* stream) {
     return false;
   }
 
-  // Clear cached thread data for zombie threads.
+  // Restored guest threads reuse their saved IDs. Remove any guest debugger
+  // records left by title teardown before XThread::Restore registers the new
+  // instances, while preserving long-lived host XThreads.
   std::vector<uint32_t> to_delete;
   for (auto& it : thread_debug_infos_) {
-    if (it.second->state == ThreadDebugInfo::State::kZombie) {
+    auto* xthread = static_cast<kernel::XThread*>(it.second->thread);
+    if ((xthread && xthread->is_guest_thread()) ||
+        it.second->state == ThreadDebugInfo::State::kZombie) {
+      live_guest_runtime_->UnregisterThread(it.first);
       it.second->thread_handle = 0;
       to_delete.push_back(it.first);
     }
@@ -484,6 +548,22 @@ void Processor::OnFunctionDefined(Function* function) {
 
 void Processor::OnThreadCreated(uint32_t thread_handle,
                                 ThreadState* thread_state, Thread* thread) {
+  // Processor thread registration is driven exclusively by kernel XThread.
+  auto* xthread = static_cast<kernel::XThread*>(thread);
+  if (xthread && xthread->is_guest_thread() &&
+      thread->can_debugger_suspend()) {
+    ppc::PPCContext* context = thread_state->context();
+    if (live_guest_runtime_->RegisterThread(thread_state->thread_id(),
+                                            context)) {
+      context->save_state_runtime = live_guest_runtime_.get();
+      context->save_state_requested_generation =
+          live_guest_runtime_->requested_generation_address();
+    } else {
+      XELOGE("Unable to enroll guest thread {} for save-state polling.",
+             thread_state->thread_id());
+    }
+  }
+
   auto global_lock = global_critical_region_.Acquire();
   auto thread_info = std::make_unique<ThreadDebugInfo>();
   thread_info->thread_id = thread_state->thread_id();
@@ -491,29 +571,51 @@ void Processor::OnThreadCreated(uint32_t thread_handle,
   thread_info->state = ThreadDebugInfo::State::kAlive;
   thread_info->suspended = false;
   thread_info->thread_handle = thread_handle;
-  thread_debug_infos_.emplace(thread_info->thread_id, std::move(thread_info));
+  thread_debug_infos_.insert_or_assign(thread_info->thread_id,
+                                       std::move(thread_info));
 }
 
 void Processor::OnThreadExit(uint32_t thread_id) {
+  if (auto* context = reinterpret_cast<ppc::PPCContext*>(
+          live_guest_runtime_->UnregisterThread(thread_id))) {
+    context->save_state_requested_generation = nullptr;
+    context->save_state_runtime = nullptr;
+  }
+
   auto global_lock = global_critical_region_.Acquire();
   auto it = thread_debug_infos_.find(thread_id);
-  assert_true(it != thread_debug_infos_.end());
-  auto thread_info = it->second.get();
-  thread_info->state = ThreadDebugInfo::State::kExited;
+  if (it != thread_debug_infos_.end()) {
+    it->second->state = ThreadDebugInfo::State::kExited;
+  }
 }
 
 void Processor::OnThreadDestroyed(uint32_t thread_id) {
+  if (auto* context = reinterpret_cast<ppc::PPCContext*>(
+          live_guest_runtime_->UnregisterThread(thread_id))) {
+    context->save_state_requested_generation = nullptr;
+    context->save_state_runtime = nullptr;
+  }
+
   auto global_lock = global_critical_region_.Acquire();
   auto it = thread_debug_infos_.find(thread_id);
-  assert_true(it != thread_debug_infos_.end());
-  it->second->thread_handle = 0;
-  thread_debug_infos_.erase(it);
+  if (it != thread_debug_infos_.end()) {
+    it->second->thread_handle = 0;
+    thread_debug_infos_.erase(it);
+  }
 }
 
 void Processor::OnThreadEnteringWait(uint32_t thread_id) {
+  if (auto* context = reinterpret_cast<ppc::PPCContext*>(
+          live_guest_runtime_->UnregisterThread(thread_id))) {
+    context->save_state_requested_generation = nullptr;
+    context->save_state_runtime = nullptr;
+  }
+
   auto global_lock = global_critical_region_.Acquire();
   auto it = thread_debug_infos_.find(thread_id);
-  assert_true(it != thread_debug_infos_.end());
+  if (it == thread_debug_infos_.end()) {
+    return;
+  }
   auto thread_info = it->second.get();
   thread_info->state = ThreadDebugInfo::State::kWaiting;
 }
@@ -521,8 +623,19 @@ void Processor::OnThreadEnteringWait(uint32_t thread_id) {
 void Processor::OnThreadLeavingWait(uint32_t thread_id) {
   auto global_lock = global_critical_region_.Acquire();
   auto it = thread_debug_infos_.find(thread_id);
-  assert_true(it != thread_debug_infos_.end());
+  if (it == thread_debug_infos_.end()) {
+    return;
+  }
   auto thread_info = it->second.get();
+  auto* context = thread_info->thread->thread_state()->context();
+  global_lock.unlock();
+  if (thread_info->thread->can_debugger_suspend() &&
+      live_guest_runtime_->RegisterThread(thread_id, context)) {
+    context->save_state_runtime = live_guest_runtime_.get();
+    context->save_state_requested_generation =
+        live_guest_runtime_->requested_generation_address();
+  }
+  global_lock = global_critical_region_.Acquire();
   if (thread_info->state == ThreadDebugInfo::State::kWaiting) {
     thread_info->state = ThreadDebugInfo::State::kAlive;
   }

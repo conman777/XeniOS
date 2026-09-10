@@ -658,4 +658,36 @@ JNIEXPORT void JNICALL Java_jp_xenios_emulator_WindowedAppActivity_paintWindow(
       ->JniActivityPaintWindow(bool(force_paint));
 }
 
+JNIEXPORT jstring JNICALL
+Java_jp_xenios_emulator_WindowedAppActivity_collectNativeDiagnosticSnapshotNative(
+    JNIEnv* jni_env, jobject activity, jlong app_context_ptr) {
+  auto* app_context =
+      reinterpret_cast<xe::ui::AndroidWindowedAppContext*>(app_context_ptr);
+  xe::ui::WindowedApp* app = app_context ? app_context->app() : nullptr;
+  const std::string snapshot =
+      app ? app->GetDiagnosticSnapshotJson() : std::string("{}");
+  return jni_env->NewStringUTF(snapshot.c_str());
+}
+
+JNIEXPORT jstring JNICALL
+Java_jp_xenios_emulator_WindowedAppActivity_runDiagnosticSaveStateNative(
+    JNIEnv* jni_env, jobject activity, jlong app_context_ptr, jstring path,
+    jboolean restore) {
+  auto* app_context =
+      reinterpret_cast<xe::ui::AndroidWindowedAppContext*>(app_context_ptr);
+  xe::ui::WindowedApp* app = app_context ? app_context->app() : nullptr;
+  if (!app || !path) {
+    return jni_env->NewStringUTF(
+        "error\tThe emulator runtime is unavailable.");
+  }
+  const char* path_utf8 = jni_env->GetStringUTFChars(path, nullptr);
+  if (!path_utf8) {
+    return jni_env->NewStringUTF("error\tThe save path is unavailable.");
+  }
+  const std::string result =
+      app->RunDiagnosticSaveState(path_utf8, bool(restore));
+  jni_env->ReleaseStringUTFChars(path, path_utf8);
+  return jni_env->NewStringUTF(result.c_str());
+}
+
 }  // extern "C"

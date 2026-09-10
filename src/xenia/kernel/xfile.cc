@@ -85,6 +85,7 @@ void LogAndroidFileReadBufferRegion(std::string_view label,
 XFile::XFile(KernelState* kernel_state, vfs::File* file, bool synchronous)
     : XObject(kernel_state, kObjectType),
       file_(file),
+      absolute_path_(file->entry()->absolute_path()),
       is_synchronous_(synchronous) {
   async_event_ = threading::Event::CreateAutoResetEvent(false);
   assert_not_null(async_event_);
@@ -97,6 +98,14 @@ XFile::XFile() : XObject(kObjectType), completion_port_lock_() {
 
 XFile::~XFile() {
   // TODO(benvanik): signal that the file is closing?
+  ReversibleAdmissionGate::Lease kernel_completion_admission;
+  ReversibleAdmissionGate::Lease vfs_write_admission;
+  if (file_->entry()->delete_on_close()) {
+    kernel_completion_admission =
+        kernel_state()->AcquireSaveStateKernelDispatchTimerAdmission();
+    vfs_write_admission =
+        kernel_state()->file_system()->AcquireSaveStateGuestWriteAdmission();
+  }
   async_event_->Set();
   file_->Destroy();
 }
@@ -482,6 +491,7 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
   }
 
   auto abs_path = stream->Read<std::string>();
+  file->absolute_path_ = abs_path;
   uint64_t position = stream->Read<uint64_t>();
   auto access = stream->Read<uint32_t>();
   auto is_directory = stream->Read<bool>();

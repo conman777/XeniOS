@@ -18,6 +18,10 @@ namespace xe {
 namespace kernel {
 namespace util {
 
+namespace {
+constexpr uint32_t kMaximumRestoredObjectTableCapacity = 1u << 20;
+}
+
 ObjectTable::ObjectTable() {}
 
 ObjectTable::~ObjectTable() { Reset(); }
@@ -90,11 +94,18 @@ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot, bool host) {
 
 bool ObjectTable::Resize(uint32_t new_capacity, bool host) {
   uint32_t capacity = host ? host_table_capacity_ : table_capacity_;
-  uint32_t new_size = new_capacity * sizeof(ObjectTableEntry);
-  uint32_t old_size = capacity * sizeof(ObjectTableEntry);
+  if (new_capacity == capacity) {
+    return true;
+  }
+  if (new_capacity > kMaximumRestoredObjectTableCapacity) {
+    XELOGE("Refusing object table capacity {} (host={})", new_capacity, host);
+    return false;
+  }
+  const size_t new_size = size_t(new_capacity) * sizeof(ObjectTableEntry);
+  const size_t old_size = size_t(capacity) * sizeof(ObjectTableEntry);
   auto new_table = reinterpret_cast<ObjectTableEntry*>(
       realloc(host ? host_table_ : table_, new_size));
-  if (!new_table) {
+  if (!new_table && new_size) {
     return false;
   }
 
@@ -277,11 +288,16 @@ void ObjectTable::PurgeAllObjects() {
     auto& entry = table_[slot];
     if (entry.object) {
       entry.handle_ref_count = 0;
+      // Forced title teardown is not the normal handle-by-handle destruction
+      // path. Remove the reverse mappings before releasing the table's
+      // references so an object whose last reference is in this slot can be
+      // destroyed without retaining stale guest handles.
+      entry.object->handles().clear();
       entry.object->Release();
-
       entry.object = nullptr;
     }
   }
+  name_table_.clear();
 }
 
 ObjectTable::ObjectTableEntry* ObjectTable::LookupTable(X_HANDLE handle) {
@@ -298,10 +314,10 @@ ObjectTable::ObjectTableEntry* ObjectTable::LookupTableInLock(X_HANDLE handle) {
   const bool is_host_object = XObject::is_handle_host_object(handle);
   uint32_t slot = GetHandleSlot(handle, is_host_object);
   if (is_host_object) {
-    if (slot <= host_table_capacity_) {
+    if (slot < host_table_capacity_) {
       return &host_table_[slot];
     }
-  } else if (slot <= table_capacity_) {
+  } else if (slot < table_capacity_) {
     return &table_[slot];
   }
 
@@ -450,14 +466,37 @@ bool ObjectTable::Save(ByteStream* stream) {
 }
 
 bool ObjectTable::Restore(ByteStream* stream) {
-  Resize(stream->Read<uint32_t>(), true);
+  if (stream->data_length() - stream->offset() < sizeof(uint32_t)) {
+    XELOGE("Truncated host object table capacity.");
+    return false;
+  }
+  const uint32_t restored_host_capacity = stream->Read<uint32_t>();
+  if (restored_host_capacity > kMaximumRestoredObjectTableCapacity ||
+      size_t(restored_host_capacity) >
+          (stream->data_length() - stream->offset()) / sizeof(int32_t) ||
+      !Resize(restored_host_capacity, true)) {
+    XELOGE("Invalid host object table capacity {}.",
+           restored_host_capacity);
+    return false;
+  }
   for (uint32_t i = 0; i < host_table_capacity_; i++) {
     auto& entry = host_table_[i];
     // entry.object = nullptr;
     entry.handle_ref_count = stream->Read<int32_t>();
   }
 
-  Resize(stream->Read<uint32_t>(), false);
+  if (stream->data_length() - stream->offset() < sizeof(uint32_t)) {
+    XELOGE("Truncated guest object table capacity.");
+    return false;
+  }
+  const uint32_t restored_capacity = stream->Read<uint32_t>();
+  if (restored_capacity > kMaximumRestoredObjectTableCapacity ||
+      size_t(restored_capacity) >
+          (stream->data_length() - stream->offset()) / sizeof(int32_t) ||
+      !Resize(restored_capacity, false)) {
+    XELOGE("Invalid guest object table capacity {}.", restored_capacity);
+    return false;
+  }
   for (uint32_t i = 0; i < table_capacity_; i++) {
     auto& entry = table_[i];
     // entry.object = nullptr;
@@ -471,14 +510,17 @@ X_STATUS ObjectTable::RestoreHandle(X_HANDLE handle, XObject* object) {
   const bool is_host_object = XObject::is_handle_host_object(handle);
   uint32_t slot = GetHandleSlot(handle, is_host_object);
   uint32_t capacity = is_host_object ? host_table_capacity_ : table_capacity_;
-  assert_true(capacity >= slot);
-
-  if (capacity >= slot) {
-    auto& entry = is_host_object ? host_table_[slot] : table_[slot];
-    entry.object = object;
-    object->Retain();
+  if (!object || slot >= capacity) {
+    XELOGE(
+        "Invalid restored object handle 0x{:08X}: slot={} capacity={} "
+        "host={}",
+        handle, slot, capacity, is_host_object);
+    return X_STATUS_INVALID_HANDLE;
   }
 
+  auto& entry = is_host_object ? host_table_[slot] : table_[slot];
+  entry.object = object;
+  object->Retain();
   return X_STATUS_SUCCESS;
 }
 

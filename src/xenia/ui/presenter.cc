@@ -213,6 +213,7 @@ void Presenter::OnSurfaceResizeFromUIThread() {
 }
 
 void Presenter::PaintFromUIThread(bool force_paint) {
+  auto save_state_operation = EnterSaveStateOperation();
   // If there is no surface, this will be a no-op, nothing outdated, nothing to
   // paint. However, an explicit monitor check is needed because UI framerate
   // limiting may be tied to signals from the OS for the monitor - but painting
@@ -353,6 +354,7 @@ bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height,
     uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+  auto save_state_operation = EnterSaveStateOperation();
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
@@ -455,6 +457,24 @@ bool Presenter::RefreshGuestOutput(
   }
 
   return is_active;
+}
+
+bool Presenter::QuiesceForSaveState(
+    uint64_t owner_id, std::chrono::steady_clock::time_point deadline) {
+  if (save_state_operation_admission_.CloseAndWait(owner_id, deadline) !=
+      AdmissionGateResult::kReached) {
+    return false;
+  }
+  if (DrainForSaveState(deadline) &&
+      std::chrono::steady_clock::now() <= deadline) {
+    return true;
+  }
+  save_state_operation_admission_.Reopen(owner_id);
+  return false;
+}
+
+bool Presenter::ReopenAfterSaveState(uint64_t owner_id) noexcept {
+  return save_state_operation_admission_.Reopen(owner_id);
 }
 
 void Presenter::SetGuestOutputPaintConfigFromUIThread(

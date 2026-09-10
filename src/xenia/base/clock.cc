@@ -12,6 +12,7 @@
 #include <mutex>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/guest_interrupt_clock.h"
 #include "xenia/base/math.h"
 #include "xenia/base/mutex.h"
 
@@ -54,6 +55,27 @@ using tick_mutex_type = std::mutex;
 // Heap-allocated and intentionally leaked to avoid static destruction order
 // issues where threads may outlive static destructors.
 static tick_mutex_type* tick_mutex_ = new tick_mutex_type();
+bool guest_time_frozen_ = false;
+GuestInterruptClock guest_interrupt_clock_ = []() {
+  GuestInterruptClock clock;
+  clock.Reset(last_guest_tick_count_, Clock::QueryHostInterruptTime(),
+              guest_tick_frequency_);
+  return clock;
+}();
+
+uint64_t UpdateGuestClockLocked(uint64_t host_tick_count) {
+  if (guest_time_frozen_) {
+    return last_guest_tick_count_;
+  }
+  uint64_t host_tick_delta = host_tick_count > last_host_tick_count_
+                                 ? host_tick_count - last_host_tick_count_
+                                 : 0;
+  last_host_tick_count_ = host_tick_count;
+  uint64_t guest_tick_delta =
+      host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
+  last_guest_tick_count_ += guest_tick_delta;
+  return last_guest_tick_count_;
+}
 
 void RecomputeGuestTickScalar() {
   // Create a rational number with numerator (first) and denominator (second)
@@ -85,22 +107,8 @@ uint64_t UpdateGuestClock() {
     return host_tick_count * guest_tick_ratio_.first / guest_tick_ratio_.second;
   }
 
-  std::unique_lock<tick_mutex_type> lock(*tick_mutex_, std::defer_lock);
-  if (lock.try_lock()) {
-    // Translate host tick count to guest tick count.
-    uint64_t host_tick_delta = host_tick_count > last_host_tick_count_
-                                   ? host_tick_count - last_host_tick_count_
-                                   : 0;
-    last_host_tick_count_ = host_tick_count;
-    uint64_t guest_tick_delta =
-        host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
-    last_guest_tick_count_ += guest_tick_delta;
-    return last_guest_tick_count_;
-  } else {
-    // Wait until another thread has finished updating the clock.
-    lock.lock();
-    return last_guest_tick_count_;
-  }
+  std::lock_guard<tick_mutex_type> lock(*tick_mutex_);
+  return UpdateGuestClockLocked(host_tick_count);
 }
 
 // Offset of the current guest system file time relative to the guest base time.
@@ -179,7 +187,90 @@ uint64_t Clock::QueryGuestSystemTime() {
 }
 
 uint64_t Clock::QueryGuestInterruptTime() {
-  return Clock::QueryHostInterruptTime();
+  if (cvars::clock_no_scaling) {
+    return Clock::QueryHostInterruptTime();
+  }
+  std::lock_guard<tick_mutex_type> lock(*tick_mutex_);
+  const uint64_t guest_tick_count =
+      UpdateGuestClockLocked(Clock::QueryHostTickCount());
+  return guest_interrupt_clock_.Query(guest_tick_count);
+}
+
+bool Clock::FreezeGuestTime(GuestClockState* state) {
+  if (!state || cvars::clock_no_scaling) {
+    return false;
+  }
+  std::lock_guard<tick_mutex_type> lock(*tick_mutex_);
+  if (guest_time_frozen_) {
+    return false;
+  }
+  UpdateGuestClockLocked(Clock::QueryHostTickCount());
+  guest_time_frozen_ = true;
+  state->guest_tick_count = last_guest_tick_count_;
+  state->guest_tick_frequency = guest_tick_frequency_;
+  state->tick_ratio_numerator = guest_tick_ratio_.first;
+  state->tick_ratio_denominator = guest_tick_ratio_.second;
+  state->guest_system_time_base = guest_system_time_base_;
+  state->guest_interrupt_time =
+      guest_interrupt_clock_.Query(last_guest_tick_count_);
+  state->guest_time_scalar = guest_time_scalar_;
+  return true;
+}
+
+bool Clock::CaptureFrozenGuestTime(GuestClockState* state) {
+  if (!state) {
+    return false;
+  }
+  std::lock_guard<tick_mutex_type> lock(*tick_mutex_);
+  if (!guest_time_frozen_) {
+    return false;
+  }
+  state->guest_tick_count = last_guest_tick_count_;
+  state->guest_tick_frequency = guest_tick_frequency_;
+  state->tick_ratio_numerator = guest_tick_ratio_.first;
+  state->tick_ratio_denominator = guest_tick_ratio_.second;
+  state->guest_system_time_base = guest_system_time_base_;
+  state->guest_interrupt_time =
+      guest_interrupt_clock_.Query(last_guest_tick_count_);
+  state->guest_time_scalar = guest_time_scalar_;
+  return true;
+}
+
+bool Clock::RestoreFrozenGuestTime(const GuestClockState& state) {
+  if (!state.guest_tick_frequency || !state.tick_ratio_numerator ||
+      !state.tick_ratio_denominator || !std::isfinite(state.guest_time_scalar) ||
+      state.guest_time_scalar <= 0.0) {
+    return false;
+  }
+  GuestInterruptClock restored_interrupt_clock;
+  if (!restored_interrupt_clock.Reset(
+          state.guest_tick_count, state.guest_interrupt_time,
+          state.guest_tick_frequency)) {
+    return false;
+  }
+  std::lock_guard<tick_mutex_type> lock(*tick_mutex_);
+  if (!guest_time_frozen_) {
+    return false;
+  }
+  last_guest_tick_count_ = state.guest_tick_count;
+  last_host_tick_count_ = Clock::QueryHostTickCount();
+  guest_tick_frequency_ = state.guest_tick_frequency;
+  guest_tick_ratio_ = {state.tick_ratio_numerator,
+                       state.tick_ratio_denominator};
+  guest_system_time_base_ = state.guest_system_time_base;
+  guest_time_scalar_ = state.guest_time_scalar;
+  guest_interrupt_clock_ = restored_interrupt_clock;
+  return true;
+}
+
+bool Clock::UnfreezeGuestTime() {
+  std::lock_guard<tick_mutex_type> lock(*tick_mutex_);
+  if (!guest_time_frozen_) {
+    return false;
+  }
+  last_host_tick_count_ = Clock::QueryHostTickCount();
+  guest_time_frozen_ = false;
+  return true;
 }
 
 uint32_t Clock::QueryGuestUptimeMillis() {

@@ -32,6 +32,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
+#include "xenia/base/reversible_admission_gate.h"
 #include "xenia/ui/surface.h"
 #include "xenia/ui/ui_drawer.h"
 
@@ -307,6 +308,14 @@ class Presenter {
   // them too.
   void PaintFromUIThread(bool force_paint = false);
 
+  // Closes refresh, paint, present and capture admission, then waits for all
+  // backend work accepted before the close to complete. The hold remains in
+  // place until ReopenAfterSaveState. Intended only for the bounded
+  // diagnostic save-state path.
+  bool QuiesceForSaveState(
+      uint64_t owner_id, std::chrono::steady_clock::time_point deadline);
+  bool ReopenAfterSaveState(uint64_t owner_id) noexcept;
+
   // Pass 0 as width or height to disable guest output until the next refresh
   // with an actual size. The display aspect ratio may be specified like 16:9 or
   // like 1280:720, both are accepted, for simplicity, the guest display size
@@ -338,6 +347,14 @@ class Presenter {
   void RequestUIPaintFromUIThread();
 
  protected:
+  ReversibleAdmissionGate::Lease EnterSaveStateOperation() {
+    return save_state_operation_admission_.Enter();
+  }
+  virtual bool DrainForSaveState(
+      std::chrono::steady_clock::time_point deadline) {
+    return true;
+  }
+
   enum class PaintResult {
     kPresented,
     kPresentedSuboptimal,
@@ -851,6 +868,7 @@ class Presenter {
   // (even if the UI thread argument is false - such as when the guest output is
   // refreshed on the UI thread).
   HostGpuLossCallback host_gpu_loss_callback_;
+  ReversibleAdmissionGate save_state_operation_admission_;
 
   // May be accessed by the guest output thread if the paint mode is not kNone,
   // to request painting (for kUIThreadOnRequest) or reconnection (for

@@ -22,6 +22,7 @@
 #include <mutex>
 #include <queue>
 #include <set>
+#include <shared_mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -75,6 +76,14 @@ class VulkanPipelineCache {
     // the real pipeline is being compiled in the background.
     std::atomic<bool> is_placeholder{false};
 
+    // True while a creation request for this pipeline sits in the creation
+    // queue or is being compiled by a worker. Guards against permanently-null
+    // placeholders when a request had to be dropped because the creation queue
+    // was full - the next draw of this state re-queues it once there is room.
+    std::atomic<bool> creation_queued{false};
+    // A driver/translation failure must not be compiled again on every draw.
+    std::atomic<bool> creation_failed{false};
+
     // Monotonically increasing command-processor usage stamp. Pipelines loaded
     // speculatively from storage remain at zero until a guest draw uses them,
     // making them the first candidates for memory-pressure eviction.
@@ -88,6 +97,8 @@ class VulkanPipelineCache {
         : pipeline(other.pipeline.load(std::memory_order_acquire)),
           pipeline_layout(other.pipeline_layout),
           is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+          creation_queued(false),
+          creation_failed(other.creation_failed.load(std::memory_order_acquire)),
           last_used_sequence(other.last_used_sequence) {
     }
 
@@ -96,6 +107,9 @@ class VulkanPipelineCache {
         : pipeline(other.pipeline.load(std::memory_order_acquire)),
           pipeline_layout(other.pipeline_layout),
           is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+          creation_queued(
+              other.creation_queued.load(std::memory_order_acquire)),
+          creation_failed(other.creation_failed.load(std::memory_order_acquire)),
           last_used_sequence(other.last_used_sequence) {
     }
 
@@ -127,19 +141,54 @@ class VulkanPipelineCache {
   // timeline has been refreshed.
   void CompletedSubmissionUpdated();
   size_t deferred_pipeline_count();
+  // Flushes shader/pipeline storage and wakes creation threads. Does not wait
+  // for compiles — placeholders keep the frame loop moving (D3D12 behavior).
   void EndSubmission();
+
+
+  void BeginPostRestoreWarmup();
+  void EndPostRestoreWarmup();
   void ClearCache();
   // Evicts the least recently used guest pipelines until no more than
   // max_pipeline_count remain. If requested, the driver compiler cache is
   // reset even when the guest pipeline count is already within the limit.
   // The caller must idle the GPU queue first.
-  size_t TrimCache(size_t max_pipeline_count, bool reset_driver_cache);
+  // protect_recent: skip placeholders, in-flight compiles, and pipelines used
+  // in the last 1024 ConfigurePipeline calls so a flyover growth spike cannot
+  // evict the working set (t160). Emergency reclaim passes false.
+  size_t TrimCache(size_t max_pipeline_count, bool reset_driver_cache,
+                   bool protect_recent = true);
   // Removes old entries after a submission and defers VkPipeline destruction
   // until that submission completes, avoiding an idle wait on the hot path.
   size_t TrimCacheAfterSubmission(size_t max_pipeline_count,
                                   uint64_t submission_index);
   size_t pipeline_count() const { return pipelines_.size(); }
   bool IsCreatingPipelines();
+  struct CreationStats {
+    size_t live = 0;
+    size_t placeholders = 0;
+    size_t null_handles = 0;
+    size_t queued = 0;
+    size_t busy = 0;
+    size_t deferred = 0;
+  };
+  // Command-processor thread only. Iterates pipelines_ plus the creation and
+  // deferred-destroy queues so SwapSummary can show compile backlog without
+  // waiting on workers.
+  CreationStats GetCreationStats();
+  // Logs what the live pipeline set is actually made of: how many distinct
+  // shader programs it represents, and which PipelineDescription state fields
+  // are multiplying those programs into separate pipelines. Gated on the
+  // log_pipeline_key_census experiment key; safe to call from the command
+  // processor thread only.
+  void LogPipelineKeyCensus(const char* reason);
+  // Blocks until no creation thread is running or has queued work. Callers that
+  // are about to destroy anything a queued creation request still holds by raw
+  // handle - render passes and pipeline layouts as well as entries in
+  // pipelines_ - must call this first, otherwise the worker hands a freed
+  // handle to vkCreateGraphicsPipelines and the driver faults inside it. No-op
+  // when creation is synchronous, since then creation cannot outlive the draw.
+  void DrainCreationThreads();
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type,
                            const uint32_t* host_address, uint32_t dword_count);
@@ -410,12 +459,7 @@ class VulkanPipelineCache {
       const PipelineCreationArguments& creation_arguments,
       VkShaderModule fragment_shader_override = VK_NULL_HANDLE);
 
-  // Creates a placeholder pipeline using the placeholder pixel shader.
-  // Used for pipeline hot-swap to reduce stutter.
-  bool EnsurePipelineCreatedWithPlaceholder(
-      const PipelineCreationArguments& creation_arguments) {
-    return EnsurePipelineCreated(creation_arguments, placeholder_pixel_shader_);
-  }
+
 
   // Optimizes a shader's SPIR-V binary if optimization is enabled and the
   // shader module hasn't been created yet. Called from creation threads.
@@ -468,7 +512,8 @@ class VulkanPipelineCache {
   VkShaderModule depth_only_fragment_shader_ = VK_NULL_HANDLE;
 
   // Placeholder pixel shader for pipeline hot-swap to reduce stutter.
-  // Outputs transparent black while the real shader compiles in background.
+  // Outputs opaque black while the real shader compiles in background so
+  // alpha-tested draws still write depth instead of punching holes.
   VkShaderModule placeholder_pixel_shader_ = VK_NULL_HANDLE;
 
   // Tessellation shaders.
@@ -493,16 +538,56 @@ class VulkanPipelineCache {
 
   // Vulkan pipeline cache for faster pipeline creation.
   VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
+  // Shared across vkCreateGraphicsPipelines so placeholder compiles on the
+  // command-processor thread can overlap real compiles on creation threads.
+  // Exclusive for any destroy/reset of driver-visible pipeline objects
+  // (VkPipeline, VkPipelineCache). Adreno/KGSL faults inside
+  // vkCreateGraphicsPipelines if a cache handle or in-flight pipeline is
+  // destroyed during create (t159). ProcessDeferredDestructions try-locks
+  // exclusive so the frame loop never waits on a compile.
+  std::shared_mutex pipeline_driver_mutex_;
 
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher>
       pipelines_;
 
   uint64_t pipeline_usage_sequence_ = 0;
 
+#if XE_PLATFORM_ANDROID
+  // A restored guest resumes in the middle of a frame graph, but host Vulkan
+  // pipelines are deliberately not serialized. Compile a bounded number of
+  // first-use pipelines synchronously so placeholder output can't turn a valid
+  // restore into a persistent black screen.
+  std::atomic<bool> post_restore_sync_active_{false};
+#endif
+
   // Previously used pipeline, to avoid lookups if the state wasn't changed.
   std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;
 
   void CreationThread();
+
+  // Maximum pending vkCreateGraphicsPipelines requests allowed in the creation
+  // queue. The opening Halo Reach flyover enqueues ~130 unique pipelines in
+  // ~6 s; an unbounded queue let Adreno compiler memory balloon until the
+  // device entered system-wide critical memory pressure (t160-t166). Requests
+  // refused here leave a null-handle placeholder whose draw is skipped, and
+  // the next draw of that state re-queues it once room exists.
+  static constexpr size_t kMaxQueuedPipelineCreates = 16;
+  // Re-queues a placeholder whose original request was dropped (queue was
+  // full) or lost. Called from the existing-entry fast path of
+  // ConfigurePipeline when a draw hit a null handle that nobody is compiling.
+  void TryRecoverUnqueuedPipeline(
+      std::pair<const PipelineDescription, Pipeline>& pipeline_pair,
+      VulkanShader::VulkanTranslation* vertex_shader,
+      VulkanShader::VulkanTranslation* pixel_shader,
+      uint32_t normalized_color_mask,
+      VulkanRenderTargetCache::RenderPassKey render_pass_key);
+  // Enqueues a real pipeline compile for async creation. Returns false when
+  // the queue is at capacity (the caller keeps the null handle; draws skip
+  // and retry later). Storage warmup may wait for room. The flag stays set
+  // until the worker finishes, covering queued and in-flight requests.
+  bool TryEnqueuePipelineCreation(
+      const PipelineCreationArguments& creation_arguments,
+      bool wait_for_space = false);
 
   // For asynchronous creation.
   std::vector<std::unique_ptr<xe::threading::Thread>> creation_threads_;
@@ -517,6 +602,7 @@ class VulkanPipelineCache {
       creation_queue_;
   std::mutex creation_request_lock_;
   std::condition_variable creation_request_cond_;
+  std::condition_variable creation_queue_space_cond_;
   std::unique_ptr<xe::threading::Event> creation_completion_event_ = nullptr;
   std::atomic<bool> creation_completion_set_event_{false};
   std::function<void()> creation_completion_callback_;
@@ -528,6 +614,7 @@ class VulkanPipelineCache {
   // Pipelines are only destroyed after the GPU submission that might reference
   // them has completed (tracked via submission numbers from command processor).
   void ProcessDeferredDestructions();
+  bool IsProtectedFromTrim(const Pipeline& pipeline, bool protect_recent) const;
   std::vector<std::pair<VkPipeline, uint64_t>> deferred_destroy_pipelines_;
   std::mutex deferred_destroy_mutex_;
 

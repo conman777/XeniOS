@@ -147,6 +147,8 @@ KernelState::KernelState(Emulator* emulator)
 }
 
 KernelState::~KernelState() {
+  ResumeTimestampUpdatesAfterSaveState();
+  ResumeDispatchWorkerAfterSaveState();
   SetExecutableModule(nullptr);
 
   ShutdownDispatchThread();
@@ -166,10 +168,46 @@ KernelState::~KernelState() {
 
 void KernelState::ShutdownDispatchThread() {
   if (dispatch_thread_running_) {
+    ResumeDispatchWorkerAfterSaveState();
     dispatch_thread_running_ = false;
     dispatch_cond_.notify_all();
+    dispatch_save_state_condition_.notify_all();
     dispatch_thread_->Wait(0, 0, 0, nullptr);
   }
+}
+
+bool KernelState::PauseDispatchWorkerForSaveState(
+    std::chrono::milliseconds timeout, std::string* error_message) {
+  if (!dispatch_thread_running_.load(std::memory_order_acquire)) {
+    return true;
+  }
+  dispatch_save_state_pause_requested_.store(true, std::memory_order_release);
+  dispatch_cond_.notify_all();
+
+  std::unique_lock<std::mutex> lock(dispatch_save_state_mutex_);
+  if (dispatch_save_state_condition_.wait_for(
+          lock, timeout,
+          [this]() { return dispatch_save_state_paused_; })) {
+    return true;
+  }
+
+  dispatch_save_state_pause_requested_.store(false,
+                                             std::memory_order_release);
+  lock.unlock();
+  dispatch_save_state_condition_.notify_all();
+  dispatch_cond_.notify_all();
+  if (error_message) {
+    *error_message =
+        "The kernel dispatch worker did not reach a safe boundary.";
+  }
+  return false;
+}
+
+void KernelState::ResumeDispatchWorkerAfterSaveState() noexcept {
+  dispatch_save_state_pause_requested_.store(false,
+                                             std::memory_order_release);
+  dispatch_save_state_condition_.notify_all();
+  dispatch_cond_.notify_all();
 }
 
 KernelState* KernelState::shared() { return shared_kernel_state_; }
@@ -611,12 +649,51 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
           auto global_lock = global_critical_region_.AcquireDeferred();
           while (dispatch_thread_running_) {
             global_lock.lock();
-            if (dispatch_queue_.empty()) {
+            while (dispatch_thread_running_ && dispatch_queue_.empty() &&
+                   !dispatch_save_state_pause_requested_.load(
+                       std::memory_order_acquire)) {
               dispatch_cond_.wait(global_lock);
-              if (!dispatch_thread_running_) {
-                global_lock.unlock();
-                break;
+            }
+            if (!dispatch_thread_running_) {
+              global_lock.unlock();
+              break;
+            }
+            global_lock.unlock();
+
+            {
+              std::unique_lock<std::mutex> pause_lock(
+                  dispatch_save_state_mutex_);
+              if (dispatch_save_state_pause_requested_.load(
+                      std::memory_order_acquire)) {
+                dispatch_save_state_paused_ = true;
+                dispatch_save_state_condition_.notify_all();
+                dispatch_save_state_condition_.wait(pause_lock, [this]() {
+                  return !dispatch_save_state_pause_requested_.load(
+                             std::memory_order_acquire) ||
+                         !dispatch_thread_running_.load(
+                             std::memory_order_acquire);
+                });
+                dispatch_save_state_paused_ = false;
+                dispatch_save_state_condition_.notify_all();
               }
+            }
+            if (!dispatch_thread_running_.load(std::memory_order_acquire)) {
+              break;
+            }
+
+            // Acquire before dequeuing so a closed boundary owns the pending
+            // queue without allowing the worker to remove untracked work.
+            auto admission =
+                save_state_dispatch_timer_admission_gate_.Enter();
+
+            global_lock.lock();
+            if (!dispatch_thread_running_) {
+              global_lock.unlock();
+              break;
+            }
+            if (dispatch_queue_.empty()) {
+              global_lock.unlock();
+              continue;
             }
             auto fn = std::move(dispatch_queue_.front());
             dispatch_queue_.pop_front();
@@ -940,8 +1017,8 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
   object_table()->ReleaseHandleInLock(module->handle());
 }
 
-void KernelState::TerminateTitle() {
-#if XE_PLATFORM_IOS
+void KernelState::TerminateTitle(bool preserve_guest_memory_for_restore) {
+#if XE_PLATFORM_IOS || XE_PLATFORM_ANDROID
   XELOGD("KernelState::TerminateTitle");
   auto global_lock = global_critical_region_.Acquire();
 
@@ -989,10 +1066,11 @@ void KernelState::TerminateTitle() {
 
   // Third: Unload all user modules (including the executable).
   for (size_t i = 0; i < user_modules_.size(); i++) {
-    X_STATUS status = user_modules_[i]->Unload();
-    assert_true(XSUCCEEDED(status));
-
-    object_table_.RemoveHandle(user_modules_[i]->handle());
+    if (!preserve_guest_memory_for_restore) {
+      X_STATUS status = user_modules_[i]->Unload();
+      assert_true(XSUCCEEDED(status));
+      object_table_.RemoveHandle(user_modules_[i]->handle());
+    }
   }
   user_modules_.clear();
 
@@ -1107,6 +1185,8 @@ std::vector<uint32_t> KernelState::GetAllThreadIDs() {
 }
 
 void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
+  auto notification_admission = AcquireSaveStateKernelAsyncAdmission(
+      save_state::KernelAsyncDomain::kNotification);
   auto global_lock = global_critical_region_.Acquire();
   notify_listeners_.push_back(retain_object(listener));
 
@@ -1129,6 +1209,8 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
 }
 
 void KernelState::UnregisterNotifyListener(XNotifyListener* listener) {
+  auto notification_admission = AcquireSaveStateKernelAsyncAdmission(
+      save_state::KernelAsyncDomain::kNotification);
   auto global_lock = global_critical_region_.Acquire();
   for (auto it = notify_listeners_.begin(); it != notify_listeners_.end();
        ++it) {
@@ -1140,6 +1222,8 @@ void KernelState::UnregisterNotifyListener(XNotifyListener* listener) {
 }
 
 void KernelState::BroadcastNotification(XNotificationID id, uint32_t data) {
+  auto notification_admission = AcquireSaveStateKernelAsyncAdmission(
+      save_state::KernelAsyncDomain::kNotification);
   auto global_lock = global_critical_region_.Acquire();
   for (const auto& notify_listener : notify_listeners_) {
     notify_listener->EnqueueNotification(id, data);
@@ -1153,6 +1237,14 @@ void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
 void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
                                        uint32_t extended_error,
                                        uint32_t length) {
+  auto admission = save_state_dispatch_timer_admission_gate_.Enter();
+  CompleteOverlappedExImpl(overlapped_ptr, result, extended_error, length);
+}
+
+void KernelState::CompleteOverlappedExImpl(uint32_t overlapped_ptr,
+                                           X_RESULT result,
+                                           uint32_t extended_error,
+                                           uint32_t length) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, result);
   XOverlappedSetExtendedError(ptr, extended_error);
@@ -1189,9 +1281,10 @@ void KernelState::CompleteOverlappedImmediateEx(uint32_t overlapped_ptr,
                                                 X_RESULT result,
                                                 uint32_t extended_error,
                                                 uint32_t length) {
+  auto admission = save_state_dispatch_timer_admission_gate_.Enter();
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
-  CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+  CompleteOverlappedExImpl(overlapped_ptr, result, extended_error, length);
 }
 
 void KernelState::CompleteOverlappedDeferred(
@@ -1235,6 +1328,7 @@ void KernelState::CompleteOverlappedDeferredEx(
     std::function<X_RESULT(uint32_t&, uint32_t&)> completion_callback,
     uint32_t overlapped_ptr, std::function<void()> pre_callback,
     std::function<void()> post_callback) {
+  auto admission = save_state_dispatch_timer_admission_gate_.Enter();
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
@@ -1257,7 +1351,7 @@ void KernelState::CompleteOverlappedDeferredEx(
     xe::threading::Sleep(kDeferredOverlappedDelayMillis);
     uint32_t extended_error, length;
     auto result = completion_callback(extended_error, length);
-    CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+    CompleteOverlappedExImpl(overlapped_ptr, result, extended_error, length);
     if (post_callback) {
       post_callback();
     }
@@ -1290,8 +1384,8 @@ bool KernelState::Save(ByteStream* stream) {
     }
 
     if (!thread->Save(stream)) {
-      XELOGD("Failed to save thread \"{}\"", thread->name());
-      num_threads--;
+      XELOGE("Failed to save guest thread \"{}\"", thread->name());
+      return false;
     }
   }
 
@@ -1314,15 +1408,14 @@ bool KernelState::Save(ByteStream* stream) {
       continue;
     }
 
+    XELOGD("Diagnostic kernel save object type={} offset={}",
+           static_cast<uint32_t>(object->type()), prev_offset);
     stream->Write<uint32_t>(static_cast<uint32_t>(object->type()));
     if (!object->Save(stream)) {
-      XELOGD("Did not save object of type {}",
-             static_cast<uint32_t>(object->type()));
-      assert_always();
-
-      // Revert backwards and overwrite if a save failed.
+      XELOGE("Failed to save kernel object type={} name='{}'",
+             static_cast<uint32_t>(object->type()), object->name());
       stream->set_offset(prev_offset);
-      num_objects--;
+      return false;
     }
   }
 
@@ -1332,7 +1425,50 @@ bool KernelState::Save(ByteStream* stream) {
 
 // this only gets triggered once per ms at most, so fields other than tick count
 // will probably not be updated in a timely manner for guest code that uses them
+bool KernelState::PauseTimestampUpdatesForSaveState(
+    std::chrono::milliseconds timeout, std::string* error_message) {
+  std::unique_lock<std::mutex> lock(timestamp_save_state_mutex_);
+  timestamp_save_state_pause_requested_ = true;
+  timestamp_save_state_condition_.notify_all();
+  if (timestamp_save_state_condition_.wait_for(
+          lock, timeout,
+          [this]() { return timestamp_save_state_paused_; })) {
+    return true;
+  }
+
+  timestamp_save_state_pause_requested_ = false;
+  lock.unlock();
+  timestamp_save_state_condition_.notify_all();
+  if (error_message) {
+    *error_message =
+        "The kernel timestamp writer did not reach a safe boundary.";
+  }
+  return false;
+}
+
+void KernelState::ResumeTimestampUpdatesAfterSaveState() noexcept {
+  {
+    std::lock_guard<std::mutex> lock(timestamp_save_state_mutex_);
+    timestamp_save_state_pause_requested_ = false;
+  }
+  timestamp_save_state_condition_.notify_all();
+}
+
 void KernelState::UpdateKeTimestampBundle() {
+  {
+    std::unique_lock<std::mutex> lock(timestamp_save_state_mutex_);
+    if (timestamp_save_state_pause_requested_) {
+      timestamp_save_state_paused_ = true;
+      timestamp_save_state_condition_.notify_all();
+      timestamp_save_state_condition_.wait(lock, [this]() {
+        return !timestamp_save_state_pause_requested_;
+      });
+      timestamp_save_state_paused_ = false;
+      timestamp_save_state_condition_.notify_all();
+    }
+  }
+
+  auto admission = save_state_dispatch_timer_admission_gate_.Enter();
   X_TIME_STAMP_BUNDLE* lpKeTimeStampBundle =
       memory_->TranslateVirtual<X_TIME_STAMP_BUNDLE*>(ke_timestamp_bundle_ptr_);
   uint32_t uptime_ms = Clock::QueryGuestUptimeMillis();
@@ -1474,37 +1610,57 @@ bool KernelState::Restore(ByteStream* stream) {
   }
 
   // Restore the object table
-  object_table_.Restore(stream);
-
-  // TLS bitmap is now stored per-process in X_KPROCESS structures (in guest
-  // memory) Skip reading old global TLS bitmap if present in old save files
-  auto num_bitmap_entries = stream->Read<uint32_t>();
-  for (uint32_t i = 0; i < num_bitmap_entries; i++) {
-    stream->Read<uint64_t>();  // Discard old data
+  if (!object_table_.Restore(stream)) {
+    XELOGE("Failed to restore the kernel object table.");
+    return false;
   }
 
   uint32_t num_threads = stream->Read<uint32_t>();
-  XELOGD("Loading {} threads...", num_threads);
+  XELOGD("Diagnostic kernel restore loading {} threads at offset={}",
+         num_threads, stream->offset());
   for (uint32_t i = 0; i < num_threads; i++) {
+    XELOGD("Diagnostic kernel restore thread {} of {} offset={}", i + 1,
+           num_threads, stream->offset());
     auto thread = XObject::Restore(this, XObject::Type::Thread, stream);
     if (!thread) {
       // Can't continue the restore or we risk misalignment.
-      assert_always();
+      XELOGE("Failed to restore guest thread {} of {} at offset={}", i + 1,
+             num_threads, stream->offset());
       return false;
     }
   }
 
   uint32_t num_objects = stream->Read<uint32_t>();
-  XELOGD("Loading {} objects...", num_objects);
+  XELOGD("Diagnostic kernel restore loading {} objects at offset={}",
+         num_objects, stream->offset());
   for (uint32_t i = 0; i < num_objects; i++) {
     uint32_t type = stream->Read<uint32_t>();
+    XELOGD("Diagnostic kernel restore object {} of {} type={} offset={}",
+           i + 1, num_objects, type, stream->offset() - sizeof(uint32_t));
 
     auto obj = XObject::Restore(this, XObject::Type(type), stream);
     if (!obj) {
       // Can't continue the restore or we risk misalignment.
-      assert_always();
+      XELOGE(
+          "Failed to restore kernel object {} of {} type={} at offset={}",
+          i + 1, num_objects, type, stream->offset());
       return false;
     }
+  }
+
+  // UserModule::Restore reconstructs the file-backed XEX module and registers
+  // it with the processor, but LoadFromFile intentionally stops at
+  // X_STATUS_PENDING. Finish the non-executing half of module loading before
+  // any restored thread is resumed so address lookup and on-demand JIT
+  // compilation have complete module metadata.
+  for (const auto& module : user_modules_) {
+    if (XFAILED(FinishLoadingUserModule(module, false))) {
+      XELOGE("Failed to finish restored user module '{}'", module->path());
+      return false;
+    }
+  }
+  if (!user_modules_.empty()) {
+    SetExecutableModule(user_modules_.front());
   }
 
   return true;
@@ -1522,6 +1678,7 @@ void KernelState::BeginDPCImpersonation(cpu::ppc::PPCContext* context,
                                         DPCImpersonationScope& scope) {
   auto kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
   xenia_assert(kpcr->prcb_data.dpc_active == 0);
+  scope.kpcr_ = kpcr;
   scope.previous_irql_ = kpcr->current_irql;
 
   kpcr->current_irql = 2;
@@ -1529,10 +1686,20 @@ void KernelState::BeginDPCImpersonation(cpu::ppc::PPCContext* context,
 }
 void KernelState::EndDPCImpersonation(cpu::ppc::PPCContext* context,
                                       DPCImpersonationScope& end_scope) {
-  auto kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
-  xenia_assert(kpcr->prcb_data.dpc_active == 1);
+  // Finish against the KPCR that BeginDPCImpersonation modified. Guest code
+  // may legitimately use the PPC context, including r13, while the callback
+  // is executing.
+  auto kpcr = end_scope.kpcr_;
+  if (!kpcr) {
+    XELOGE("DPC impersonation ended without a captured KPCR");
+    return;
+  }
+  if (kpcr->prcb_data.dpc_active != 1) {
+    XELOGW("DPC active state changed during guest callback; normalizing it");
+  }
   kpcr->current_irql = end_scope.previous_irql_;
   kpcr->prcb_data.dpc_active = 0;
+  end_scope.kpcr_ = nullptr;
 }
 void KernelState::EmulateCPInterruptDPC(uint32_t interrupt_callback,
                                         uint32_t interrupt_callback_data,
@@ -1540,6 +1707,8 @@ void KernelState::EmulateCPInterruptDPC(uint32_t interrupt_callback,
   if (!interrupt_callback) {
     return;
   }
+  auto dpc_admission = AcquireSaveStateKernelAsyncAdmission(
+      save_state::KernelAsyncDomain::kDpc);
 
   auto thread = kernel::XThread::GetCurrentThread();
   assert_not_null(thread);

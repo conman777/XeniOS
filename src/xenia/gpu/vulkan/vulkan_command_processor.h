@@ -16,6 +16,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -143,8 +144,23 @@ class VulkanCommandProcessor final : public CommandProcessor {
   ~VulkanCommandProcessor();
 
   void ClearCaches() override;
+  bool Save(ByteStream* stream) override;
   void InvalidateGpuMemory() override;
+  void BeginPostRestoreWarmup() override;
   void ClearReadbackBuffers() override;
+
+  // Blocks until asynchronous pipeline creation is idle. For callers outside
+  // the pipeline cache that destroy objects a queued creation request still
+  // references by raw handle - see VulkanPipelineCache::DrainCreationThreads.
+  void DrainPipelineCreationThreads();
+
+#if XE_PLATFORM_ANDROID
+  // Serializes vkCreateGraphicsPipelines against command-buffer recording and
+  // vkQueueSubmit. t165: one worker still hung Adreno when creates overlapped
+  // in-flight draws (live 401, then LMK "device is not responding").
+  void LockAsyncPipelineCreate();
+  void UnlockAsyncPipelineCreate();
+#endif
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
@@ -290,6 +306,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
   }
 
  protected:
+  bool RestoreSaveStateEdramSnapshot(const void* snapshot) override;
+  bool PrepareForSaveState(std::chrono::steady_clock::time_point deadline,
+                           std::string* error_message) override;
+  void ResumeAfterSaveState() noexcept override;
+
   bool SetupContext() override;
   void ShutdownContext() override;
   XE_FORCEINLINE
@@ -523,6 +544,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint32_t target_width = 0;
   };
   AndroidBase1350DrawContext android_base1350_draw_context_;
+#endif
+
+#if XE_PLATFORM_ANDROID
+  std::mutex android_pipeline_create_mutex_;
+  uint64_t android_pipeline_pressure_deadline_ms_ = 0;
 #endif
 
   bool device_lost_ = false;

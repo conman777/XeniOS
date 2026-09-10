@@ -27,6 +27,16 @@ namespace xe {
 
 // chrono APIs in xenia/base/chrono.h are preferred
 
+struct GuestClockState {
+  uint64_t guest_tick_count = 0;
+  uint64_t guest_tick_frequency = 0;
+  uint64_t tick_ratio_numerator = 0;
+  uint64_t tick_ratio_denominator = 0;
+  uint64_t guest_system_time_base = 0;
+  uint64_t guest_interrupt_time = 0;
+  double guest_time_scalar = 1.0;
+};
+
 class Clock {
  public:
   // Host ticks-per-second. Generally QueryHostTickFrequency should be used.
@@ -84,6 +94,14 @@ class Clock {
   static uint32_t QueryGuestUptimeMillis();
 
   static uint64_t QueryGuestInterruptTime();
+
+  // Save-state clock boundary. Restore is accepted only while frozen, and
+  // Unfreeze rebases host sampling so serialization time does not elapse in
+  // the guest.
+  static bool FreezeGuestTime(GuestClockState* state);
+  static bool CaptureFrozenGuestTime(GuestClockState* state);
+  static bool RestoreFrozenGuestTime(const GuestClockState& state);
+  static bool UnfreezeGuestTime();
 
   // Sets the system time of the guest.
   static void SetGuestSystemTime(uint64_t system_time);

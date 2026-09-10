@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_PPC_PPC_CONTEXT_H_
 #define XENIA_CPU_PPC_PPC_CONTEXT_H_
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -26,6 +27,9 @@ class ThreadState;
 namespace kernel {
 class KernelState;
 }  // namespace kernel
+namespace save_state {
+class LiveGuestRuntime;
+}  // namespace save_state
 }  // namespace xe
 
 namespace xe {
@@ -435,7 +439,16 @@ typedef struct alignas(64) PPCContext_s {
   // logs can identify guest-code stalls without root-only native backtraces.
   uint32_t last_guest_function;
   uint32_t last_guest_pc;
-  uint64_t debug_sample_reserved[7];
+
+  // Host-only cooperative save-state polling. These are deliberately not part
+  // of any serialized CPU record.
+  xe::save_state::LiveGuestRuntime* save_state_runtime;
+  const std::atomic<uint64_t>* save_state_requested_generation;
+  // Set only by a future fully preflighted restore runner while this thread is
+  // parked. Generated A64 frames propagate it outward without dispatching.
+  uint32_t save_state_unwind_requested;
+  uint32_t save_state_unwind_reserved;
+  uint64_t debug_sample_reserved[4];
 
   template <typename T = uint8_t*>
   inline T TranslateVirtual(uint32_t guest_address) XE_RESTRICT const {

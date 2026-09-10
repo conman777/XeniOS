@@ -71,6 +71,14 @@ bool A64Assembler::Assemble(GuestFunction* function, HIRBuilder* builder,
                             std::unique_ptr<FunctionDebugInfo> debug_info) {
   SCOPE_profile_cpu_f("cpu");
 
+  auto* code_cache =
+      reinterpret_cast<A64CodeCache*>(backend_->code_cache());
+  // The generation gate must cover the entire publication lifetime, not only
+  // PlaceGuestCode. A restore freeze therefore cannot observe the map entry
+  // before source-map cloning, Setup, stack metadata, and the indirection slot
+  // are all complete.
+  auto publication = code_cache->BeginCodePublication();
+
   // Reset when we leave.
   xe::make_reset_scope(this);
 
@@ -98,13 +106,11 @@ bool A64Assembler::Assemble(GuestFunction* function, HIRBuilder* builder,
 #if XE_A64_INDIRECTION_64BIT
   // On ARM64 platforms, AddIndirection64 encodes the host address as rel32
   // offset (or tagged external target) for compact dispatch table entries.
-  reinterpret_cast<A64CodeCache*>(backend_->code_cache())
-      ->AddIndirection64(function->address(), host_address);
+  code_cache->AddIndirection64(function->address(), host_address);
 #else
   assert_true((host_address >> 32) == 0);
-  reinterpret_cast<A64CodeCache*>(backend_->code_cache())
-      ->AddIndirection(function->address(),
-                       static_cast<uint32_t>(host_address));
+  code_cache->AddIndirection(function->address(),
+                             static_cast<uint32_t>(host_address));
 #endif
 
   return true;

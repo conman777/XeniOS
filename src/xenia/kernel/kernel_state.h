@@ -17,6 +17,8 @@
 #include <vector>
 
 #include "xenia/base/bit_map.h"
+#include "xenia/base/reversible_admission_gate.h"
+#include "xenia/base/save_state_kernel_async.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/kernel.h"
@@ -146,6 +148,7 @@ struct KernelGuestGlobals {
 };
 struct DPCImpersonationScope {
   uint8_t previous_irql_;
+  X_KPCR* kpcr_ = nullptr;
 };
 
 struct KernelVersion {
@@ -260,7 +263,7 @@ class KernelState {
   X_RESULT ApplyTitleUpdate(const object_ref<UserModule> title_module);
   // Terminates a title: Unloads all modules, and kills all guest threads.
   // This DOES NOT RETURN if called from a guest thread!
-  void TerminateTitle();
+  void TerminateTitle(bool preserve_guest_memory_for_restore = false);
 
   // Gracefully stops the dispatch thread. Call before force-terminating
   // threads to avoid corrupting the CV it's blocked on.
@@ -306,6 +309,51 @@ class KernelState {
       uint32_t overlapped_ptr, std::function<void()> pre_callback = nullptr,
       std::function<void()> post_callback = nullptr);
 
+  ReversibleAdmissionGate::Lease
+  AcquireSaveStateKernelDispatchTimerAdmission() {
+    return save_state_dispatch_timer_admission_gate_.Enter();
+  }
+  AdmissionGateResult CloseSaveStateKernelDispatchTimerAdmission(
+      uint64_t owner_id, std::chrono::steady_clock::time_point deadline) {
+    return save_state_dispatch_timer_admission_gate_.CloseAndWait(owner_id,
+                                                                  deadline);
+  }
+  bool ReopenSaveStateKernelDispatchTimerAdmission(
+      uint64_t owner_id) noexcept {
+    return save_state_dispatch_timer_admission_gate_.Reopen(owner_id);
+  }
+  AdmissionGateSnapshot GetSaveStateKernelDispatchTimerAdmissionState() const {
+    return save_state_dispatch_timer_admission_gate_.Snapshot();
+  }
+
+  bool PauseTimestampUpdatesForSaveState(
+      std::chrono::milliseconds timeout, std::string* error_message);
+  void ResumeTimestampUpdatesAfterSaveState() noexcept;
+  bool PauseDispatchWorkerForSaveState(
+      std::chrono::milliseconds timeout, std::string* error_message);
+  void ResumeDispatchWorkerAfterSaveState() noexcept;
+
+  save_state::KernelAsyncAdmissionBoundary::Operation
+  AcquireSaveStateKernelAsyncAdmission(
+      save_state::KernelAsyncDomain domain) {
+    return save_state_async_admission_boundary_.Enter(domain);
+  }
+  save_state::KernelAsyncCloseResult CloseSaveStateKernelAsyncAdmission(
+      save_state::KernelAsyncDomain domain, uint64_t owner_id,
+      std::chrono::steady_clock::time_point deadline,
+      save_state::KernelPendingPolicy pending_policy) {
+    return save_state_async_admission_boundary_.CloseAndWait(
+        domain, owner_id, deadline, pending_policy);
+  }
+  bool ReopenSaveStateKernelAsyncAdmission(
+      save_state::KernelAsyncDomain domain, uint64_t owner_id) noexcept {
+    return save_state_async_admission_boundary_.Reopen(domain, owner_id);
+  }
+  save_state::KernelAsyncSnapshot GetSaveStateKernelAsyncAdmissionState(
+      save_state::KernelAsyncDomain domain) const {
+    return save_state_async_admission_boundary_.Snapshot(domain);
+  }
+
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
 
@@ -349,6 +397,8 @@ class KernelState {
 
   X_RESULT ApplyTitleUpdate(const object_ref<UserModule> title_module,
                             const object_ref<UserModule> patch_module);
+  void CompleteOverlappedExImpl(uint32_t overlapped_ptr, X_RESULT result,
+                                uint32_t extended_error, uint32_t length);
 
   Emulator* emulator_;
   Memory* memory_;
@@ -360,6 +410,14 @@ class KernelState {
   KernelVersion kernel_version_;
 
   xe::global_critical_region global_critical_region_;
+
+  // Central APC/DPC/notification/wait/timer admission and pending-item
+  // accounting. Declared before the object table so it outlives kernel
+  // objects whose destructors remove pending accounting. This boundary is not
+  // registered as a live save-state participant while unsupported paths
+  // listed in the save-state plan remain.
+  save_state::KernelAsyncAdmissionBoundary
+      save_state_async_admission_boundary_;
 
   // Must be guarded by the global critical region.
   util::ObjectTable object_table_;
@@ -380,7 +438,22 @@ class KernelState {
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+  std::atomic<bool> dispatch_save_state_pause_requested_ = false;
+  std::mutex dispatch_save_state_mutex_;
+  std::condition_variable dispatch_save_state_condition_;
+  bool dispatch_save_state_paused_ = false;
 
+  // Covers deferred dispatch enqueue/execution, overlapped completion
+  // mutation, the timestamp updater, and XTimer APC callbacks. The broad gate
+  // and central async boundary remain unregistered until every direct kernel
+  // callback and wait path has a common quiescence proof. The timestamp writer
+  // has its own cooperative park below because it mutates guest memory once
+  // per millisecond during a multi-minute live save.
+  ReversibleAdmissionGate save_state_dispatch_timer_admission_gate_;
+  std::mutex timestamp_save_state_mutex_;
+  std::condition_variable timestamp_save_state_condition_;
+  bool timestamp_save_state_pause_requested_ = false;
+  bool timestamp_save_state_paused_ = false;
   uint32_t ke_timestamp_bundle_ptr_ = 0;
   uint32_t last_thread_sample_ms_ = 0;
   std::unique_ptr<xe::threading::HighResolutionTimer> timestamp_timer_;

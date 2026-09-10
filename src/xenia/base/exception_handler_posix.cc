@@ -221,6 +221,23 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
+
+  // Nothing claimed the fault. Simply returning would resume execution at the
+  // faulting instruction, which faults again immediately - an unbreakable
+  // livelock that burns a core and spams the log at thousands of faults per
+  // second while the emulator looks frozen and cannot be recovered except by
+  // force-stopping it. That is the outcome whenever the fault comes from host
+  // code (for example a GPU driver dereferencing an object the emulator
+  // already destroyed) rather than from guest JIT code, since only the guest
+  // handlers ever return true.
+  //
+  // Put the original disposition back and return; the instruction re-faults
+  // once more and dies through the default handler, leaving a normal crash
+  // with a usable tombstone instead of hanging indefinitely.
+  struct sigaction* original_handler = signal_number == SIGILL
+                                           ? &original_sigill_handler_
+                                           : &original_sigsegv_handler_;
+  sigaction(signal_number, original_handler, nullptr);
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {

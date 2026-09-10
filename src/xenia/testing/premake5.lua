@@ -1,0 +1,10 @@
+project_root = "../../.."
+include(project_root.."/tools/build")
+
+test_suite("xenia-save-state-tests", project_root, ".", {
+  links = {
+    "fmt",
+    "xenia-base",
+    "xenia-core",
+  },
+})

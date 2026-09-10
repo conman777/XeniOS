@@ -102,6 +102,11 @@ class Entry {
   void SetForDeletion(bool delete_on_close) {
     delete_on_close_ = delete_on_close;
   }
+  // Files keep raw Entry pointers, while the directory tree owns Entry
+  // objects. Track live files so delete-on-close removes the tree node only
+  // after the final file releases it.
+  void AcquireOpenFileReference();
+  void ReleaseOpenFileReference();
 
   bool is_read_only() const;
 
@@ -157,6 +162,7 @@ class Entry {
   uint64_t access_timestamp_;
   uint64_t write_timestamp_;
   bool delete_on_close_;
+  uint32_t open_file_reference_count_ = 0;
   std::vector<std::unique_ptr<Entry>> children_;
 };
 

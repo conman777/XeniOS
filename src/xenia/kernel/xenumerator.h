@@ -88,6 +88,10 @@ class XEnumerator : public XObject {
   virtual uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
                               uint32_t* written_count) = 0;
 
+  bool Save(ByteStream* stream) override;
+  static object_ref<XEnumerator> Restore(KernelState* kernel_state,
+                                         ByteStream* stream);
+
   size_t item_size() const { return item_size_; }
   size_t items_per_enumerate() const { return items_per_enumerate_; }
   size_t extra_size() const { return extra_size_; }
@@ -114,6 +118,8 @@ class XStaticUntypedEnumerator : public XEnumerator {
                       uint32_t* written_count) override;
 
  private:
+  friend class XEnumerator;
+
   size_t item_count_;
   size_t current_item_;
   std::vector<uint8_t> buffer_;
@@ -155,6 +161,8 @@ class XAchievementEnumerator : public XEnumerator {
                       uint32_t* written_count) override;
 
  private:
+  friend class XEnumerator;
+
   struct StringBuffer {
     uint8_t* data;
     size_t remaining_bytes;
@@ -196,6 +204,8 @@ class XTitleEnumerator : public XEnumerator {
                       uint32_t* written_count) override;
 
  private:
+  friend class XEnumerator;
+
   std::vector<xam::TitleInfo> items_;
   size_t current_item_ = 0;
 };
@@ -215,6 +225,8 @@ class XUserStatsEnumerator : public XEnumerator {
                       uint32_t* written_count) override;
 
  private:
+  friend class XEnumerator;
+
   std::vector<XUSER_STATS_SPEC> items_;
   size_t current_item_ = 0;
 };
@@ -235,6 +247,8 @@ class XMPCreateUserPlaylistEnumerator : public XEnumerator {
                       uint32_t* written_count) override;
 
  private:
+  friend class XEnumerator;
+
   std::vector<xam::XMP_USER_PLAYLIST_INFO> items_;
   size_t current_item_ = 0;
 };

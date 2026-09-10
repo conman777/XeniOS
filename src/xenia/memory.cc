@@ -10,6 +10,7 @@
 #include "xenia/memory.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <random>
 
@@ -30,6 +31,8 @@
 #include "xenia/base/threading.h"
 
 #include "xenia/cpu/mmio_handler.h"
+#include "xenia/save_state_live_memory.h"
+#include "xenia/save_state_phase2.h"
 
 // TODO(benvanik): move xbox.h out
 #include "xenia/xbox.h"
@@ -823,6 +826,181 @@ bool Memory::Restore(ByteStream* stream) {
   return true;
 }
 
+bool Memory::CaptureSaveStateAllocationInventory(
+    save_state::MemoryAllocationInventory* inventory) {
+  if (!inventory) {
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  save_state::MemoryAllocationInventory captured;
+  const auto append_heap =
+      [&captured](const BaseHeap& heap,
+                  save_state::MemoryAddressSpace address_space,
+                  const PhysicalHeap* physical_alias) {
+        for (uint32_t index = 0; index < heap.page_table_.size(); ++index) {
+          const PageEntry page = heap.page_table_[index];
+          if (!page.state) {
+            continue;
+          }
+          const uint32_t address = heap.heap_base_ + index * heap.page_size_;
+          captured.pages.push_back({
+              address_space,
+              address,
+              heap.page_size_,
+              page.state,
+              heap.heap_base_ + (page.base_address << heap.page_size_shift_),
+              page.region_page_count,
+              page.allocation_protect,
+              page.current_protect,
+              physical_alias
+                  ? physical_alias->GetPhysicalAddress(address)
+                  : save_state::kNoPhysicalBacking,
+          });
+        }
+      };
+  append_heap(heaps_.v00000000, save_state::MemoryAddressSpace::kVirtual,
+              nullptr);
+  append_heap(heaps_.v40000000, save_state::MemoryAddressSpace::kVirtual,
+              nullptr);
+  append_heap(heaps_.v80000000, save_state::MemoryAddressSpace::kVirtual,
+              nullptr);
+  append_heap(heaps_.v90000000, save_state::MemoryAddressSpace::kVirtual,
+              nullptr);
+  append_heap(heaps_.vA0000000, save_state::MemoryAddressSpace::kVirtual,
+              &heaps_.vA0000000);
+  append_heap(heaps_.vC0000000, save_state::MemoryAddressSpace::kVirtual,
+              &heaps_.vC0000000);
+  append_heap(heaps_.vE0000000, save_state::MemoryAddressSpace::kVirtual,
+              &heaps_.vE0000000);
+  append_heap(heaps_.physical, save_state::MemoryAddressSpace::kPhysical,
+              nullptr);
+  std::sort(captured.pages.begin(), captured.pages.end(),
+            [](const save_state::MemoryInventoryPage& left,
+               const save_state::MemoryInventoryPage& right) {
+              if (left.address_space != right.address_space) {
+                return uint32_t(left.address_space) <
+                       uint32_t(right.address_space);
+              }
+              return left.address < right.address;
+            });
+  *inventory = std::move(captured);
+  return true;
+}
+
+save_state::StateProviderResult
+Memory::PrepareSaveStateStablePageTransaction(
+    const save_state::MemorySnapshot& target,
+    const save_state::MemoryCaptureLimits& limits,
+    std::unique_ptr<save_state::StablePageMemoryTransaction>* output,
+    std::string* error_message) {
+  if (!output || *output) {
+    if (error_message) {
+      *error_message = "Stable-page transaction output is invalid.";
+    }
+    return save_state::StateProviderResult::kInvalidState;
+  }
+  const save_state::SnapshotCodecValidation validation =
+      save_state::ValidateMemorySnapshot(target);
+  if (!validation.ok()) {
+    if (error_message) {
+      *error_message = validation.message;
+    }
+    return save_state::StateProviderResult::kInvalidState;
+  }
+
+  auto global_lock = global_critical_region_.Acquire();
+  save_state::MemoryAllocationInventory current;
+  if (!CaptureSaveStateAllocationInventory(&current)) {
+    if (error_message) {
+      *error_message = "Current memory topology could not be captured.";
+    }
+    return save_state::StateProviderResult::kFailed;
+  }
+  if (current.pages.size() != target.pages.size()) {
+    if (error_message) {
+      *error_message =
+          "Stable-page restore does not support topology changes.";
+    }
+    return save_state::StateProviderResult::kUnsupported;
+  }
+
+  const auto metadata_equal =
+      [](const save_state::MemoryInventoryPage& live,
+         const save_state::MemoryPageSnapshot& saved) {
+        return live.address_space == saved.address_space &&
+               live.address == saved.address &&
+               live.page_size == saved.page_size &&
+               live.state == saved.state &&
+               live.allocation_base == saved.allocation_base &&
+               live.allocation_page_count == saved.allocation_page_count &&
+               live.allocation_protect == saved.allocation_protect &&
+               live.current_protect == saved.current_protect &&
+               live.backing_physical_address ==
+                   saved.backing_physical_address;
+      };
+
+  std::vector<save_state::StablePageCopyBinding> bindings;
+  bindings.reserve(target.pages.size());
+  for (size_t index = 0; index < target.pages.size(); ++index) {
+    const save_state::MemoryPageSnapshot& page = target.pages[index];
+    if (!metadata_equal(current.pages[index], page)) {
+      if (error_message) {
+        *error_message =
+            "Stable-page restore does not support topology or protection "
+            "changes.";
+      }
+      return save_state::StateProviderResult::kUnsupported;
+    }
+    if (page.data.empty()) {
+      continue;
+    }
+    if ((page.state & save_state::kMemorySnapshotCommit) == 0 ||
+        !IsWritableProtect(page.current_protect)) {
+      if (error_message) {
+        *error_message =
+            "Stable-page restore requires committed writable backing pages.";
+      }
+      return save_state::StateProviderResult::kUnsupported;
+    }
+
+    uint8_t* live_data = nullptr;
+    if (page.address_space == save_state::MemoryAddressSpace::kPhysical) {
+      live_data = TranslatePhysical(page.address);
+    } else if (page.backing_physical_address ==
+               save_state::kNoPhysicalBacking) {
+      live_data = TranslateVirtual(page.address);
+    } else {
+      // Physical aliases never carry data in the canonical snapshot and must
+      // not be copied independently.
+      return save_state::StateProviderResult::kInvalidState;
+    }
+    const uint64_t backing_identity =
+        (uint64_t(page.address_space) + 1) << 32 | page.address;
+    bindings.push_back(
+        {backing_identity, live_data, page.data.data(), page.page_size});
+  }
+
+  if (bindings.empty()) {
+    if (error_message) {
+      *error_message = "Stable-page restore contains no writable page data.";
+    }
+    return save_state::StateProviderResult::kUnsupported;
+  }
+  class StablePageGlobalLock final
+      : public save_state::StablePageTransactionLock {
+   public:
+    explicit StablePageGlobalLock(global_unique_lock_type lock)
+        : lock_(std::move(lock)) {}
+
+   private:
+    global_unique_lock_type lock_;
+  };
+  auto transaction_lock =
+      std::make_unique<StablePageGlobalLock>(std::move(global_lock));
+  return save_state::StablePageMemoryTransaction::Prepare(
+      bindings, limits, std::move(transaction_lock), output, error_message);
+}
+
 uint32_t FromPageAccess(xe::memory::PageAccess protect) {
   switch (protect) {
     case memory::PageAccess::kNoAccess:
@@ -932,6 +1110,9 @@ void BaseHeap::DumpMap() {
 
 bool BaseHeap::Save(ByteStream* stream) {
   XELOGD("Heap {:08X}-{:08X}", heap_base_, heap_base_ + (heap_size_ - 1));
+  const auto started_at = std::chrono::steady_clock::now();
+  size_t committed_page_count = 0;
+  size_t temporarily_readable_page_count = 0;
 
   for (size_t i = 0; i < page_table_.size(); i++) {
     auto& page = page_table_[i];
@@ -943,18 +1124,39 @@ bool BaseHeap::Save(ByteStream* stream) {
 
     // TODO(DrChat): write compressed with snappy.
     if (page.state & kMemoryAllocationCommit) {
+      ++committed_page_count;
       void* addr = TranslateRelative(i * page_size_);
 
-      memory::PageAccess old_access;
-      memory::Protect(addr, page_size_, memory::PageAccess::kReadWrite,
-                      &old_access);
+      // Most committed guest pages are already host-readable. Avoid two
+      // mprotect calls per page in that overwhelmingly common case — on
+      // Android, hundreds of thousands of those calls dominated live capture
+      // time. Temporarily expose only genuinely no-access pages, and request
+      // read-only access because serialization never writes guest memory.
+      memory::PageAccess old_access = memory::PageAccess::kNoAccess;
+      const bool temporarily_make_readable =
+          (page.current_protect & kMemoryProtectRead) == 0;
+      if (temporarily_make_readable) {
+        ++temporarily_readable_page_count;
+        memory::Protect(addr, page_size_, memory::PageAccess::kReadOnly,
+                        &old_access);
+      }
 
       stream->Write(addr, page_size_);
 
-      memory::Protect(addr, page_size_, old_access, nullptr);
+      if (temporarily_make_readable) {
+        memory::Protect(addr, page_size_, old_access, nullptr);
+      }
     }
   }
 
+  const auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - started_at)
+                               .count();
+  XELOGI(
+      "Diagnostic save state: heap {:08X}-{:08X} serialized pages={} "
+      "temporary_access_changes={} duration_ms={}",
+      heap_base_, heap_base_ + (heap_size_ - 1), committed_page_count,
+      temporarily_readable_page_count, duration_ms);
   return true;
 }
 

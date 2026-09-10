@@ -1319,6 +1319,9 @@ X_STATUS xeProcessUserApcs(PPCContext* ctx) {
   if (!ctx) {
     ctx = cpu::ThreadState::Get()->context();
   }
+  auto apc_admission =
+      ctx->kernel_state->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kApc);
   X_STATUS alert_status = X_STATUS_SUCCESS;
   auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
 
@@ -1348,6 +1351,7 @@ X_STATUS xeProcessUserApcs(PPCContext* ctx) {
     xe::store_and_swap<uint32_t>(scratch_ptr + 12, apc->arg2);
     util::XeRemoveEntryList(&apc->list_entry, ctx);
     apc->enqueued = 0;
+    apc_admission.RecordDequeued();
 
     xeKeKfReleaseSpinLock(ctx, &current_thread->apc_lock, unlocked_irql);
     alert_status = X_STATUS_USER_APC;
@@ -1387,6 +1391,9 @@ X_STATUS xeProcessUserApcs(PPCContext* ctx) {
 
 static void YankApcList(PPCContext* ctx, X_KTHREAD* current_thread,
                         unsigned apc_mode, bool rundown) {
+  auto apc_admission =
+      ctx->kernel_state->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kApc);
   uint32_t unlocked_irql =
       xeKeKfAcquireSpinLock(ctx, &current_thread->apc_lock);
 
@@ -1396,11 +1403,14 @@ static void YankApcList(PPCContext* ctx, X_KTHREAD* current_thread,
   if (user_apc_queue.empty(ctx)) {
     result = nullptr;
   } else {
+    size_t removed_count = 0;
     result = user_apc_queue.HeadObject(ctx);
     for (auto&& entry : user_apc_queue.IterateForward(ctx)) {
       entry.enqueued = 0;
+      ++removed_count;
     }
     util::XeRemoveEntryList(&user_apc_queue, ctx);
+    apc_admission.RecordDequeued(removed_count);
   }
 
   xeKeKfReleaseSpinLock(ctx, &current_thread->apc_lock, unlocked_irql);
@@ -1470,6 +1480,9 @@ DECLARE_XBOXKRNL_EXPORT1(KeInitializeApc, kThreading, kImplemented);
 uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2,
                             uint32_t priority_increment,
                             cpu::ppc::PPCContext* context) {
+  auto apc_admission =
+      context->kernel_state->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kApc);
   uint32_t thread_guest_pointer = apc->thread_ptr;
   if (!thread_guest_pointer) {
     return 0;
@@ -1504,6 +1517,7 @@ uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2,
     }
 
     apc->enqueued = 1;
+    apc_admission.RecordEnqueued();
 
     /*
         todo: this is incomplete, a ton of other logic happens here, i believe
@@ -1524,6 +1538,9 @@ DECLARE_XBOXKRNL_EXPORT1(KeInsertQueueApc, kThreading, kImplemented);
 
 dword_result_t KeRemoveQueueApc_entry(pointer_t<XAPC> apc,
                                       const ppc_context_t& context) {
+  auto apc_admission =
+      context->kernel_state->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kApc);
   bool result = false;
 
   uint32_t thread_guest_pointer = apc->thread_ptr;
@@ -1537,6 +1554,7 @@ dword_result_t KeRemoveQueueApc_entry(pointer_t<XAPC> apc,
     result = true;
     apc->enqueued = 0;
     util::XeRemoveEntryList(&apc->list_entry, context);
+    apc_admission.RecordDequeued();
     // todo: this is incomplete, there is more logic here in actual kernel
   }
   xeKeKfReleaseSpinLock(context, &target_thread->apc_lock, old_irql);
@@ -1559,6 +1577,9 @@ DECLARE_XBOXKRNL_EXPORT2(KeInitializeDpc, kThreading, kImplemented, kSketchy);
 
 dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
                                       dword_t arg2) {
+  auto dpc_admission =
+      kernel_state()->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kDpc);
   assert_always("DPC does not dispatch yet; going to hang!");
 
   uint32_t list_entry_ptr = dpc.guest_address() + 4;
@@ -1577,12 +1598,16 @@ dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
   dpc->arg2 = (uint32_t)arg2;
 
   dpc_list->Insert(list_entry_ptr);
+  dpc_admission.RecordEnqueued();
 
   return 1;
 }
 DECLARE_XBOXKRNL_EXPORT2(KeInsertQueueDpc, kThreading, kStub, kSketchy);
 
 dword_result_t KeRemoveQueueDpc_entry(pointer_t<XDPC> dpc) {
+  auto dpc_admission =
+      kernel_state()->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kDpc);
   bool result = false;
 
   uint32_t list_entry_ptr = dpc.guest_address() + 4;
@@ -1591,6 +1616,7 @@ dword_result_t KeRemoveQueueDpc_entry(pointer_t<XDPC> dpc) {
   auto dpc_list = kernel_state()->dpc_list();
   if (dpc_list->IsQueued(list_entry_ptr)) {
     dpc_list->Remove(list_entry_ptr);
+    dpc_admission.RecordDequeued();
     result = true;
   }
 

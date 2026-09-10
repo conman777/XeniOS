@@ -25,6 +25,7 @@
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
+#include "xenia/save_state_gpu_quiescence.h"
 #include "xenia/ui/presenter.h"
 
 namespace xe {
@@ -110,9 +111,36 @@ class CommandProcessor {
   virtual void Shutdown();
 
   void CallInThread(std::function<void()> fn);
+  bool HasPendingFns();
+  bool IsSaveStatePauseRequested() const {
+    return save_state_pause_requested_.load(std::memory_order_acquire);
+  }
+
+  save_state::GpuCommandWorkerParkAcquireResult
+  ParkSaveStateCommandWorker(
+      uint64_t owner_id,
+      std::chrono::steady_clock::time_point deadline) {
+    return save_state_command_admission_.ParkWorkerAndWait(
+        owner_id, deadline,
+        [this]() { write_ptr_index_event_->SetBoostPriority(); });
+  }
+  bool ResumeSaveStateCommandWorker(
+      uint64_t owner_id,
+      std::chrono::steady_clock::time_point deadline) noexcept {
+    return save_state_command_admission_.ReleaseWorkerAndReopen(owner_id,
+                                                                deadline);
+  }
+  save_state::GpuCommandAdmissionSnapshot
+  GetSaveStateCommandAdmissionSnapshot() const {
+    return save_state_command_admission_.Snapshot();
+  }
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
+  // Gives backends a chance to make the first host resources needed after a
+  // save-state restore available before substituting asynchronous fallback
+  // output. Backends without deferred host-resource creation need no action.
+  virtual void BeginPostRestoreWarmup() {}
   virtual void ClearReadbackBuffers();
 
   // Get cached readback resolve mode (avoids string parsing every frame)
@@ -174,12 +202,29 @@ class CommandProcessor {
 
   bool is_paused() const { return paused_; }
   void Pause();
+  bool PauseForSaveState(std::string* error_message);
   void Resume();
 
-  bool Save(ByteStream* stream);
+  virtual bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
 
  protected:
+  // Live save-state restoration needs a checked backend path. Legacy trace
+  // playback uses RestoreEdramSnapshot, which has no success result.
+  virtual bool RestoreSaveStateEdramSnapshot(const void* snapshot) {
+    return false;
+  }
+  virtual bool PrepareForSaveState(
+      std::chrono::steady_clock::time_point deadline,
+      std::string* error_message);
+  virtual void ResumeAfterSaveState() noexcept {}
+  void SetSaveStateEdramSnapshot(std::vector<uint8_t> snapshot) {
+    save_state_edram_snapshot_ = std::move(snapshot);
+  }
+  const std::vector<uint8_t>& save_state_edram_snapshot() const {
+    return save_state_edram_snapshot_;
+  }
+
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
     xenos::Endian endianness = xenos::Endian::kNone;
@@ -330,7 +375,31 @@ class CommandProcessor {
   std::atomic<bool> worker_running_;
   kernel::object_ref<kernel::XHostThread> worker_thread_;
 
-  std::queue<std::function<void()>> pending_fns_;
+  struct PendingFunction {
+    PendingFunction() = default;
+    PendingFunction(std::function<void()> function,
+                    ReversibleAdmissionGate::Lease producer_admission)
+        : function(std::move(function)),
+          producer_admission(std::move(producer_admission)) {}
+    PendingFunction(const PendingFunction&) = delete;
+    PendingFunction& operator=(const PendingFunction&) = delete;
+    PendingFunction(PendingFunction&&) noexcept = default;
+    PendingFunction& operator=(PendingFunction&&) noexcept = default;
+
+    std::function<void()> function;
+    ReversibleAdmissionGate::Lease producer_admission;
+  };
+
+  // These lanes are not registered as a live GPU participant. They only bound
+  // CPU-side PM4 publication and pending callback lifetime.
+  save_state::GpuCommandAdmissionLanes save_state_command_admission_;
+  std::mutex save_state_pm4_pending_mutex_;
+  ReversibleAdmissionGate::Lease save_state_pm4_pending_admission_;
+
+  // Pushed from any thread (e.g. Android memory-pressure callbacks), popped
+  // by the worker thread - must hold pending_fns_mutex_ for every access.
+  std::queue<PendingFunction> pending_fns_;
+  std::mutex pending_fns_mutex_;
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
@@ -354,6 +423,9 @@ class CommandProcessor {
   Shader* active_pixel_shader_ = nullptr;
 
   bool paused_ = false;
+  bool paused_for_save_state_ = false;
+  std::atomic<bool> save_state_pause_requested_ = false;
+  std::vector<uint8_t> save_state_edram_snapshot_;
 
   // By default (such as for tools), post-processing is disabled.
   // "Desired" is for the external thread managing the post-processing effect.
@@ -368,6 +440,8 @@ class CommandProcessor {
   uint64_t last_swap_time_ = 0;
 
  private:
+  void ReleaseSaveStatePm4AdmissionIfDrained(uint32_t read_ptr_index);
+
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;

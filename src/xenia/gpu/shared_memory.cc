@@ -740,7 +740,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
                         (page_last - page_first + 1) << page_size_log2_);
 }
 
-void SharedMemory::PrepareForTraceDownload() {
+bool SharedMemory::PrepareForTraceDownload() {
   ReleaseTraceDownloadRanges();
   assert_true(trace_download_ranges_.empty());
   assert_zero(trace_download_page_count_);
@@ -751,6 +751,7 @@ void SharedMemory::PrepareForTraceDownload() {
 
   uint32_t fire_watches_range_start = UINT32_MAX;
   uint32_t gpu_written_range_start = UINT32_MAX;
+  bool allocation_success = true;
   auto global_lock = global_critical_region_.Acquire();
   uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
   for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
@@ -811,6 +812,8 @@ void SharedMemory::PrepareForTraceDownload() {
               std::make_pair(gpu_written_range_start << page_size_log2_,
                              gpu_written_range_length << page_size_log2_));
           trace_download_page_count_ += gpu_written_range_length;
+        } else {
+          allocation_success = false;
         }
         gpu_written_range_start = UINT32_MAX;
       }
@@ -833,8 +836,11 @@ void SharedMemory::PrepareForTraceDownload() {
           std::make_pair(gpu_written_range_start << page_size_log2_,
                          gpu_written_range_length << page_size_log2_));
       trace_download_page_count_ += gpu_written_range_length;
+    } else {
+      allocation_success = false;
     }
   }
+  return allocation_success;
 }
 
 void SharedMemory::ReleaseTraceDownloadRanges() {

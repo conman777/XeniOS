@@ -376,10 +376,13 @@ class Emulator {
   };
 
   void Pause();
+  bool PauseForSaveState(std::string* error_message);
   void Resume();
   bool is_paused() const { return paused_; }
-  bool SaveToFile(const std::filesystem::path& path);
-  bool RestoreFromFile(const std::filesystem::path& path);
+  bool SaveToFile(const std::filesystem::path& path,
+                  std::string* error_message = nullptr);
+  bool RestoreFromFile(const std::filesystem::path& path,
+                       std::string* error_message = nullptr);
 
   // Full in-process relaunch: terminates threads, Shutdown(), Setup(),
   // then launches with new params. Must be called from a non-guest thread.
@@ -461,6 +464,7 @@ class Emulator {
   std::unique_ptr<patcher::PluginLoader> plugin_loader_;
 
   std::unique_ptr<kernel::KernelState> kernel_state_;
+  bool save_state_guest_clock_frozen_ = false;
 
   kernel::object_ref<kernel::XThread> main_thread_;
   kernel::object_ref<kernel::XHostThread> plugin_loader_thread_;

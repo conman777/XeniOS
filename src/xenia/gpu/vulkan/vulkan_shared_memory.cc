@@ -258,11 +258,21 @@ void VulkanSharedMemory::Use(Usage usage,
   last_written_range_ = written_range;
 }
 
-bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {
+bool VulkanSharedMemory::InitializeTraceSubmitDownloads(bool* capture_success) {
+  if (capture_success) {
+    *capture_success = false;
+  }
   ResetTraceDownload();
-  PrepareForTraceDownload();
+  if (!PrepareForTraceDownload()) {
+    XELOGE("Shared memory: Failed to prepare GPU-written memory for capture");
+    ResetTraceDownload();
+    return false;
+  }
   uint32_t download_page_count = trace_download_page_count();
   if (!download_page_count) {
+    if (capture_success) {
+      *capture_success = true;
+    }
     return false;
   }
 
@@ -309,26 +319,38 @@ bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {
       VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
       VK_ACCESS_HOST_READ_BIT);
 
+  if (capture_success) {
+    *capture_success = true;
+  }
   return true;
 }
 
-void VulkanSharedMemory::InitializeTraceCompleteDownloads() {
+bool VulkanSharedMemory::InitializeTraceCompleteDownloads(
+    bool copy_to_guest_memory) {
   if (!trace_download_buffer_memory_) {
-    return;
+    return true;
   }
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  void* download_mapping;
+  void* download_mapping = nullptr;
+  bool success = false;
   if (dfn.vkMapMemory(device, trace_download_buffer_memory_, 0, VK_WHOLE_SIZE,
                       0, &download_mapping) == VK_SUCCESS) {
+    success = true;
     uint32_t download_buffer_offset = 0;
     for (const auto& download_range : trace_download_ranges()) {
-      trace_writer_.WriteMemoryRead(
-          download_range.first, download_range.second,
-          reinterpret_cast<const uint8_t*>(download_mapping) +
-              download_buffer_offset);
+      const uint8_t* source =
+          static_cast<const uint8_t*>(download_mapping) + download_buffer_offset;
+      if (copy_to_guest_memory) {
+        std::memcpy(memory().TranslatePhysical(download_range.first), source,
+                    download_range.second);
+      } else {
+        trace_writer_.WriteMemoryRead(download_range.first, download_range.second,
+                                     source);
+      }
+      download_buffer_offset += download_range.second;
     }
     dfn.vkUnmapMemory(device, trace_download_buffer_memory_);
   } else {
@@ -337,6 +359,7 @@ void VulkanSharedMemory::InitializeTraceCompleteDownloads() {
         "for frame tracing");
   }
   ResetTraceDownload();
+  return success;
 }
 
 bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(

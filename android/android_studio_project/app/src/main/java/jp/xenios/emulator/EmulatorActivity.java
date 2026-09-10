@@ -1,9 +1,15 @@
 package jp.xenios.emulator;
 
+import android.app.AlertDialog;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.View;
+import android.widget.Button;
+import android.widget.TextView;
+import android.widget.Toast;
 
 public class EmulatorActivity extends WindowedAppActivity {
     private static final int XINPUT_DPAD_UP = 0x0001;
@@ -32,6 +38,7 @@ public class EmulatorActivity extends WindowedAppActivity {
     private float mGamepadRightY;
     private float mGamepadLeftTrigger;
     private float mGamepadRightTrigger;
+    private long mDiagnosticOperationGeneration;
 
     private native void setGamepadStateNative(
             int buttons, float leftX, float leftY, float rightX, float rightY,
@@ -46,6 +53,35 @@ public class EmulatorActivity extends WindowedAppActivity {
 
     @Override
     protected void onCreate(final Bundle savedInstanceState) {
+        // Debug builds may be launched directly by adb / automated device
+        // tests with a plain string "target" extra. Production launches still
+        // use the complete cvar Bundle created by LauncherActivity.
+        if (BuildConfig.DEBUG
+                && getIntent().getBundleExtra(WindowedAppActivity.EXTRA_CVARS) == null) {
+            final String directTarget = getIntent().getStringExtra("target");
+            if (directTarget != null && !directTarget.isEmpty()) {
+                final Bundle launchArguments = new Bundle();
+                final java.io.File contentRoot =
+                        new java.io.File(getFilesDir(), "content");
+                contentRoot.mkdirs();
+                launchArguments.putString("target", directTarget);
+                launchArguments.putString(
+                        "storage_root", getFilesDir().getAbsolutePath());
+                launchArguments.putString(
+                        "content_root", contentRoot.getAbsolutePath());
+                launchArguments.putString(
+                        "cache_root", getCacheDir().getAbsolutePath());
+                launchArguments.putString("apu", "opensl");
+                launchArguments.putString("gpu", "vulkan");
+                launchArguments.putString("hid", "nop");
+                launchArguments.putBoolean("discord", false);
+                launchArguments.putBoolean(
+                        "a64_fail_fast_on_access_violation", false);
+                launchArguments.putBoolean("log_undefined_extern_args", true);
+                getIntent().putExtra(
+                        WindowedAppActivity.EXTRA_CVARS, launchArguments);
+            }
+        }
         super.onCreate(savedInstanceState);
         if (!isWindowedAppReady()) {
             return;
@@ -53,11 +89,194 @@ public class EmulatorActivity extends WindowedAppActivity {
 
         setContentView(R.layout.activity_emulator);
         setWindowSurfaceView(findViewById(R.id.emulator_surface_view));
+        configureDebugDiagnostics();
+    }
+
+    private void configureDebugDiagnostics() {
+        final View panel = findViewById(R.id.debug_diagnostics_panel);
+        final Button toggle = findViewById(R.id.debug_diagnostics_toggle);
+        if (!BuildConfig.DEBUG) {
+            panel.setVisibility(View.GONE);
+            toggle.setVisibility(View.GONE);
+            return;
+        }
+
+        panel.setVisibility(View.GONE);
+        toggle.setVisibility(View.VISIBLE);
+        toggle.setOnClickListener(view -> {
+            final boolean show = panel.getVisibility() != View.VISIBLE;
+            panel.setVisibility(show ? View.VISIBLE : View.GONE);
+            toggle.setText(show ? R.string.debug_tools_close : R.string.debug_tools_open);
+        });
+        final Button reportButton = findViewById(R.id.report_diagnostics_button);
+        final Button captureButton = findViewById(R.id.capture_diagnostics_button);
+        final Button restoreButton = findViewById(R.id.restore_diagnostic_save_button);
+        final TextView statusView = findViewById(R.id.debug_diagnostics_status);
+        reportButton.setOnClickListener(view -> {
+            setDiagnosticControlsEnabled(reportButton, captureButton, restoreButton, false);
+            statusView.setText(R.string.debug_diagnostics_report_collecting);
+
+            final String nativeSnapshot = collectNativeDiagnosticSnapshot();
+            final String targetPath = getDiagnosticTargetPath();
+            new Thread(() -> {
+                final DiagnosticCaptureManager.Result result =
+                        DiagnosticCaptureManager.captureReport(
+                                getApplicationContext(), targetPath, nativeSnapshot);
+                runOnUiThread(() -> finishDiagnosticOperation(
+                        reportButton, captureButton, restoreButton, statusView,
+                        result.isSuccess(),
+                        result.isSuccess()
+                                ? getString(
+                                        R.string.debug_diagnostics_report_created,
+                                        result.getRequestId())
+                                : result.getErrorMessage(),
+                        false));
+            }, "XeniOS diagnostic report").start();
+        });
+
+        captureButton.setOnClickListener(view -> {
+            setDiagnosticControlsEnabled(reportButton, captureButton, restoreButton, false);
+            setWindowPaintingSuspended(true);
+            beginLongDiagnosticOperation(
+                    statusView, R.string.debug_diagnostics_collecting);
+
+            final String nativeSnapshot = collectNativeDiagnosticSnapshot();
+            final String targetPath = getDiagnosticTargetPath();
+            new Thread(() -> {
+                final String saveStatePath = getDiagnosticSaveStatePath();
+                final String saveResult =
+                        runDiagnosticSaveState(saveStatePath, false);
+                if (!isNativeOperationSuccessful(saveResult)) {
+                    runOnUiThread(() -> finishDiagnosticOperation(
+                            reportButton, captureButton, restoreButton, statusView, false,
+                            nativeOperationMessage(saveResult), true));
+                    return;
+                }
+                final DiagnosticCaptureManager.Result result =
+                        DiagnosticCaptureManager.capture(
+                                getApplicationContext(), targetPath, nativeSnapshot,
+                                saveStatePath);
+                runOnUiThread(() -> finishDiagnosticOperation(
+                        reportButton, captureButton, restoreButton, statusView,
+                        result.isSuccess(),
+                        result.isSuccess()
+                                ? getString(
+                                        R.string.debug_diagnostics_created,
+                                        result.getRequestId())
+                                : result.getErrorMessage(),
+                        true));
+            }, "XeniOS diagnostic capture").start();
+        });
+
+        restoreButton.setOnClickListener(view -> new AlertDialog.Builder(this)
+                .setTitle(R.string.debug_diagnostics_restore_title)
+                .setMessage(R.string.debug_diagnostics_restore_confirmation)
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(android.R.string.ok, (dialog, which) -> {
+                    setDiagnosticControlsEnabled(
+                            reportButton, captureButton, restoreButton, false);
+                    setWindowPaintingSuspended(true);
+                    beginLongDiagnosticOperation(
+                            statusView, R.string.debug_diagnostics_restoring);
+                    new Thread(() -> {
+                        final String restoreResult = runDiagnosticSaveState(
+                                getDiagnosticSaveStatePath(), true);
+                        runOnUiThread(() -> {
+                            final boolean success =
+                                    isNativeOperationSuccessful(restoreResult);
+                            finishDiagnosticOperation(
+                                    reportButton, captureButton, restoreButton,
+                                    statusView, success,
+                                    success
+                                            ? getString(R.string.debug_diagnostics_restored)
+                                            : nativeOperationMessage(restoreResult),
+                                    true);
+                        });
+                    }, "XeniOS diagnostic restore").start();
+                })
+                .show());
+    }
+
+    private String getDiagnosticSaveStatePath() {
+        final java.io.File externalRoot = getExternalFilesDir(null);
+        final java.io.File saveDirectory =
+                new java.io.File(externalRoot != null ? externalRoot : getFilesDir(),
+                        "diagnostic_save");
+        if (!saveDirectory.isDirectory()) {
+            saveDirectory.mkdirs();
+        }
+        return new java.io.File(saveDirectory, "current.xes").getAbsolutePath();
+    }
+
+    private static boolean isNativeOperationSuccessful(final String result) {
+        return result != null && result.startsWith("ok\t");
+    }
+
+    private static String nativeOperationMessage(final String result) {
+        if (result == null) {
+            return "Native operation returned no result.";
+        }
+        final int separator = result.indexOf('\t');
+        return separator >= 0 ? result.substring(separator + 1) : result;
+    }
+
+    private void finishDiagnosticOperation(
+            final Button reportButton, final Button captureButton,
+            final Button restoreButton, final TextView statusView,
+            final boolean success, final String message,
+            final boolean resumePainting) {
+        if (resumePainting) {
+            ++mDiagnosticOperationGeneration;
+            setWindowPaintingSuspended(false);
+        }
+        setDiagnosticControlsEnabled(reportButton, captureButton, restoreButton, true);
+        final String displayMessage = success
+                ? message
+                : getString(R.string.debug_diagnostics_failed, message);
+        statusView.setText(displayMessage);
+        Toast.makeText(this, displayMessage, Toast.LENGTH_LONG).show();
+    }
+
+    private void beginLongDiagnosticOperation(
+            final TextView statusView, final int messageResource) {
+        final long generation = ++mDiagnosticOperationGeneration;
+        final long startedAt = SystemClock.elapsedRealtime();
+        statusView.post(new Runnable() {
+            @Override
+            public void run() {
+                if (generation != mDiagnosticOperationGeneration) {
+                    return;
+                }
+                final long elapsedSeconds =
+                        (SystemClock.elapsedRealtime() - startedAt) / 1000L;
+                statusView.setText(getString(messageResource, elapsedSeconds));
+                statusView.postDelayed(this, 1000L);
+            }
+        });
+    }
+
+    private static void setDiagnosticControlsEnabled(
+            final Button reportButton, final Button captureButton,
+            final Button restoreButton, final boolean enabled) {
+        reportButton.setEnabled(enabled);
+        captureButton.setEnabled(enabled);
+        restoreButton.setEnabled(enabled);
+    }
+
+    private String getDiagnosticTargetPath() {
+        final Bundle launchArguments =
+                getIntent().getBundleExtra(WindowedAppActivity.EXTRA_CVARS);
+        return launchArguments != null ? launchArguments.getString("target", "") : "";
     }
 
     private static boolean isGamepadEvent(final KeyEvent event) {
         return event.isFromSource(InputDevice.SOURCE_GAMEPAD)
                 || event.isFromSource(InputDevice.SOURCE_JOYSTICK);
+    }
+
+    private static boolean isDedicatedGamepadKey(final int keyCode) {
+        return keyCode >= KeyEvent.KEYCODE_BUTTON_A
+                && keyCode <= KeyEvent.KEYCODE_BUTTON_MODE;
     }
 
     private static boolean isGamepadEvent(final MotionEvent event) {
@@ -170,14 +389,14 @@ public class EmulatorActivity extends WindowedAppActivity {
 
     @Override
     public boolean dispatchKeyEvent(final KeyEvent event) {
-        if (!isGamepadEvent(event)) {
+        final int keyCode = event.getKeyCode();
+        if (!isGamepadEvent(event) && !isDedicatedGamepadKey(keyCode)) {
             return super.dispatchKeyEvent(event);
         }
 
         final boolean isDown = event.getAction() == KeyEvent.ACTION_DOWN;
         final boolean isUp = event.getAction() == KeyEvent.ACTION_UP;
         if (isDown || isUp) {
-            final int keyCode = event.getKeyCode();
             final int button = xInputButtonForKeyCode(keyCode);
             if (button != 0) {
                 if (isDown) {

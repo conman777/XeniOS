@@ -205,6 +205,10 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
   worker_running_ = true;
   work_event_ = xe::threading::Event::CreateAutoResetEvent(false);
   assert_not_null(work_event_);
+  pause_event_ = xe::threading::Event::CreateAutoResetEvent(false);
+  assert_not_null(pause_event_);
+  resume_event_ = xe::threading::Event::CreateAutoResetEvent(false);
+  assert_not_null(resume_event_);
   worker_thread_ =
       kernel::object_ref<kernel::XHostThread>(new kernel::XHostThread(
           kernel_state, 128 * 1024, 0,
@@ -237,8 +241,8 @@ void XmaDecoder::WorkerThreadMain() {
     }
 
     if (paused_.load(std::memory_order_acquire)) {
-      pause_fence_.Signal();
-      resume_fence_.Wait();
+      pause_event_->Set();
+      threading::Wait(resume_event_.get(), false);
     }
 
     if (did_work) {
@@ -436,11 +440,35 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
 }
 
 void XmaDecoder::Pause() {
+  std::string ignored_error;
+  PauseForSaveState(std::chrono::milliseconds::max(), &ignored_error);
+}
+
+bool XmaDecoder::PauseForSaveState(std::chrono::milliseconds timeout,
+                                   std::string* error_message) {
   if (paused_.exchange(true, std::memory_order_acq_rel)) {
-    return;
+    return true;
   }
 
-  pause_fence_.Wait();
+  // On ARM64 XMA decoding normally happens synchronously on guest threads, so
+  // there is no dedicated worker to acknowledge a pause.
+  if (!cvars::use_dedicated_xma_thread) {
+    return true;
+  }
+
+  threading::Wait(pause_event_.get(), false, std::chrono::milliseconds(0));
+  threading::Wait(resume_event_.get(), false, std::chrono::milliseconds(0));
+  work_event_->Set();
+  if (threading::Wait(pause_event_.get(), false, timeout) !=
+      threading::WaitResult::kSuccess) {
+    paused_.store(false, std::memory_order_release);
+    resume_event_->Set();
+    if (error_message) {
+      *error_message = "The XMA decoder did not quiesce in time.";
+    }
+    return false;
+  }
+  return true;
 }
 
 void XmaDecoder::Resume() {
@@ -448,7 +476,9 @@ void XmaDecoder::Resume() {
     return;
   }
 
-  resume_fence_.Signal();
+  if (cvars::use_dedicated_xma_thread) {
+    resume_event_->Set();
+  }
 }
 
 }  // namespace apu

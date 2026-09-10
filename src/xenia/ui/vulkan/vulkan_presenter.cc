@@ -228,6 +228,7 @@ Surface::TypeFlags VulkanPresenter::GetSupportedSurfaceTypes() const {
 }
 
 bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
+  auto save_state_operation = EnterSaveStateOperation();
   std::shared_ptr<GuestOutputImage> guest_output_image;
   {
     uint32_t guest_output_mailbox_index;
@@ -419,6 +420,43 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
   dfn.vkFreeMemory(device, buffer_memory, nullptr);
 
   return true;
+}
+
+bool VulkanPresenter::DrainForSaveState(
+    std::chrono::steady_clock::time_point deadline) {
+  // Queue an empty operation after the last presentation. Unlike
+  // vkQueueWaitIdle this is observable through a fence and can be polled with
+  // the caller's deadline.
+  if (paint_context_.present_queue_family != UINT32_MAX) {
+    const VkResult marker_result = ui_completion_timeline_.AcquireFenceAndSubmit(
+        paint_context_.present_queue_family, 0, 0, nullptr);
+    if (marker_result != VK_SUCCESS) {
+      return false;
+    }
+  }
+
+  const uint64_t refresher_target =
+      guest_output_image_refresher_completion_timeline_.GetUpcomingSubmission() -
+      1;
+  const uint64_t ui_target =
+      ui_completion_timeline_.GetUpcomingSubmission() - 1;
+  const uint64_t paint_target =
+      paint_context_.completion_timeline.GetUpcomingSubmission() - 1;
+  while (std::chrono::steady_clock::now() <= deadline) {
+    const uint64_t refresher_completed =
+        guest_output_image_refresher_completion_timeline_
+            .UpdateAndGetCompletedSubmission();
+    const uint64_t ui_completed =
+        ui_completion_timeline_.UpdateAndGetCompletedSubmission();
+    const uint64_t paint_completed =
+        paint_context_.completion_timeline.UpdateAndGetCompletedSubmission();
+    if (refresher_completed >= refresher_target && ui_completed >= ui_target &&
+        paint_completed >= paint_target) {
+      return !vulkan_device_->IsLost();
+    }
+    std::this_thread::yield();
+  }
+  return false;
 }
 
 VkCommandBuffer VulkanPresenter::AcquireUISetupCommandBufferFromUIThread() {

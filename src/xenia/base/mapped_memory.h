@@ -56,6 +56,7 @@ class MappedMemory {
   virtual void Close(uint64_t truncate_size = 0) {}
   virtual void Flush() {}
   virtual void FlushSync() { Flush(); }
+  virtual void FlushSync(size_t offset, size_t length) { FlushSync(); }
 
   // Changes the offset inside the file. This will update data() and size()!
   virtual bool Remap(size_t offset, size_t length) { return false; }

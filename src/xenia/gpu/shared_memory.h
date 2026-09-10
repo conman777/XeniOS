@@ -169,7 +169,7 @@ class SharedMemory {
   // non-GPU-written ranges so only the needed data - not the all the collected
   // data - will be written in the trace. trace_download_page_count() will be 0
   // if nothing to download.
-  void PrepareForTraceDownload();
+  bool PrepareForTraceDownload();
   // Release memory used for trace download ranges, to be called after
   // downloading or in cases when download is dropped.
   void ReleaseTraceDownloadRanges();

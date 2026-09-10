@@ -49,6 +49,8 @@ class XmaDecoder {
 
   bool is_paused() const { return paused_.load(std::memory_order_acquire); }
   void Pause();
+  bool PauseForSaveState(std::chrono::milliseconds timeout,
+                         std::string* error_message);
   void Resume();
 
   void SignalWork() {
@@ -83,6 +85,8 @@ class XmaDecoder {
   std::atomic<bool> paused_ = false;
   xe::threading::Fence pause_fence_;   // Signaled when worker paused.
   xe::threading::Fence resume_fence_;  // Signaled when resume requested.
+  std::unique_ptr<xe::threading::Event> pause_event_;
+  std::unique_ptr<xe::threading::Event> resume_event_;
 
   XmaRegisterFile register_file_;
 

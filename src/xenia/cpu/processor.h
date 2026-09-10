@@ -28,6 +28,7 @@
 #include "xenia/cpu/thread_debug_info.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/memory.h"
+#include "xenia/save_state_runtime.h"
 
 DECLARE_bool(debug);
 
@@ -39,6 +40,9 @@ constexpr fourcc_t kProcessorSaveSignature = make_fourcc("PROC");
 class Breakpoint;
 class StackWalker;
 class XexModule;
+
+}  // namespace cpu
+namespace cpu {
 
 enum class Irql : uint32_t {
   PASSIVE = 0,
@@ -71,6 +75,15 @@ class Processor {
   ppc::PPCFrontend* frontend() const { return frontend_.get(); }
   backend::Backend* backend() const { return backend_.get(); }
   ExportResolver* export_resolver() const { return export_resolver_; }
+  save_state::LiveGuestRuntime* live_guest_runtime() const {
+    return live_guest_runtime_.get();
+  }
+  bool AcquireSaveStateBoundary(std::chrono::milliseconds timeout,
+                                std::string* error_message);
+  void ReleaseSaveStateBoundary();
+  bool has_save_state_boundary() const {
+    return bool(save_state_boundary_);
+  }
 
   bool Setup(std::unique_ptr<backend::Backend> backend);
 
@@ -263,6 +276,8 @@ class Processor {
 
   std::unique_ptr<ppc::PPCFrontend> frontend_;
   std::unique_ptr<backend::Backend> backend_;
+  std::unique_ptr<save_state::LiveGuestRuntime> live_guest_runtime_;
+  save_state::HeldGuestBoundary save_state_boundary_;
   ExportResolver* export_resolver_ = nullptr;
 
   EntryTable entry_table_;

@@ -18,6 +18,53 @@
             android:text="@string/launcher_status_missing_game"
             android:textAppearance="?android:attr/textAppearanceMedium" />
 
+        <LinearLayout
+            android:id="@+id/debug_checkpoint_panel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="#FFF3E0"
+            android:orientation="vertical"
+            android:padding="12dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/checkpoint_debug_banner"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/checkpoint_launcher_instructions" />
+
+            <TextView
+                android:id="@+id/checkpoint_snapshot_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/checkpoint_autosave_missing" />
+
+            <Button
+                android:id="@+id/create_checkpoint_snapshot_button"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:onClick="onCreateCheckpointSnapshotClick"
+                android:text="@string/checkpoint_create_button" />
+
+            <Button
+                android:id="@+id/restore_checkpoint_snapshot_button"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:onClick="onRestoreCheckpointSnapshotClick"
+                android:text="@string/checkpoint_restore_button" />
+
+        </LinearLayout>
+
         <TextView
             android:id="@+id/launcher_game_path"
             android:layout_width="match_parent"

@@ -62,6 +62,15 @@ class WindowedApp {
   // been initialized successfully (otherwise platform-specific code must call
   // OnDestroy and refuse to continue running the app).
   virtual bool OnInitialize() = 0;
+#if XE_PLATFORM_ANDROID
+  // A short, non-blocking, best-effort snapshot for a user-triggered
+  // diagnostic marker. Implementations must not pause emulation or the GPU.
+  virtual std::string GetDiagnosticSnapshotJson() const { return "{}"; }
+  virtual std::string RunDiagnosticSaveState(const std::string& path,
+                                             bool restore) {
+    return "error\tDiagnostic saves are unavailable.";
+  }
+#endif
   // See OnDestroy for more info.
   void InvokeOnDestroy() {
     // For safety and convenience of referencing objects owned by the app in

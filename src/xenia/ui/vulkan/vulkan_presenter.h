@@ -163,6 +163,8 @@ class VulkanPresenter final : public Presenter {
       bool& is_8bpc_out_ref) override;
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  bool DrainForSaveState(
+      std::chrono::steady_clock::time_point deadline) override;
 
  private:
   // Usable for both the guest output image itself and for intermediate images.

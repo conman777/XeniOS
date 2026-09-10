@@ -74,7 +74,10 @@ static void MMIOAwareStore(void* _ctx, unsigned int guestaddr, T value) {
   if (swap) {
     value = xe::byte_swap(value);
   }
-  if (guestaddr >= 0xE0000000) {
+  // 4 KB hosts map the physical alias with its offset already applied.
+  // Match ComputeMemoryAddress on hosts that cannot map a 4 KB offset.
+  if (guestaddr >= 0xE0000000 &&
+      xe::memory::allocation_granularity() > 0x1000) {
     guestaddr += 0x1000;
   }
 
@@ -92,7 +95,8 @@ template <typename T, bool swap>
 static T MMIOAwareLoad(void* _ctx, unsigned int guestaddr) {
   T value;
 
-  if (guestaddr >= 0xE0000000) {
+  if (guestaddr >= 0xE0000000 &&
+      xe::memory::allocation_granularity() > 0x1000) {
     guestaddr += 0x1000;
   }
 

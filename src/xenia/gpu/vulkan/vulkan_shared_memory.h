@@ -60,9 +60,11 @@ class VulkanSharedMemory : public SharedMemory {
   VkBuffer buffer() const { return buffer_; }
   Memory& guest_memory_for_diagnostics() const { return memory(); }
 
-  // Returns true if any downloads were submitted to the command processor.
-  bool InitializeTraceSubmitDownloads();
-  void InitializeTraceCompleteDownloads();
+  // Returns true if any downloads were submitted. capture_success, if supplied,
+  // distinguishes an empty GPU-owned range set from an allocation failure.
+  bool InitializeTraceSubmitDownloads(bool* capture_success = nullptr);
+  // Save-state callers must keep all guest producers paused until completion.
+  bool InitializeTraceCompleteDownloads(bool copy_to_guest_memory = false);
 
  protected:
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,

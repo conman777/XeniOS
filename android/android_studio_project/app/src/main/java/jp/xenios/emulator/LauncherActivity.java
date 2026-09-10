@@ -1,6 +1,7 @@
 package jp.xenios.emulator;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.AssetManager;
@@ -31,9 +32,13 @@ public class LauncherActivity extends Activity {
     private static final String DEFAULT_PROFILE_FILENAME = "xenios_android_profile.txt";
 
     private Button launchGameButton;
+    private Button createCheckpointSnapshotButton;
+    private Button restoreCheckpointSnapshotButton;
     private TextView gamePathView;
     private TextView statusView;
+    private TextView checkpointStatusView;
     private String detectedGamePath;
+    private boolean checkpointOperationRunning;
 
     @Override
     protected void onCreate(final Bundle savedInstanceState) {
@@ -43,6 +48,7 @@ public class LauncherActivity extends Activity {
         launchGameButton = findViewById(R.id.launch_game_button);
         gamePathView = findViewById(R.id.launcher_game_path);
         statusView = findViewById(R.id.launcher_status);
+        configureCheckpointPanel();
         ensureDefaultProfileInstalled();
         refreshDetectedGame();
     }
@@ -51,6 +57,7 @@ public class LauncherActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refreshDetectedGame();
+        refreshCheckpointPanel();
     }
 
     @Override
@@ -99,9 +106,11 @@ public class LauncherActivity extends Activity {
     }
 
     public void onLaunchDetectedGameClick(final View view) {
-        if (detectedGamePath == null) {
+        if (detectedGamePath == null || checkpointOperationRunning) {
             return;
         }
+        HaloCheckpointSnapshotManager.markEmulatorStartedInThisProcess();
+        refreshCheckpointPanel();
         rememberLastGamePath(detectedGamePath);
         final Intent emulatorIntent = new Intent(this, EmulatorActivity.class);
         emulatorIntent.putExtra(
@@ -111,6 +120,162 @@ public class LauncherActivity extends Activity {
 
     public void onRescanGamesClick(final View view) {
         refreshDetectedGame();
+    }
+
+    public void onCreateCheckpointSnapshotClick(final View view) {
+        if (!BuildConfig.DEBUG || !checkpointActionsAllowed()) {
+            showCheckpointError(getString(R.string.checkpoint_restart_required));
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.checkpoint_create_title)
+                .setMessage(R.string.checkpoint_create_confirmation)
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(
+                        R.string.checkpoint_create_button,
+                        (dialog, which) -> createCheckpointSnapshot())
+                .show();
+    }
+
+    public void onRestoreCheckpointSnapshotClick(final View view) {
+        if (!BuildConfig.DEBUG || !checkpointActionsAllowed()) {
+            showCheckpointError(getString(R.string.checkpoint_restart_required));
+            return;
+        }
+        final List<HaloCheckpointSnapshotManager.SnapshotInfo> snapshots =
+                HaloCheckpointSnapshotManager.listSnapshots(getFilesDir());
+        if (snapshots.isEmpty()) {
+            showCheckpointError(getString(R.string.checkpoint_no_snapshots));
+            return;
+        }
+
+        final String[] labels = new String[snapshots.size()];
+        for (int index = 0; index < snapshots.size(); ++index) {
+            final HaloCheckpointSnapshotManager.SnapshotInfo snapshot = snapshots.get(index);
+            labels[index] = getString(
+                    R.string.checkpoint_snapshot_label,
+                    snapshot.id,
+                    snapshot.sha256.substring(0, 12));
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.checkpoint_restore_choose_title)
+                .setItems(
+                        labels,
+                        (dialog, which) -> confirmRestoreCheckpointSnapshot(snapshots.get(which)))
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void configureCheckpointPanel() {
+        final View panel = findViewById(R.id.debug_checkpoint_panel);
+        if (!BuildConfig.DEBUG) {
+            panel.setVisibility(View.GONE);
+            return;
+        }
+        panel.setVisibility(View.VISIBLE);
+        createCheckpointSnapshotButton = findViewById(R.id.create_checkpoint_snapshot_button);
+        restoreCheckpointSnapshotButton = findViewById(R.id.restore_checkpoint_snapshot_button);
+        checkpointStatusView = findViewById(R.id.checkpoint_snapshot_status);
+        refreshCheckpointPanel();
+    }
+
+    private void refreshCheckpointPanel() {
+        if (!BuildConfig.DEBUG || checkpointStatusView == null) {
+            return;
+        }
+        final boolean allowed = checkpointActionsAllowed();
+        final boolean hasAutosave =
+                HaloCheckpointSnapshotManager.hasAutosave(getFilesDir());
+        final List<HaloCheckpointSnapshotManager.SnapshotInfo> snapshots =
+                HaloCheckpointSnapshotManager.listSnapshots(getFilesDir());
+        createCheckpointSnapshotButton.setEnabled(allowed && hasAutosave);
+        restoreCheckpointSnapshotButton.setEnabled(
+                allowed && hasAutosave && !snapshots.isEmpty());
+        if (!allowed) {
+            checkpointStatusView.setText(R.string.checkpoint_restart_required);
+        } else if (!hasAutosave) {
+            checkpointStatusView.setText(R.string.checkpoint_autosave_missing);
+        } else {
+            checkpointStatusView.setText(
+                    getString(R.string.checkpoint_ready_status, snapshots.size()));
+        }
+    }
+
+    private boolean checkpointActionsAllowed() {
+        return !checkpointOperationRunning
+                && HaloCheckpointSnapshotManager.isCheckpointAccessAllowed();
+    }
+
+    private void createCheckpointSnapshot() {
+        beginCheckpointOperation();
+        new Thread(() -> {
+            try {
+                final HaloCheckpointSnapshotManager.SnapshotInfo snapshot =
+                        HaloCheckpointSnapshotManager.createSnapshot(
+                                getFilesDir(), "user-confirmed stable checkpoint");
+                runOnUiThread(() -> finishCheckpointOperation(
+                        getString(
+                                R.string.checkpoint_create_success,
+                                snapshot.id,
+                                snapshot.sha256.substring(0, 12))));
+            } catch (final Exception e) {
+                runOnUiThread(() -> finishCheckpointOperation(
+                        getString(R.string.checkpoint_operation_failed, e.getMessage())));
+            }
+        }, "Halo checkpoint snapshot").start();
+    }
+
+    private void confirmRestoreCheckpointSnapshot(
+            final HaloCheckpointSnapshotManager.SnapshotInfo snapshot) {
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.checkpoint_restore_title)
+                .setMessage(getString(R.string.checkpoint_restore_confirmation, snapshot.id))
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(
+                        R.string.checkpoint_restore_button,
+                        (dialog, which) -> restoreCheckpointSnapshot(snapshot))
+                .show();
+    }
+
+    private void restoreCheckpointSnapshot(
+            final HaloCheckpointSnapshotManager.SnapshotInfo snapshot) {
+        beginCheckpointOperation();
+        new Thread(() -> {
+            try {
+                final HaloCheckpointSnapshotManager.RestoreResult result =
+                        HaloCheckpointSnapshotManager.restoreSnapshot(
+                                getFilesDir(), snapshot.id);
+                runOnUiThread(() -> finishCheckpointOperation(
+                        getString(
+                                R.string.checkpoint_restore_success,
+                                result.restoredSnapshot.id,
+                                result.recoverySnapshot.id)));
+            } catch (final Exception e) {
+                runOnUiThread(() -> finishCheckpointOperation(
+                        getString(R.string.checkpoint_operation_failed, e.getMessage())));
+            }
+        }, "Halo checkpoint restore").start();
+    }
+
+    private void beginCheckpointOperation() {
+        checkpointOperationRunning = true;
+        launchGameButton.setEnabled(false);
+        createCheckpointSnapshotButton.setEnabled(false);
+        restoreCheckpointSnapshotButton.setEnabled(false);
+        checkpointStatusView.setText(R.string.checkpoint_operation_running);
+    }
+
+    private void finishCheckpointOperation(final String message) {
+        checkpointOperationRunning = false;
+        refreshDetectedGame();
+        refreshCheckpointPanel();
+        checkpointStatusView.setText(message);
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+    }
+
+    private void showCheckpointError(final String message) {
+        checkpointStatusView.setText(message);
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 
     private void importPickedGame(final Uri uri) {
@@ -243,7 +408,7 @@ public class LauncherActivity extends Activity {
         launchArguments.putString("storage_root", storageRoot.getAbsolutePath());
         launchArguments.putString("content_root", contentRoot.getAbsolutePath());
         launchArguments.putString("cache_root", getCacheDir().getAbsolutePath());
-        launchArguments.putString("apu", "nop");
+        launchArguments.putString("apu", "opensl");
         launchArguments.putString("gpu", "vulkan");
         launchArguments.putString("hid", "nop");
         launchArguments.putBoolean("discord", false);

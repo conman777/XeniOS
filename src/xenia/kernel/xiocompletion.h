@@ -19,6 +19,8 @@
 namespace xe {
 namespace kernel {
 
+constexpr fourcc_t kIOCompletionSaveSignature = make_fourcc("IOCP");
+
 class XIOCompletion : public XObject {
  public:
   static const XObject::Type kObjectType = XObject::Type::IOCompletion;
@@ -37,6 +39,10 @@ class XIOCompletion : public XObject {
 
   // Returns true if the wait ended because a notification was received.
   bool WaitForNotification(uint64_t wait_ticks, IONotification* notify);
+
+  bool Save(ByteStream* stream) override;
+  static object_ref<XIOCompletion> Restore(KernelState* kernel_state,
+                                           ByteStream* stream);
 
  private:
   static constexpr uint32_t kMaxNotifications = 1024;

@@ -48,6 +48,7 @@ InputSystem::~InputSystem() = default;
 X_STATUS InputSystem::Setup() { return X_STATUS_SUCCESS; }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
+  auto admission = save_state_admission_gate_.Enter();
   drivers_.push_back(std::move(driver));
 }
 
@@ -105,6 +106,7 @@ std::vector<InputDriver*> InputSystem::FilterDrivers(uint32_t flags) {
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
+  auto admission = save_state_admission_gate_.Enter();
 
   std::vector<InputDriver*> filtered_drivers = FilterDrivers(flags);
 
@@ -120,6 +122,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
                                X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  auto admission = save_state_admission_gate_.Enter();
 
   // If UI is blocking input, return zeroed state to the game
   if (ui_input_blockers_.load() > 0) {
@@ -127,7 +130,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
     return X_ERROR_SUCCESS;
   }
 
-  X_RESULT result = GetStateForUI(user_index, flags, out_state);
+  X_RESULT result = GetStateForUIImpl(user_index, flags, out_state);
 
   // Handle consumed buttons - these are buttons that were held when a UI dialog
   // closed. We mask them from the game until they are released.
@@ -146,7 +149,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
 X_RESULT InputSystem::GetStateForUI(uint32_t user_index, uint32_t flags,
                                     X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  auto admission = save_state_admission_gate_.Enter();
+  return GetStateForUIImpl(user_index, flags, out_state);
+}
 
+X_RESULT InputSystem::GetStateForUIImpl(uint32_t user_index, uint32_t flags,
+                                        X_INPUT_STATE* out_state) {
   std::vector<InputDriver*> filtered_drivers = FilterDrivers(flags);
   if (filtered_drivers.empty()) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -168,15 +176,19 @@ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, uint32_t flags,
   return X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
-void InputSystem::AddUIInputBlocker() { ui_input_blockers_.fetch_add(1); }
+void InputSystem::AddUIInputBlocker() {
+  auto admission = save_state_admission_gate_.Enter();
+  ui_input_blockers_.fetch_add(1);
+}
 
 void InputSystem::RemoveUIInputBlocker() {
+  auto admission = save_state_admission_gate_.Enter();
   // Before removing the blocker, capture any currently pressed buttons.
   // These will be masked from game input until they are released, preventing
   // the button press that closed the UI from carrying over into the game.
   X_INPUT_STATE state;
   for (uint32_t user_index = 0; user_index < XUserMaxUserCount; user_index++) {
-    if (GetStateForUI(user_index, 1, &state) == X_ERROR_SUCCESS) {
+    if (GetStateForUIImpl(user_index, 1, &state) == X_ERROR_SUCCESS) {
       consumed_buttons_[user_index] |= state.gamepad.buttons;
     }
   }
@@ -187,6 +199,12 @@ void InputSystem::RemoveUIInputBlocker() {
 X_RESULT InputSystem::SetState(uint32_t user_index,
                                X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
+  auto admission = save_state_admission_gate_.Enter();
+  return SetStateImpl(user_index, vibration);
+}
+
+X_RESULT InputSystem::SetStateImpl(uint32_t user_index,
+                                   X_INPUT_VIBRATION* vibration) {
   X_INPUT_VIBRATION modified_vibration = ModifyVibrationLevel(vibration);
   for (auto& driver : drivers_) {
     X_RESULT result = driver->SetState(user_index, &modified_vibration);
@@ -200,6 +218,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index,
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
+  auto admission = save_state_admission_gate_.Enter();
 
   // If UI is blocking input, return empty keystroke to the game
   if (ui_input_blockers_.load() > 0) {
@@ -235,13 +254,24 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
 bool InputSystem::GetVibrationCvar() { return cvars::vibration; }
 
 void InputSystem::ToggleVibration() {
+  auto admission = save_state_admission_gate_.Enter();
   OVERRIDE_bool(vibration, !cvars::vibration);
   // Send instant update to vibration state to prevent awaiting for next tick.
   X_INPUT_VIBRATION vibration = X_INPUT_VIBRATION();
 
   for (uint8_t user_index = 0; user_index < XUserMaxUserCount; user_index++) {
-    SetState(user_index, &vibration);
+    SetStateImpl(user_index, &vibration);
   }
+}
+
+X_STATUS InputSystem::ReadSkylanderPortal(std::vector<uint8_t>& data) {
+  auto admission = save_state_admission_gate_.Enter();
+  return skylander_portal_->read(data);
+}
+
+X_STATUS InputSystem::WriteSkylanderPortal(std::vector<uint8_t>& data) {
+  auto admission = save_state_admission_gate_.Enter();
+  return skylander_portal_->write(data);
 }
 
 void InputSystem::AdjustDeadzoneLevels(const uint8_t slot,

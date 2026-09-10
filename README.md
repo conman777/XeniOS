@@ -22,6 +22,11 @@ improvements are intended to flow back upstream over time.
 
 ## Current Focus
 
+For this checkout's experimental Android work, start with the
+[Android development guide](docs/android-development.md). It records the
+verified device status, build commands and save-state limitations. Halo Reach
+is currently not playable on the tested Odin2 Portal.
+
 - iOS
 - macOS (Apple Silicon)
 - macOS (Intel)

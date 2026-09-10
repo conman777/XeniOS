@@ -129,6 +129,21 @@ void VulkanPrimitiveProcessor::BeginSubmission() {
   }
 }
 
+void VulkanPrimitiveProcessor::ClearCache() {
+  // The pool destroys every VkBuffer it owns, so the handle table and the
+  // converted-index cache that maps guest index data to those handles must go
+  // with it. Dropping only the pool leaves frame_index_buffers_ holding
+  // dangling VkBuffers, and the next draw that hits the cache binds one
+  // through GetConvertedIndexBuffer - the driver then faults inside
+  // vkCmdBindIndexBuffer when the deferred command buffer is replayed.
+  // This is reachable mid-frame: the Android memory reclamation path in
+  // VulkanCommandProcessor calls ClearCache() between draws, not just at the
+  // frame close where EndFrame() would have cleared both.
+  ClearPerFrameCache();
+  frame_index_buffers_.clear();
+  frame_index_buffer_pool_->ClearCache();
+}
+
 void VulkanPrimitiveProcessor::BeginFrame() {
   frame_index_buffer_pool_->Reclaim(command_processor_.GetCompletedFrame());
 }

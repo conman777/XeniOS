@@ -31,7 +31,9 @@
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #if XE_PLATFORM_ANDROID
+#include "xenia/gpu/vulkan/android_diagnostic_state.h"
 #include "xenia/gpu/vulkan/android_halo_experiment.h"
+#include "xenia/gpu/vulkan/android_halo_reclaim_state.h"
 #endif
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
@@ -363,9 +365,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       vulkan_device->properties();
 
 #if XE_PLATFORM_ANDROID
-  // Experiment: force the bit-exact EDRAM path without native interlock.
-  // Guest draws are serialized below to make their read-modify-write ordering
-  // deterministic across draw calls.
+  // Legacy alias for requesting FSI. Capability checks still apply.
   const bool force_fsi_experiment = GetAndroidHaloExperiment().force_fsi;
 #else
   constexpr bool force_fsi_experiment = false;
@@ -406,9 +406,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     // between, for instance, the ability to vfetch and memexport in fragment
     // shaders, and the usage of fragment shader interlock, prefer the former
     // for simplicity.
-    if ((!(device_properties.fragmentShaderSampleInterlock ||
-           device_properties.fragmentShaderPixelInterlock) &&
-         !force_fsi_experiment) ||
+    if (!(device_properties.fragmentShaderSampleInterlock ||
+          device_properties.fragmentShaderPixelInterlock) ||
         !device_properties.fragmentStoresAndAtomics ||
         !device_properties.sampleRateShading ||
         !device_properties.standardSampleLocations ||
@@ -454,6 +453,13 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       shared_memory_binding_count,
       device_properties.maxPerStageDescriptorStorageBuffers,
       device_properties.maxFragmentCombinedOutputResources);
+  AndroidDiagnosticRenderState::Get().SetRenderer(
+      requested_fsi,
+      path_ == Path::kPixelShaderInterlock
+          ? AndroidDiagnosticRenderTargetPath::kFragmentShaderInterlock
+          : AndroidDiagnosticRenderTargetPath::kHostRenderTargets,
+      device_properties.fragmentShaderSampleInterlock,
+      device_properties.fragmentShaderPixelInterlock);
 #endif
 
   // Format support.
@@ -1325,6 +1331,8 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   android_halo_present_shadow_valid_ = false;
   android_halo_menu_scene_shadow_valid_ = false;
   android_halo_owner_kind_ = AndroidHaloOwnerKind::kUnknown;
+  AndroidDiagnosticRenderState::Get().SetOwnerState(
+      AndroidDiagnosticOwnerState::kUnknown);
 #endif
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
                                          edram_buffer_);
@@ -1349,7 +1357,79 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   }
 }
 
-void VulkanRenderTargetCache::ClearCache() {
+void VulkanRenderTargetCache::ClearCache() { ClearCache("deferred"); }
+
+bool VulkanRenderTargetCache::SaveStateSubmitEdramDownload(
+    VkBuffer destination) {
+  if (destination == VK_NULL_HANDLE || IsDrawResolutionScaled()) {
+    return false;
+  }
+  if (GetPath() == Path::kHostRenderTargets) {
+    DumpRenderTargets(0, xenos::kEdramTileCount, 1,
+                      xenos::kEdramTileCount);
+  }
+  UseEdramBuffer(EdramBufferUsage::kTransferRead);
+  command_processor_.SubmitBarriers(true);
+  VkBufferCopy* copy =
+      command_processor_.deferred_command_buffer().CmdCopyBufferEmplace(
+          edram_buffer_, destination, 1);
+  copy->srcOffset = 0;
+  copy->dstOffset = 0;
+  copy->size = xenos::kEdramSizeBytes;
+  command_processor_.PushBufferMemoryBarrier(
+      destination, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_HOST_READ_BIT);
+  return true;
+}
+
+void VulkanRenderTargetCache::SaveStateSubmitEdramUpload(VkBuffer source) {
+  assert_true(source != VK_NULL_HANDLE);
+  UseEdramBuffer(EdramBufferUsage::kTransferWrite);
+  command_processor_.SubmitBarriers(true);
+  VkBufferCopy* copy =
+      command_processor_.deferred_command_buffer().CmdCopyBufferEmplace(
+          source, edram_buffer_, 1);
+  copy->srcOffset = 0;
+  copy->dstOffset = 0;
+  copy->size = xenos::kEdramSizeBytes;
+}
+
+void VulkanRenderTargetCache::ClearCache(const char* reason) {
+  // Queued pipeline creation requests hold the render pass they were recorded
+  // with as a raw VkRenderPass, so any pass destroyed below may still be about
+  // to be handed to vkCreateGraphicsPipelines by an async creation thread.
+  // Drain those workers first or the driver faults inside pipeline creation.
+  // Only reachable with async creation enabled: synchronous creation finishes
+  // inside the draw, so it can never overlap with this.
+  command_processor_.DrainPipelineCreationThreads();
+
+#if XE_PLATFORM_ANDROID
+  const bool android_halo_compat_active = IsAndroidHaloCompatActive();
+  const bool android_halo_presentable_tracked =
+      android_halo_presentable_color_rt_ != nullptr;
+  const RenderTargetKey android_halo_presentable_key =
+      android_halo_presentable_tracked
+          ? android_halo_presentable_color_rt_->key()
+          : RenderTargetKey();
+  const bool android_halo_msaa_scene_tracked =
+      android_halo_msaa_scene_color_rt_ != nullptr;
+  const RenderTargetKey android_halo_msaa_scene_key =
+      android_halo_msaa_scene_tracked
+          ? android_halo_msaa_scene_color_rt_->key()
+          : RenderTargetKey();
+  const bool android_halo_present_shadow_valid_before =
+      android_halo_present_shadow_valid_;
+  const bool android_halo_menu_scene_shadow_valid_before =
+      android_halo_menu_scene_shadow_valid_;
+  const AndroidHaloOwnerKind android_halo_owner_kind_before =
+      android_halo_owner_kind_;
+  const bool android_halo_depth_alias_latched_before =
+      android_halo_depth_alias_quarantine_latched_;
+  const bool android_halo_reclaim_shadow_required_before =
+      android_halo_reclaim_shadow_required_;
+#endif
+
   const VkDeviceSize render_target_memory_usage_before =
       render_target_memory_usage_bytes_;
   const ui::vulkan::VulkanDevice* const vulkan_device =
@@ -1380,11 +1460,7 @@ void VulkanRenderTargetCache::ClearCache() {
   android_depth_to_color_edram_fallback_source_ = nullptr;
   android_halo_presentable_color_rt_ = nullptr;
   android_halo_msaa_scene_color_rt_ = nullptr;
-  android_halo_present_shadow_valid_ = false;
-  android_halo_menu_scene_shadow_valid_ = false;
-  android_halo_owner_kind_ = AndroidHaloOwnerKind::kUnknown;
   android_halo_transfer_render_pass_active_ = false;
-  android_halo_depth_alias_quarantine_latched_ = false;
   android_halo_present_shadow_stage_mask_ = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
   android_halo_present_shadow_access_mask_ = 0;
   android_halo_menu_scene_shadow_stage_mask_ =
@@ -1393,6 +1469,85 @@ void VulkanRenderTargetCache::ClearCache() {
 #endif
 
   RenderTargetCache::ClearCache();
+#if XE_PLATFORM_ANDROID
+  if (android_halo_presentable_tracked) {
+    android_halo_presentable_color_rt_ =
+        static_cast<VulkanRenderTarget*>(
+            FindRenderTarget(android_halo_presentable_key));
+  }
+  if (android_halo_msaa_scene_tracked) {
+    android_halo_msaa_scene_color_rt_ =
+        static_cast<VulkanRenderTarget*>(
+            FindRenderTarget(android_halo_msaa_scene_key));
+  }
+  const AndroidHaloReclaimStateDecision android_halo_reclaim_decision =
+      DecideAndroidHaloReclaimState({
+          android_halo_owner_kind_before ==
+              AndroidHaloOwnerKind::kPresentableColor,
+          android_halo_owner_kind_before ==
+              AndroidHaloOwnerKind::kDepthColorAliasNonPresentable,
+          android_halo_depth_alias_latched_before,
+          android_halo_presentable_tracked,
+          android_halo_presentable_color_rt_ != nullptr,
+          android_halo_msaa_scene_tracked,
+          android_halo_msaa_scene_color_rt_ != nullptr,
+          android_halo_present_shadow_valid_before,
+          android_halo_reclaim_shadow_required_before,
+      });
+  android_halo_present_shadow_valid_ =
+      android_halo_reclaim_decision.preserve_shadow_valid;
+  android_halo_menu_scene_shadow_valid_ =
+      android_halo_menu_scene_shadow_valid_before;
+  android_halo_depth_alias_quarantine_latched_ =
+      android_halo_reclaim_decision.preserve_depth_alias_latch;
+  android_halo_reclaim_shadow_required_ =
+      android_halo_reclaim_decision.reclaim_shadow_required;
+  android_halo_owner_kind_ =
+      android_halo_reclaim_decision.preserve_owner
+          ? android_halo_owner_kind_before
+          : AndroidHaloOwnerKind::kUnknown;
+  switch (android_halo_owner_kind_) {
+    case AndroidHaloOwnerKind::kPresentableColor:
+      AndroidDiagnosticRenderState::Get().SetOwnerState(
+          AndroidDiagnosticOwnerState::kPresentableColor);
+      break;
+    case AndroidHaloOwnerKind::kDepthColorAliasNonPresentable:
+      AndroidDiagnosticRenderState::Get().SetOwnerState(
+          AndroidDiagnosticOwnerState::kDepthColorAliasNonPresentable);
+      break;
+    default:
+      AndroidDiagnosticRenderState::Get().SetOwnerState(
+          AndroidDiagnosticOwnerState::kUnknown);
+      break;
+  }
+  if (android_halo_compat_active) {
+    const uint64_t generation = ++android_halo_cache_reclaim_generation_;
+    if (generation <= 64 || (generation % 300) == 0) {
+      XELOGI(
+          "HaloCompat cache_reclaim generation={} reason={} owner={}->{} "
+          "presentable_tracked/rebound={}/{} msaa_tracked/rebound={}/{} "
+          "shadow={}->{} menu_shadow={}->{} latch={}->{} "
+          "reclaim_shadow_required={}->{}",
+          generation, reason, GetAndroidHaloOwnerKindName(
+                                  android_halo_owner_kind_before),
+          GetAndroidHaloOwnerKindName(android_halo_owner_kind_),
+          uint32_t(android_halo_presentable_tracked),
+          uint32_t(android_halo_presentable_color_rt_ != nullptr),
+          uint32_t(android_halo_msaa_scene_tracked),
+          uint32_t(android_halo_msaa_scene_color_rt_ != nullptr),
+          uint32_t(android_halo_present_shadow_valid_before),
+          uint32_t(android_halo_present_shadow_valid_),
+          uint32_t(android_halo_menu_scene_shadow_valid_before),
+          uint32_t(android_halo_menu_scene_shadow_valid_),
+          uint32_t(android_halo_depth_alias_latched_before),
+          uint32_t(android_halo_depth_alias_quarantine_latched_),
+          uint32_t(android_halo_reclaim_shadow_required_before),
+          uint32_t(android_halo_reclaim_shadow_required_));
+    }
+  }
+#else
+  static_cast<void>(reason);
+#endif
   render_target_memory_clear_requested_ = false;
   if (render_target_memory_usage_bytes_ !=
       render_target_memory_usage_before) {
@@ -1441,6 +1596,15 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
   }
 
 #if XE_PLATFORM_ANDROID
+  AndroidDiagnosticRenderState::Get().RecordResolve(
+      resolve_info.copy_dest_extent_start,
+      resolve_info.copy_dest_extent_length,
+      uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+      uint32_t(resolve_info.color_edram_info.base_tiles),
+      uint32_t(resolve_info.color_edram_info.format),
+      uint32_t(1) << uint32_t(resolve_info.color_edram_info.msaa_samples),
+      resolve_info.color_edram_info.is_depth);
+
   // Permanent, allocation-free telemetry for Reach's reused scene scratch
   // range. Log each distinct register-derived resolve tuple at most once.
   constexpr uint32_t kAndroidHaloSceneResolveStart = UINT32_C(0x02354000);
@@ -1581,13 +1745,28 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
           dump_base, dump_row_length_used, dump_rows, dump_pitch,
           resolve_info.copy_dest_extent_start,
           uint32_t(resolve_info.copy_dest_info.copy_dest_format));
-      android_prefer_7e3_dump_675_ =
-          GetAndroidHaloExperiment().dump_scene_675_prefer_7e3_float &&
-          !resolve_info.IsCopyingDepth() &&
-          resolve_info.copy_dest_extent_start == UINT32_C(0x02354000) &&
-          resolve_info.copy_dest_info.copy_dest_format ==
-              xenos::ColorFormat::k_16_16_16_16 &&
-          dump_base == 675;
+      // Only redirect when the resolve registers themselves claim a 7e3
+      // source; a legitimately-LDR resolve to the same span must not be fed
+      // stale HDR content (HOSTDUMP t150: register src was fmt3 while the
+      // ownership map said fmt2 in every bad case).
+      {
+        const xenos::ColorRenderTargetFormat prefer_7e3_reg_src_format =
+            xenos::ColorRenderTargetFormat(
+                resolve_info.color_edram_info.format);
+        android_prefer_7e3_dump_675_ =
+            GetAndroidHaloExperiment().dump_scene_675_prefer_7e3_float &&
+            !resolve_info.IsCopyingDepth() &&
+            !resolve_info.color_edram_info.is_depth &&
+            (prefer_7e3_reg_src_format ==
+                 xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+             prefer_7e3_reg_src_format ==
+                 xenos::ColorRenderTargetFormat::
+                     k_2_10_10_10_FLOAT_AS_16_16_16_16) &&
+            resolve_info.copy_dest_extent_start == UINT32_C(0x02354000) &&
+            resolve_info.copy_dest_info.copy_dest_format ==
+                xenos::ColorFormat::k_16_16_16_16 &&
+            dump_base == 675;
+      }
 #endif
       DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
 #if XE_PLATFORM_ANDROID
@@ -2567,22 +2746,6 @@ bool VulkanRenderTargetCache::Update(
       // For FSI, only the barrier is needed - already scheduled if required.
       // But the buffer will be used for FSI drawing now.
       UseEdramBuffer(EdramBufferUsage::kFragmentReadWrite);
-#if XE_PLATFORM_ANDROID
-      const ui::vulkan::VulkanDevice::Properties& device_properties =
-          command_processor_.GetVulkanDevice()->properties();
-      const bool emulating_fragment_shader_interlock =
-          GetAndroidHaloExperiment().force_fsi &&
-          !(device_properties.fragmentShaderSampleInterlock ||
-            device_properties.fragmentShaderPixelInterlock);
-      if (emulating_fragment_shader_interlock) {
-        // Native interlock orders overlapping fragment read-modify-writes both
-        // within and across guest draws. Without it, at least make every new
-        // guest draw observe all EDRAM writes from the preceding draw. The
-        // pending barrier is submitted before the draw pass is re-entered.
-        CommitEdramBufferShaderWrites(
-            EdramBufferModificationStatus::kViaFragmentShaderInterlock);
-      }
-#endif
       // Commit preceding unordered (but not FSI) writes like clears as they
       // aren't synchronized with FSI accesses.
       CommitEdramBufferShaderWrites(
@@ -3793,6 +3956,8 @@ void VulkanRenderTargetCache::AndroidHaloNoteColorDrawTargets(
       android_halo_depth_alias_quarantine_latched_ = false;
     }
     android_halo_owner_kind_ = AndroidHaloOwnerKind::kPresentableColor;
+    AndroidDiagnosticRenderState::Get().SetOwnerState(
+        AndroidDiagnosticOwnerState::kPresentableColor);
     android_halo_presentable_color_rt_ = static_cast<VulkanRenderTarget*>(rt);
     AndroidHaloNotifyMsaaSceneDrawFrame(gameplay_scene_draw_this_frame);
     return;
@@ -3808,6 +3973,8 @@ void VulkanRenderTargetCache::AndroidHaloQuarantineDepthToColor(
   }
   android_halo_owner_kind_ =
       AndroidHaloOwnerKind::kDepthColorAliasNonPresentable;
+  AndroidDiagnosticRenderState::Get().SetOwnerState(
+      AndroidDiagnosticOwnerState::kDepthColorAliasNonPresentable);
   android_halo_depth_alias_quarantine_latched_ = true;
   ++android_halo_depth_to_color_quarantine_count_;
   if (GetAndroidHaloExperiment().log_owner_history) {
@@ -4069,6 +4236,8 @@ void VulkanRenderTargetCache::AndroidHaloCapturePresentableShadow(
 
   android_halo_present_shadow_valid_ = true;
   android_halo_owner_kind_ = AndroidHaloOwnerKind::kPresentableColor;
+  AndroidDiagnosticRenderState::Get().SetOwnerState(
+      AndroidDiagnosticOwnerState::kPresentableColor);
   ++android_halo_present_shadow_update_count_;
   if (GetAndroidHaloExperiment().log_owner_history) {
     static uint32_t owner_trace_shadow_update_count = 0;
@@ -4280,6 +4449,8 @@ bool VulkanRenderTargetCache::AndroidHaloRefreshPresentableEdramForFinalResolve(
   }
 
   android_halo_owner_kind_ = AndroidHaloOwnerKind::kPresentableColor;
+  AndroidDiagnosticRenderState::Get().SetOwnerState(
+      AndroidDiagnosticOwnerState::kPresentableColor);
   android_halo_depth_alias_quarantine_latched_ = false;
   ++android_halo_direct_presentable_resolve_count_;
   if (GetAndroidHaloExperiment().log_owner_history) {
@@ -4356,12 +4527,14 @@ bool VulkanRenderTargetCache::AndroidHaloMaybeOverrideEdramWithPresentableShadow
   if (AndroidHaloRefreshPresentableEdramForFinalResolve(
           resolve_info, dump_base, dump_row_length_used, dump_rows, dump_pitch,
           copy_width, copy_height, copy_bpp, copy_shader_constants)) {
+    android_halo_reclaim_shadow_required_ = false;
     return false;
   }
 
   const bool should_use_shadow =
       GetAndroidHaloExperiment().shadow_fallback &&
-      (android_halo_owner_kind_ ==
+      (android_halo_reclaim_shadow_required_ ||
+       android_halo_owner_kind_ ==
            AndroidHaloOwnerKind::kDepthColorAliasNonPresentable ||
        android_halo_depth_alias_quarantine_latched_) &&
       android_halo_present_shadow_valid_;
@@ -4369,10 +4542,12 @@ bool VulkanRenderTargetCache::AndroidHaloMaybeOverrideEdramWithPresentableShadow
     if (android_halo_present_shadow_skip_log_count_ < 128) {
       XELOGI(
           "HaloCompat final_override skipped: shadow_valid={} owner_kind={} "
-          "latched={} fb_addr=0x{:08X} fb={}x{} fmt={} dump_base={} pitch={}",
+          "latched={} reclaim_required={} fb_addr=0x{:08X} fb={}x{} fmt={} "
+          "dump_base={} pitch={}",
           uint32_t(android_halo_present_shadow_valid_),
           GetAndroidHaloOwnerKindName(android_halo_owner_kind_),
           uint32_t(android_halo_depth_alias_quarantine_latched_),
+          uint32_t(android_halo_reclaim_shadow_required_),
           resolve_info.copy_dest_extent_start, copy_width, copy_height,
           uint32_t(resolve_info.copy_dest_info.copy_dest_format), dump_base,
           dump_pitch);
@@ -4406,7 +4581,10 @@ bool VulkanRenderTargetCache::AndroidHaloMaybeOverrideEdramWithPresentableShadow
       uint32_t(resolve_info.copy_dest_info.copy_dest_format),
       kAndroidHaloShadowBytes);
   android_halo_depth_alias_quarantine_latched_ = false;
+  android_halo_reclaim_shadow_required_ = false;
   android_halo_owner_kind_ = AndroidHaloOwnerKind::kPresentableColor;
+  AndroidDiagnosticRenderState::Get().SetOwnerState(
+      AndroidDiagnosticOwnerState::kPresentableColor);
   return true;
 }
 #endif
@@ -9455,29 +9633,9 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   } else {
     xenos::ColorRenderTargetFormat dump_pack_format = key.GetColorFormat();
 #if XE_PLATFORM_ANDROID
-    bool android_repack_to_8888 =
-        key.android_force_8888_repack ||
-        GetAndroidHaloExperiment().repack_mode != 0;
-    if (!android_repack_to_8888 && key.source_to_1x && !format_is_64bpp) {
-      switch (key.GetColorFormat()) {
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10:
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-        case xenos::ColorRenderTargetFormat::
-            k_2_10_10_10_FLOAT_AS_16_16_16_16:
-          // Gameplay frontbuffer is fetched as 8888; always repack collapsed
-          // 4x 1010102 owners so byte1 can carry live scene data.
-          android_repack_to_8888 = true;
-          break;
-        default:
-          break;
-      }
-    }
-    if (key.source_to_1x && !format_is_64bpp && android_repack_to_8888) {
-      // The guest reads this span as k_8_8_8_8 (verified at the resolve);
-      // pack in the read format so colors survive the samples-as-pixels
-      // aliasing instead of scrambling 10-bit words into 8888 reads. 64bpp
-      // owners pass raw bits through, which any same-bpp read handles.
+    if (key.source_to_1x && !format_is_64bpp && key.android_force_8888_repack) {
+      // Explicit presentation experiment. Native dump mode preserves the
+      // owner's format, including 10-bit formats, for guest reinterpretation.
       dump_pack_format = xenos::ColorRenderTargetFormat::k_8_8_8_8;
       if (GetAndroidHaloExperiment().repack_16_16_to_8888 &&
           key.GetColorFormat() == xenos::ColorRenderTargetFormat::k_16_16) {
@@ -9509,20 +9667,14 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
         source_vec4 =
             builder.createCompositeConstruct(type_float4, id_vector_temp);
       }
-      // Prefer the value baked into DumpPipelineKey (hot-reloadable). Fall
-      // back to the live experiment snapshot for keys built before WO40.
-      const bool android_normalize_7e3_enabled =
-          key.android_normalize_7e3 ||
-          (GetAndroidHaloExperiment().normalize_7e3_to_rgba8_repack);
-      if (android_normalize_7e3_enabled && !UsesScaledUNorm7e3RenderTargets() &&
+      // Shader behavior must be determined by its cache key. These keys are
+      // constructed in this process; there are no legacy keys to recover.
+      if (key.android_normalize_7e3 && !UsesScaledUNorm7e3RenderTargets() &&
           (key.GetColorFormat() ==
                xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
            key.GetColorFormat() == xenos::ColorRenderTargetFormat::
                                        k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
-        const uint32_t curve =
-            key.android_normalize_7e3
-                ? uint32_t(key.android_normalize_7e3_curve)
-                : GetAndroidHaloExperiment().normalize_7e3_to_rgba8_repack_curve;
+        const uint32_t curve = uint32_t(key.android_normalize_7e3_curve);
         id_vector_temp.clear();
         const spv::Id const_float_0 = builder.makeFloatConstant(0.0f);
         const spv::Id const_float_1 = builder.makeFloatConstant(1.0f);
@@ -10175,6 +10327,28 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
       float_key.resource_format =
           uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT);
       RenderTarget* float_rt = FindRenderTarget(float_key);
+      if (!float_rt) {
+        // The owner check accepts the AS_16_16_16_16 aliasing of the same 7e3
+        // data, so the lookup must too - the game switches between both keys
+        // for the same physical target.
+        float_key.resource_format = uint32_t(
+            xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16);
+        float_rt = FindRenderTarget(float_key);
+      }
+      if (!float_rt) {
+        // No live 7e3 RT (typically right after a memory-pressure cache
+        // clear deleted it - the redirect's premise is that it is NOT the
+        // ownership-map owner, so ClearCache picks exactly it). The dump
+        // falls back to the LDR owner and colors go dull until the next HDR
+        // pass recreates the RT; log so disarm windows are visible.
+        static uint32_t android_prefer_7e3_dump_miss_log_count = 0;
+        if (android_prefer_7e3_dump_miss_log_count < 64) {
+          XELOGW("SCENE675_DUMP_PREFER_7E3 miss={}: no live 7e3 RT, dumping "
+                 "current owner",
+                 android_prefer_7e3_dump_miss_log_count);
+          ++android_prefer_7e3_dump_miss_log_count;
+        }
+      }
       if (float_rt) {
         const uint32_t prev_fmt =
             dump_rectangles_.empty()
@@ -10495,7 +10669,9 @@ void VulkanRenderTargetCache::ExecutePendingDumpRectanglesToEdram(
          (pipeline_key.source_to_1x &&
           GetAndroidHaloExperiment().repack_mode != 0));
     pipeline_key.android_force_8888_repack =
-        !rt_key.is_depth && android_halo_force_8888_repack_;
+        pipeline_key.source_to_1x && !rt_key.Is64bpp() &&
+        (android_halo_force_8888_repack_ ||
+         GetAndroidHaloExperiment().repack_mode != 0);
 #if XE_PLATFORM_ANDROID
     {
       const AndroidHaloExperiment& normalize_experiment =
@@ -10507,7 +10683,8 @@ void VulkanRenderTargetCache::ExecutePendingDumpRectanglesToEdram(
            android_owner_format == xenos::ColorRenderTargetFormat::
                                        k_2_10_10_10_FLOAT_AS_16_16_16_16);
       pipeline_key.android_normalize_7e3 =
-          is_7e3_owner && normalize_experiment.normalize_7e3_to_rgba8_repack &&
+          pipeline_key.android_force_8888_repack && is_7e3_owner &&
+          normalize_experiment.normalize_7e3_to_rgba8_repack &&
           !UsesScaledUNorm7e3RenderTargets();
       // Only bake the curve when normalize is active so inactive keys stay
       // shared across curve experiment flips that don't affect this owner.

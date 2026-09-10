@@ -16,8 +16,10 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+
 
 #if !XE_PLATFORM_ANDROID
 #include "xenia/app/discord/discord_presence.h"
@@ -46,6 +48,10 @@
 
 // Available audio systems:
 #include "xenia/apu/nop/nop_audio_system.h"
+#if XE_PLATFORM_ANDROID
+#include <unistd.h>
+#include "xenia/apu/audio_system_android.h"
+#endif
 #if XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
 #include "xenia/apu/alsa/alsa_audio_system.h"
 #endif  // XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
@@ -61,6 +67,7 @@
 #if !XE_PLATFORM_APPLE
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #if XE_PLATFORM_ANDROID
+#include "xenia/gpu/vulkan/android_diagnostic_state.h"
 #include "xenia/gpu/vulkan/android_halo_experiment.h"
 #endif
 #endif  // !XE_PLATFORM_APPLE
@@ -89,10 +96,10 @@ DEFINE_string(apu, "xaudio2", "Audio system. Use: " APU_OPTIONS, "APU");
 DEFINE_string(gpu, "d3d12", "Graphics system. Use: " GPU_OPTIONS, "GPU");
 DEFINE_string(hid, "sdl", "Input system. Use: " HID_OPTIONS, "HID");
 #elif XE_PLATFORM_ANDROID
-#define APU_OPTIONS "[nop]"
+#define APU_OPTIONS "[opensl, nop]"
 #define GPU_OPTIONS "[vulkan, null]"
 #define HID_OPTIONS "[nop]"
-DEFINE_string(apu, "nop", "Audio system. Use: " APU_OPTIONS, "APU");
+DEFINE_string(apu, "opensl", "Audio system. Use: " APU_OPTIONS, "APU");
 DEFINE_string(gpu, "vulkan", "Graphics system. Use: " GPU_OPTIONS, "GPU");
 DEFINE_string(hid, "nop", "Input system. Use: " HID_OPTIONS, "HID");
 #elif XE_PLATFORM_LINUX
@@ -292,6 +299,11 @@ class EmulatorApp final : public xe::ui::WindowedApp {
   ~EmulatorApp();
 
   bool OnInitialize() override;
+#if XE_PLATFORM_ANDROID
+  std::string GetDiagnosticSnapshotJson() const override;
+  std::string RunDiagnosticSaveState(const std::string& path,
+                                     bool restore) override;
+#endif
 
  protected:
   void OnDestroy() override;
@@ -417,6 +429,13 @@ class EmulatorApp final : public xe::ui::WindowedApp {
   std::atomic<bool> emulator_thread_quit_requested_;
   std::unique_ptr<xe::threading::Event> emulator_thread_event_;
   std::thread emulator_thread_;
+
+#if XE_PLATFORM_ANDROID
+  mutable std::mutex diagnostic_title_mutex_;
+  std::mutex diagnostic_save_state_mutex_;
+  uint32_t diagnostic_title_id_ = 0;
+  std::string diagnostic_title_name_;
+#endif
 };
 
 void EmulatorApp::DebugWindowClosedListener::OnClosing(xe::ui::UIEvent& e) {
@@ -692,7 +711,8 @@ void ApplyAndroidProfileFileOverrides(
                profile_path, line_number, name, value);
       }
     }
-    return;
+    // Keep scanning: later files override earlier ones so a /sdcard profile
+    // wins over the internal files/ copy that previously shadowed it.
   }
 }
 
@@ -771,9 +791,164 @@ EmulatorApp::~EmulatorApp() {
   ShutdownEmulatorThreadFromUIThread();
 }
 
+#if XE_PLATFORM_ANDROID
+std::string EmulatorApp::GetDiagnosticSnapshotJson() const {
+  auto escape_json = [](const std::string_view value) {
+    constexpr char kHexDigits[] = "0123456789ABCDEF";
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (unsigned char character : value) {
+      switch (character) {
+        case '"':
+          escaped += "\\\"";
+          break;
+        case '\\':
+          escaped += "\\\\";
+          break;
+        case '\b':
+          escaped += "\\b";
+          break;
+        case '\f':
+          escaped += "\\f";
+          break;
+        case '\n':
+          escaped += "\\n";
+          break;
+        case '\r':
+          escaped += "\\r";
+          break;
+        case '\t':
+          escaped += "\\t";
+          break;
+        default:
+          if (character < 0x20) {
+            escaped += "\\u00";
+            escaped.push_back(kHexDigits[character >> 4]);
+            escaped.push_back(kHexDigits[character & 0xF]);
+          } else {
+            escaped.push_back(char(character));
+          }
+          break;
+      }
+    }
+    return escaped;
+  };
+  auto json_bool = [](bool value) { return value ? "true" : "false"; };
+
+  uint32_t title_id = 0;
+  std::string title_name;
+  {
+    std::lock_guard<std::mutex> lock(diagnostic_title_mutex_);
+    title_id = diagnostic_title_id_;
+    title_name = diagnostic_title_name_;
+  }
+
+  const gpu::vulkan::AndroidDiagnosticRenderSnapshot render =
+      gpu::vulkan::AndroidDiagnosticRenderState::Get().Snapshot();
+  const char* render_target_path = "unavailable";
+  switch (render.render_target_path) {
+    case gpu::vulkan::AndroidDiagnosticRenderTargetPath::kHostRenderTargets:
+      render_target_path = "fbo";
+      break;
+    case gpu::vulkan::AndroidDiagnosticRenderTargetPath::
+        kFragmentShaderInterlock:
+      render_target_path = "fsi";
+      break;
+    default:
+      break;
+  }
+  const char* owner_state = "unknown";
+  switch (render.owner_state) {
+    case gpu::vulkan::AndroidDiagnosticOwnerState::kPresentableColor:
+      owner_state = "presentable_color";
+      break;
+    case gpu::vulkan::AndroidDiagnosticOwnerState::
+        kDepthColorAliasNonPresentable:
+      owner_state = "depth_color_alias_non_presentable";
+      break;
+    default:
+      break;
+  }
+
+  return fmt::format(
+      "{{"
+      "\"snapshot_version\":1,"
+      "\"best_effort_non_blocking\":true,"
+      "\"title\":{{\"available\":{},\"id\":\"{:08X}\",\"name\":\"{}\"}},"
+      "\"guest_map\":{{\"available\":false,"
+      "\"reason\":\"not exposed by the emulator core\"}},"
+      "\"renderer\":{{\"backend\":\"{}\",\"initialized\":{},"
+      "\"render_target_path_requested\":\"{}\","
+      "\"render_target_path_vulkan_requested\":\"{}\","
+      "\"render_target_path_actual\":\"{}\","
+      "\"requested_fragment_shader_interlock\":{},"
+      "\"fragment_sample_interlock\":{},"
+      "\"fragment_pixel_interlock\":{},"
+      "\"readback_resolve\":\"{}\","
+      "\"vulkan_dynamic_rendering\":{},"
+      "\"vulkan_sparse_shared_memory\":{},"
+      "\"tiled_shared_memory\":{}}},"
+      "\"resolve\":{{\"count\":{},\"last_destination\":\"0x{:08X}\","
+      "\"last_length\":{},\"last_destination_format\":{},"
+      "\"last_source_base_tiles\":{},\"last_source_format\":{},"
+      "\"last_source_msaa_samples\":{},\"last_source_is_depth\":{}}},"
+      "\"ownership\":{{\"halo_compat_owner_state\":\"{}\","
+      "\"scope\":\"latest Android Halo compatibility ownership state\"}}"
+      "}}",
+      json_bool(title_id != 0), title_id, escape_json(title_name),
+      escape_json(cvars::gpu), json_bool(render.renderer_initialized),
+      escape_json(cvars::render_target_path),
+      escape_json(cvars::render_target_path_vulkan), render_target_path,
+      json_bool(render.requested_fragment_shader_interlock),
+      json_bool(render.fragment_sample_interlock),
+      json_bool(render.fragment_pixel_interlock),
+      escape_json(cvars::readback_resolve),
+      json_bool(cvars::vulkan_dynamic_rendering),
+      json_bool(cvars::vulkan_sparse_shared_memory),
+      json_bool(cvars::tiled_shared_memory), render.resolve_count,
+      render.last_resolve_destination, render.last_resolve_length,
+      render.last_resolve_destination_format,
+      render.last_resolve_source_base_tiles, render.last_resolve_source_format,
+      render.last_resolve_msaa_samples,
+      json_bool(render.last_resolve_source_is_depth), owner_state);
+}
+
+std::string EmulatorApp::RunDiagnosticSaveState(const std::string& path,
+                                                bool restore) {
+  XELOGI("Diagnostic save state: {} requested", restore ? "restore" : "save");
+  std::unique_lock<std::mutex> operation_lock(diagnostic_save_state_mutex_,
+                                               std::try_to_lock);
+  if (!operation_lock.owns_lock()) {
+    return "error\tAnother diagnostic save operation is already running.";
+  }
+  if (!emulator_ || !emulator_->is_title_open()) {
+    return "error\tNo running title is available.";
+  }
+  if (path.empty()) {
+    return "error\tThe diagnostic save path is empty.";
+  }
+  std::string error_message;
+  const bool succeeded =
+      restore ? emulator_->RestoreFromFile(path, &error_message)
+              : emulator_->SaveToFile(path, &error_message);
+  XELOGI("Diagnostic save state: {} completed success={} message='{}'",
+         restore ? "restore" : "save", succeeded, error_message);
+  if (!succeeded) {
+    return "error\t" +
+           (error_message.empty() ? std::string("Operation failed.")
+                                  : error_message);
+  }
+  return restore ? "ok\tDiagnostic save restored."
+                 : "ok\tDiagnostic save created.";
+}
+#endif
+
 std::unique_ptr<apu::AudioSystem> EmulatorApp::CreateAudioSystem(
     cpu::Processor* processor) {
   Factory<apu::AudioSystem, cpu::Processor*> factory;
+#if XE_PLATFORM_ANDROID
+  factory.Add<apu::AndroidAudioSystem>("opensl");
+#endif
 #if XE_PLATFORM_WIN32
   factory.Add<apu::xaudio2::XAudio2AudioSystem>("xaudio2");
 #endif  // XE_PLATFORM_WIN32
@@ -982,17 +1157,11 @@ bool EmulatorApp::OnInitialize() {
   // WO39 independently mounts only the disk-backed cache1: device used by
   // Reach's resume checkpoint when mount_cache_disk_backed is enabled.
   OVERRIDE_bool(mount_cache, false);
-  // Async compilation keeps the frame loop alive through FSI's much larger
-  // pipeline compilations (sync stalls there starve the watchdog into killing
-  // the app). Off on the FBO path where sync compiles are short and
-  // placeholders would muddy diagnostics.
-  if (xe::gpu::vulkan::GetAndroidHaloExperiment().force_fsi) {
-    OverrideAndroidConfigVar<bool>("async_shader_compilation", true);
-    OverrideAndroidConfigVar<int32_t>("vulkan_pipeline_creation_threads", 2);
-  } else {
-    OverrideAndroidConfigVar<bool>("async_shader_compilation", false);
-    OverrideAndroidConfigVar<int32_t>("vulkan_pipeline_creation_threads", 1);
-  }
+  // Async compilation keeps the frame loop alive while Adreno compiles new
+  // permutations. t164: 3 concurrent creates plus CP-thread placeholders hung
+  // the compiler during the flyover. One worker, skip draws until ready.
+  OverrideAndroidConfigVar<bool>("async_shader_compilation", true);
+  OverrideAndroidConfigVar<int32_t>("vulkan_pipeline_creation_threads", 1);
   OverrideAndroidConfigVar<std::string>("xma_decoder", "old");
   OverrideAndroidConfigVar<uint64_t>("framerate_limit", 30);
   OverrideAndroidConfigVar<std::string>("render_target_path", "performance");
@@ -1015,19 +1184,30 @@ bool EmulatorApp::OnInitialize() {
   OverrideAndroidConfigVar<bool>("vulkan_sparse_shared_memory", true);
   OverrideAndroidConfigVar<bool>("tiled_shared_memory", true);
   OverrideAndroidConfigVar<uint32_t>("vulkan_render_target_memory_limit_mb",
-                                     384);
-  OverrideAndroidConfigVar<uint32_t>("vulkan_memory_limit_mb", 2048);
-  OverrideAndroidConfigVar<uint32_t>("vulkan_kgsl_memory_limit_mb", 2048);
-  OverrideAndroidConfigVar<uint32_t>("vulkan_texture_memory_limit_mb", 768);
-  // Keep enough headroom for guest RAM, render targets, and driver-managed
-  // allocations on unified-memory Android devices. Profile files may override
-  // these defaults below.
-  OverrideAndroidConfigVar<uint32_t>("texture_cache_memory_limit_soft", 96);
+                                     512);
+  OverrideAndroidConfigVar<uint32_t>("vulkan_memory_limit_mb", 3328);
+  // Leave room for guest RAM and Android. Explicit profile limits below are
+  // honored instead of being raised to a device-independent minimum.
+  uint32_t default_kgsl_limit_mb = 2048;
+  const long physical_pages = sysconf(_SC_PHYS_PAGES);
+  const long host_page_size = sysconf(_SC_PAGESIZE);
+  if (physical_pages > 0 && host_page_size > 0) {
+    const uint64_t physical_mb =
+        (uint64_t(physical_pages) * uint64_t(host_page_size)) >> 20;
+    default_kgsl_limit_mb = uint32_t(std::max(
+        uint64_t(256), std::min(uint64_t(4096), physical_mb / 2)));
+  }
+  OverrideAndroidConfigVar<uint32_t>("vulkan_kgsl_memory_limit_mb",
+                                    default_kgsl_limit_mb);
+  OverrideAndroidConfigVar<uint32_t>("vulkan_texture_memory_limit_mb", 1024);
+  // Match the known-stable t113 internal profile. The previous 96/160 caps
+  // reclaimed mid-flyover (payload 134->28 MB) and forced full re-uploads.
+  OverrideAndroidConfigVar<uint32_t>("texture_cache_memory_limit_soft", 160);
   OverrideAndroidConfigVar<uint32_t>(
-      "texture_cache_memory_limit_soft_lifetime", 5);
-  OverrideAndroidConfigVar<uint32_t>("texture_cache_memory_limit_hard", 160);
+      "texture_cache_memory_limit_soft_lifetime", 10);
+  OverrideAndroidConfigVar<uint32_t>("texture_cache_memory_limit_hard", 320);
   OverrideAndroidConfigVar<uint32_t>(
-      "texture_cache_memory_limit_render_to_texture", 24);
+      "texture_cache_memory_limit_render_to_texture", 64);
   OverrideAndroidConfigVar<std::string>("postprocess_antialiasing", "");
   OverrideAndroidConfigVar<std::string>("postprocess_scaling_and_sharpening",
                                         "");
@@ -1197,18 +1377,43 @@ void EmulatorApp::OnDestroy() {
 
 #if XE_PLATFORM_ANDROID
 void EmulatorApp::OnMemoryPressure(int32_t level) {
-  // ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE is 5. Start reclaiming
-  // here so the deferred Vulkan cleanup can finish before a critical kill.
+  // ComponentCallbacks2:
+  //   TRIM_MEMORY_RUNNING_MODERATE = 5
+  //   TRIM_MEMORY_RUNNING_LOW = 10
+  //   TRIM_MEMORY_RUNNING_CRITICAL = 15
+  //   TRIM_MEMORY_UI_HIDDEN = 20 and above (backgrounded)
   if (level < 5 || !emulator_ || !emulator_->graphics_system()) {
+    return;
+  }
+  // Moderate/low pressure is handled by the renderer's measured budgets.
+  // A critical foreground warning must also request safe reclamation: waiting
+  // for a background callback allows Android to kill the running title first.
+  if (level < 15) {
+    return;
+  }
+  // The system delivers trim callbacks in bursts while thrashing; each
+  // ClearCaches + InvalidateGpuMemory forces a full cache rebuild and shared
+  // memory re-upload, so reacting to every callback creates a destroy/upload
+  // feedback loop that worsens the very pressure being reported. One clear
+  // per window is enough - the request stays pending until frame close.
+  static std::atomic<int64_t> last_reaction_ms{0};
+  const int64_t now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  int64_t last_ms = last_reaction_ms.load(std::memory_order_relaxed);
+  if (now_ms - last_ms < 5000 ||
+      !last_reaction_ms.compare_exchange_strong(last_ms, now_ms)) {
     return;
   }
   XELOGW("Android memory pressure level {}: clearing GPU caches", level);
   gpu::GraphicsSystem* graphics_system = emulator_->graphics_system();
+  // ClearCaches defers to a frame-close, queue-idle point that already clears
+  // readback buffers too; clearing them mid-frame here would destroy buffers
+  // that recorded-but-unsubmitted deferred command buffer copies still
+  // reference (Adreno faults on replay).
   graphics_system->ClearCaches();
   graphics_system->InvalidateGpuMemory();
-  graphics_system->command_processor()->CallInThread([graphics_system]() {
-    graphics_system->command_processor()->ClearReadbackBuffers();
-  });
 }
 #endif
 
@@ -1387,6 +1592,13 @@ void EmulatorApp::EmulatorThread(bool is_game_process) {
   }
 
   emulator_->on_launch.AddListener([&](auto title_id, const auto& game_title) {
+#if XE_PLATFORM_ANDROID
+    {
+      std::lock_guard<std::mutex> lock(diagnostic_title_mutex_);
+      diagnostic_title_id_ = title_id;
+      diagnostic_title_name_ = std::string(game_title);
+    }
+#endif
 #if !XE_PLATFORM_ANDROID
     if (cvars::discord) {
       discord::DiscordPresence::PlayingTitle(

@@ -14,18 +14,27 @@
 #include <filesystem>
 #include <span>
 
+#include "xenia/vfs/entry.h"
 #include "xenia/xbox.h"
 
 namespace xe {
 namespace vfs {
 
-class Entry;
-
 class File {
  public:
   File(uint32_t file_access, Entry* entry)
-      : file_access_(file_access), entry_(entry) {}
-  virtual ~File() = default;
+      : file_access_(file_access), entry_(entry) {
+    if (entry_) {
+      entry_->AcquireOpenFileReference();
+    }
+  }
+  virtual ~File() {
+    if (entry_) {
+      Entry* entry = entry_;
+      entry_ = nullptr;
+      entry->ReleaseOpenFileReference();
+    }
+  }
 
   virtual void Destroy() = 0;
 

@@ -1,7 +1,92 @@
 <?xml version="1.0" encoding="utf-8"?>
-<jp.xenios.emulator.WindowSurfaceView xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
-    android:id="@+id/emulator_surface_view"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    tools:context="jp.xenios.emulator.EmulatorActivity" />
+    tools:context="jp.xenios.emulator.EmulatorActivity">
+
+    <jp.xenios.emulator.WindowSurfaceView
+        android:id="@+id/emulator_surface_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <Button
+        android:id="@+id/debug_diagnostics_toggle"
+        android:layout_width="wrap_content"
+        android:layout_height="48dp"
+        android:layout_gravity="top|end"
+        android:layout_margin="8dp"
+        android:focusable="false"
+        android:focusableInTouchMode="false"
+        android:text="@string/debug_tools_open"
+        android:visibility="gone" />
+
+    <LinearLayout
+        android:id="@+id/debug_diagnostics_panel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="60dp"
+        android:layout_marginEnd="12dp"
+        android:background="#E65D2A00"
+        android:elevation="12dp"
+        android:orientation="vertical"
+        android:padding="10dp"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/debug_diagnostics_banner"
+            android:textColor="#FFFFFFFF"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="260dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/checkpoint_emulator_note"
+            android:textColor="#FFFFFFFF"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/report_diagnostics_button"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:focusable="false"
+            android:focusableInTouchMode="false"
+            android:textColor="#FF212121"
+            android:text="@string/debug_report_diagnostics_button" />
+
+        <Button
+            android:id="@+id/capture_diagnostics_button"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:focusable="false"
+            android:focusableInTouchMode="false"
+            android:textColor="#FF212121"
+            android:text="@string/debug_capture_diagnostics_button" />
+
+        <Button
+            android:id="@+id/restore_diagnostic_save_button"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:focusable="false"
+            android:focusableInTouchMode="false"
+            android:textColor="#FF212121"
+            android:text="@string/debug_restore_diagnostic_save_button" />
+
+        <TextView
+            android:id="@+id/debug_diagnostics_status"
+            android:layout_width="260dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/debug_diagnostics_ready"
+            android:textColor="#FFFFFFFF"
+            android:textSize="12sp" />
+    </LinearLayout>
+</FrameLayout>

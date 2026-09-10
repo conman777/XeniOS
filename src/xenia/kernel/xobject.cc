@@ -10,22 +10,54 @@
 #include "xenia/kernel/xobject.h"
 
 #include "xenia/base/byte_stream.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xfile.h"
+#include "xenia/kernel/xiocompletion.h"
 #include "xenia/kernel/xmodule.h"
 #include "xenia/kernel/xmutant.h"
 #include "xenia/kernel/xnotifylistener.h"
 #include "xenia/kernel/xsemaphore.h"
 #include "xenia/kernel/xsymboliclink.h"
 #include "xenia/kernel/xthread.h"
+#include "xenia/kernel/xtimer.h"
 #include "xenia/xbox.h"
 
 namespace xe {
 namespace kernel {
+namespace {
+
+class SaveStateGuestWaitScope {
+ public:
+  SaveStateGuestWaitScope() {
+    if (!XThread::IsInThread()) {
+      return;
+    }
+    auto* thread = XThread::GetCurrentThread();
+    if (!thread->is_guest_thread()) {
+      return;
+    }
+    processor_ = thread->kernel_state()->processor();
+    thread_id_ = thread->thread_id();
+    processor_->OnThreadEnteringWait(thread_id_);
+  }
+
+  ~SaveStateGuestWaitScope() {
+    if (processor_) {
+      processor_->OnThreadLeavingWait(thread_id_);
+    }
+  }
+
+ private:
+  cpu::Processor* processor_ = nullptr;
+  uint32_t thread_id_ = 0;
+};
+
+}  // namespace
 
 XObject::XObject(Type type)
     : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
@@ -114,28 +146,50 @@ bool XObject::RestoreObject(ByteStream* stream) {
   allocated_guest_object_ = stream->Read<uint32_t>() > 0;
   guest_object_ptr_ = stream->Read<uint32_t>();
 
-  handles_.resize(stream->Read<uint32_t>());
-  stream->Read(&handles_[0], handles_.size() * sizeof(X_HANDLE));
+  const uint32_t handle_count = stream->Read<uint32_t>();
+  const size_t remaining = stream->data_length() - stream->offset();
+  if (handle_count > remaining / sizeof(X_HANDLE) ||
+      handle_count > 64 * 1024) {
+    XELOGE("Invalid saved handle count {} at offset={}", handle_count,
+           stream->offset() - sizeof(uint32_t));
+    return false;
+  }
+  handles_.resize(handle_count);
+  if (!handles_.empty()) {
+    stream->Read(handles_.data(), handles_.size() * sizeof(X_HANDLE));
+  }
 
   // Restore our pointer to our handles in the object table.
   for (size_t i = 0; i < handles_.size(); i++) {
-    kernel_state_->object_table()->RestoreHandle(handles_[i], this);
+    if (XFAILED(
+            kernel_state_->object_table()->RestoreHandle(handles_[i], this))) {
+      XELOGE("Could not restore invalid object handle 0x{:08X}.",
+             handles_[i]);
+      return false;
+    }
   }
 
   return true;
+}
+
+bool XObject::Save(ByteStream* stream) {
+  // Plain Device objects have no host-side state beyond the common guest
+  // pointer and handle mappings. Other unsupported derived types must provide
+  // an explicit serializer rather than silently losing state.
+  return type_ == Type::Device && SaveObject(stream);
 }
 
 object_ref<XObject> XObject::Restore(KernelState* kernel_state, Type type,
                                      ByteStream* stream) {
   switch (type) {
     case Type::Enumerator:
-      break;
+      return XEnumerator::Restore(kernel_state, stream);
     case Type::Event:
       return XEvent::Restore(kernel_state, stream);
     case Type::File:
       return XFile::Restore(kernel_state, stream);
     case Type::IOCompletion:
-      break;
+      return XIOCompletion::Restore(kernel_state, stream);
     case Type::Module:
       return XModule::Restore(kernel_state, stream);
     case Type::Mutant:
@@ -153,12 +207,20 @@ object_ref<XObject> XObject::Restore(KernelState* kernel_state, Type type,
     case Type::Thread:
       return XThread::Restore(kernel_state, stream);
     case Type::Timer:
-      break;
+      return XTimer::Restore(kernel_state, stream);
+    case Type::Device: {
+      auto object = object_ref<XObject>(new XObject(kernel_state, Type::Device));
+      if (!object->RestoreObject(stream)) {
+        return nullptr;
+      }
+      return object;
+    }
     case Type::Undefined:
       break;
   }
 
-  assert_always("No restore handler exists for this object!");
+  XELOGE("No restore handler exists for kernel object type={} at offset={}",
+         static_cast<uint32_t>(type), stream->offset());
   return nullptr;
 }
 
@@ -190,6 +252,8 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
 
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
                        uint32_t alertable, uint64_t* opt_timeout) {
+  auto wait_admission = kernel_state()->AcquireSaveStateKernelAsyncAdmission(
+      save_state::KernelAsyncDomain::kWait);
   auto wait_handle = GetWaitHandle();
   if (!wait_handle) {
     // Object doesn't support waiting.
@@ -201,6 +265,7 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
                         TimeoutTicksToMs(*opt_timeout)))
                   : std::chrono::milliseconds::max();
 
+  SaveStateGuestWaitScope save_state_wait_scope;
   auto result =
       xe::threading::Wait(wait_handle, alertable ? true : false, timeout_ms);
   switch (result) {
@@ -223,11 +288,15 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
 X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object,
                                 uint32_t wait_reason, uint32_t processor_mode,
                                 uint32_t alertable, uint64_t* opt_timeout) {
+  auto wait_admission =
+      wait_object->kernel_state()->AcquireSaveStateKernelAsyncAdmission(
+          save_state::KernelAsyncDomain::kWait);
   auto timeout_ms =
       opt_timeout ? std::chrono::milliseconds(Clock::ScaleGuestDurationMillis(
                         TimeoutTicksToMs(*opt_timeout)))
                   : std::chrono::milliseconds::max();
 
+  SaveStateGuestWaitScope save_state_wait_scope;
   auto result = xe::threading::SignalAndWait(
       signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
       alertable ? true : false, timeout_ms);
@@ -252,6 +321,12 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
                                uint32_t wait_type, uint32_t wait_reason,
                                uint32_t processor_mode, uint32_t alertable,
                                uint64_t* opt_timeout) {
+  save_state::KernelAsyncAdmissionBoundary::Operation wait_admission;
+  if (count && objects[0]) {
+    wait_admission =
+        objects[0]->kernel_state()->AcquireSaveStateKernelAsyncAdmission(
+            save_state::KernelAsyncDomain::kWait);
+  }
   xe::threading::WaitHandle* wait_handles[64];
 
   for (size_t i = 0; i < count; ++i) {
@@ -264,6 +339,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
                         TimeoutTicksToMs(*opt_timeout)))
                   : std::chrono::milliseconds::max();
 
+  SaveStateGuestWaitScope save_state_wait_scope;
   if (wait_type) {
     auto result = xe::threading::WaitAny(wait_handles, count,
                                          alertable ? true : false, timeout_ms);
@@ -374,7 +450,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state,
     global_critical_region::mutex().lock();
   }
 
-  XObject* result;
+  XObject* result = nullptr;
 
   auto header = reinterpret_cast<X_DISPATCH_HEADER*>(native_ptr);
   if (as_type == -1) {
@@ -388,7 +464,22 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state,
     result = kernel_state->object_table()
                  ->LookupObject<XObject>(handle, true)
                  .release();
-  } else {
+    if (!result) {
+      // Inline dispatcher objects are lazily backed by a host XObject. A
+      // restored guest header may outlive an intentionally omitted ephemeral
+      // host mapping. Reconstruct it from the restored dispatcher type and
+      // signal/count fields just as on first use, and replace the stale
+      // handle. Continuing with a null mapping would turn normal guest waits
+      // and signals into fatal assertions.
+      XELOGW(
+          "GetNativeObject: rebuilding stale dispatcher handle 0x{:08X} "
+          "type={}",
+          handle, as_type);
+      header->wait_list.flink_ptr = 0;
+      header->wait_list.blink_ptr = 0;
+    }
+  }
+  if (!result) {
     // First use, create new.
     // https://www.nirsoft.net/kernel_struct/vista/KOBJECTS.html
     XObject* object = nullptr;

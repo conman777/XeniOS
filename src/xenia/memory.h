@@ -22,6 +22,13 @@
 #include "xenia/cpu/mmio_handler.h"
 #include "xenia/guest_pointers.h"
 namespace xe {
+namespace save_state {
+struct MemoryAllocationInventory;
+struct MemoryCaptureLimits;
+struct MemorySnapshot;
+class StablePageMemoryTransaction;
+enum class StateProviderResult;
+}  // namespace save_state
 class ByteStream;
 }  // namespace xe
 
@@ -227,6 +234,7 @@ class BaseHeap {
   uint32_t unreserved_page_count_;
   xe::global_critical_region global_critical_region_;
   std::vector<PageEntry> page_table_;
+  friend class Memory;
 };
 
 // Normal heap allowing allocations from guest virtual address ranges.
@@ -547,6 +555,17 @@ class Memory {
 
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
+  bool CaptureSaveStateAllocationInventory(
+      save_state::MemoryAllocationInventory* inventory);
+  // Content-only save-state prototype. This requires exact current allocation,
+  // protection, and alias topology and accepts only committed writable backing
+  // pages. The returned transaction owns the global memory lock until rollback
+  // or finalize. No live save-state path calls this yet.
+  save_state::StateProviderResult PrepareSaveStateStablePageTransaction(
+      const save_state::MemorySnapshot& target,
+      const save_state::MemoryCaptureLimits& limits,
+      std::unique_ptr<save_state::StablePageMemoryTransaction>* output,
+      std::string* error_message);
 
   void SetMMIOExceptionRecordingCallback(cpu::MmioAccessRecordCallback callback,
                                          void* context);

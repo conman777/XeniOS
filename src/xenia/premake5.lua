@@ -14,3 +14,7 @@ project("xenia-core")
     "*.h",
     "*.cc",
   })
+
+if enableTests then
+  include("testing")
+end

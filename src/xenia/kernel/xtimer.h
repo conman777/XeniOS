@@ -19,6 +19,8 @@
 namespace xe {
 namespace kernel {
 
+constexpr fourcc_t kTimerSaveSignature = make_fourcc("XTMR");
+
 class XThread;
 
 class XTimer : public XObject {
@@ -31,8 +33,13 @@ class XTimer : public XObject {
   void Initialize(uint32_t timer_type);
 
   X_STATUS SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine,
-                    uint32_t routine_arg, bool resume);
+                    uint32_t routine_arg, bool resume,
+                    XThread* callback_thread = nullptr);
   X_STATUS Cancel();
+
+  bool Save(ByteStream* stream) override;
+  static object_ref<XTimer> Restore(KernelState* kernel_state,
+                                    ByteStream* stream);
 
  protected:
   xe::threading::WaitHandle* GetWaitHandle() override { return timer_.get(); }
@@ -44,6 +51,12 @@ class XTimer : public XObject {
   XThread* callback_thread_ = nullptr;
   uint32_t callback_routine_ = 0;
   uint32_t callback_routine_arg_ = 0;
+  uint32_t timer_type_ = 0;
+  int64_t save_state_due_time_ = 0;
+  uint32_t save_state_period_ms_ = 0;
+  // Conservatively remains true after a one-shot fires because the host timer
+  // interface exposes no non-invasive armed-state query.
+  bool save_state_pending_accounted_ = false;
 };
 
 }  // namespace kernel

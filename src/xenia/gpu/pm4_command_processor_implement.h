@@ -1679,14 +1679,24 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
       assert_always();
       break;
     }
+    // A diagnostic pause callback is serviced by the worker's outer loop.
+    // Large primary buffers may otherwise keep that callback queued for many
+    // seconds even though packets are completing normally. Yield only between
+    // complete packets so no PM4 packet or indirect-buffer state is split.
+    if (COMMAND_PROCESSOR::IsSaveStatePauseRequested() &&
+        reader_.read_count()) {
+      break;
+    }
   } while (reader_.read_count());
 
+  const uint32_t completed_read_index =
+      reader_.read_offset() / sizeof(uint32_t);
   COMMAND_PROCESSOR::OnPrimaryBufferEnd();
 
   trace_writer_.WritePrimaryBufferEnd();
 
   reader_ = old_reader;
-  return write_index;
+  return completed_read_index;
 }
 
 void COMMAND_PROCESSOR::ExecutePacket(uint32_t ptr, uint32_t count) {

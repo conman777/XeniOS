@@ -43,6 +43,7 @@
 #include "xenia/cpu/symbol.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/cpu/xex_module.h"
+#include "xenia/save_state_runtime.h"
 
 #include "oaknut/feature_detection/cpu_feature.hpp"
 #include "oaknut/feature_detection/feature_detection.hpp"
@@ -82,6 +83,22 @@ using namespace xe::literals;
 using namespace oaknut::util;
 
 namespace {
+
+uint64_t PollSaveStateSafePoint(void* raw_context) {
+  auto* context = reinterpret_cast<ppc::PPCContext*>(raw_context);
+  auto* runtime = context->save_state_runtime;
+  const auto* requested_generation =
+      context->save_state_requested_generation;
+  if (!runtime || !requested_generation) {
+    return 0;
+  }
+  const uint64_t generation =
+      requested_generation->load(std::memory_order_acquire);
+  if (generation) {
+    runtime->Poll(context->thread_id, generation);
+  }
+  return 0;
+}
 
 bool ShouldLogResolveFailure() {
   if (!cvars::a64_resolve_function_log) {
@@ -332,6 +349,8 @@ bool A64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
   auto block = builder->first_block();
   [[maybe_unused]] int block_count = 0;
   while (block) {
+    save_state_poll_emitted_for_block_ = false;
+
     // Mark block labels.
     auto label = block->label_head;
     while (label) {
@@ -406,6 +425,11 @@ void A64Emitter::MarkSourceOffset(const Instr* i) {
   MOV(W0, entry->guest_address);
   STR(W0, GetContextReg(), offsetof(ppc::PPCContext, last_guest_pc));
 
+  if (!save_state_poll_emitted_for_block_) {
+    EmitSaveStateSafePointPoll();
+    save_state_poll_emitted_for_block_ = true;
+  }
+
   if (cvars::emit_source_annotations) {
     NOP();
     NOP();
@@ -423,6 +447,28 @@ void A64Emitter::MarkSourceOffset(const Instr* i) {
                             instruction_index * 8)));
     LDADDAL(X0, ZR, X1);
   }
+}
+
+void A64Emitter::EmitSaveStateSafePointPoll() {
+  // This is emitted only at the first SourceOffset of an HIR basic block,
+  // after last_guest_pc and all architectural registers are synchronized.
+  // The raw load is only a hint; the C++ helper performs an acquire load and
+  // the barrier revalidates the generation while holding its mutex.
+  oaknut::Label done;
+  LDR(X9, GetContextReg(),
+      offsetof(ppc::PPCContext, save_state_requested_generation));
+  CBZ(X9, done);
+  LDR(X10, X9);
+  CBZ(X10, done);
+  CallNativeSafe(reinterpret_cast<void*>(PollSaveStateSafePoint));
+  l(done);
+  EmitSaveStateUnwindCheck();
+}
+
+void A64Emitter::EmitSaveStateUnwindCheck() {
+  LDR(W9, GetContextReg(),
+      offsetof(ppc::PPCContext, save_state_unwind_requested));
+  CBNZ(W9, epilog_label());
 }
 
 void A64Emitter::EmitGetCurrentThreadId() {
@@ -1171,6 +1217,7 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
       MOV(GetNativeParam(0), instr->GuestAddressFor());
       CallNativeSafe(reinterpret_cast<void*>(CheckStackSync));
     }
+    EmitSaveStateUnwindCheck();
   }
 }
 
@@ -1259,6 +1306,7 @@ void A64Emitter::CallIndirect(const hir::Instr* instr,
       MOV(GetNativeParam(0), instr->GuestAddressFor());
       CallNativeSafe(reinterpret_cast<void*>(CheckStackSync));
     }
+    EmitSaveStateUnwindCheck();
   }
 }
 

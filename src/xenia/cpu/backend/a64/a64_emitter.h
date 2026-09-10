@@ -191,6 +191,8 @@ class A64Emitter : public oaknut::VectorCodeGenerator {
   oaknut::Label& epilog_label() { return *epilog_label_; }
 
   void MarkSourceOffset(const hir::Instr* i);
+  void EmitSaveStateSafePointPoll();
+  void EmitSaveStateUnwindCheck();
 
   void DebugBreak();
   void Trap(uint16_t trap_type = 0);
@@ -276,6 +278,7 @@ class A64Emitter : public oaknut::VectorCodeGenerator {
   Arena source_map_arena_;
 
   size_t stack_size_ = 0;
+  bool save_state_poll_emitted_for_block_ = false;
 
   static const uint8_t gpr_reg_map_[GPR_COUNT];
   static const uint8_t fpr_reg_map_[FPR_COUNT];

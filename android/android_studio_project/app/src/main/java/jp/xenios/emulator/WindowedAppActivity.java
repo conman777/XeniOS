@@ -31,6 +31,7 @@ public abstract class WindowedAppActivity extends Activity {
 
     // May be 0 while destroying (mainly while the superclass is).
     private long mAppContext = 0;
+    private volatile boolean mWindowPaintingSuspended;
 
     @Nullable
     private WindowSurfaceView mWindowSurfaceView = null;
@@ -51,10 +52,32 @@ public abstract class WindowedAppActivity extends Activity {
 
     private native void paintWindow(long appContext, boolean forcePaint);
 
+    private native String collectNativeDiagnosticSnapshotNative(long appContext);
+    private native String runDiagnosticSaveStateNative(
+            long appContext, String path, boolean restore);
+
     protected abstract String getWindowedAppIdentifier();
 
     protected boolean isWindowedAppReady() {
         return mAppContext != 0;
+    }
+
+    protected final String collectNativeDiagnosticSnapshot() {
+        if (mAppContext == 0) {
+            return "{}";
+        }
+        final String snapshot = collectNativeDiagnosticSnapshotNative(mAppContext);
+        return snapshot != null ? snapshot : "{}";
+    }
+
+    protected final String runDiagnosticSaveState(
+            final String path, final boolean restore) {
+        if (mAppContext == 0) {
+            return "error\tThe emulator runtime is unavailable.";
+        }
+        final String result =
+                runDiagnosticSaveStateNative(mAppContext, path, restore);
+        return result != null ? result : "error\tThe native operation failed.";
     }
 
     private void enterImmersiveMode() {
@@ -108,10 +131,17 @@ public abstract class WindowedAppActivity extends Activity {
     }
 
     public void onWindowSurfaceDraw(final boolean forcePaint) {
-        if (mAppContext == 0) {
+        if (mAppContext == 0 || mWindowPaintingSuspended) {
             return;
         }
         paintWindow(mAppContext, forcePaint);
+    }
+
+    protected final void setWindowPaintingSuspended(boolean suspended) {
+        mWindowPaintingSuspended = suspended;
+        if (!suspended) {
+            postInvalidateWindowSurface();
+        }
     }
 
     // Used from the native WindowedAppContext. May be called from non-UI threads.
