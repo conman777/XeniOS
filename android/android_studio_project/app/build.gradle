@@ -48,7 +48,9 @@ android {
             debuggable true
             externalNativeBuild {
                 ndkBuild {
-                    arguments 'PREMAKE_ANDROIDNDK_CONFIGURATIONS:=Debug'
+                    // -PxeniaNativeConfig=Release keeps the debuggable .debug
+                    // package (and its data) but builds optimized native code.
+                    arguments "PREMAKE_ANDROIDNDK_CONFIGURATIONS:=${project.findProperty('xeniaNativeConfig') ?: 'Debug'}"
                 }
             }
         }

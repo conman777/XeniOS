@@ -59,6 +59,10 @@ newoption({
   description = "Enable building test targets",
 })
 newoption({
+  trigger = "misc-subprojects",
+  description = "Enable building GPU trace viewer/dump and other misc tools",
+})
+newoption({
   trigger = "mac-x86_64",
   description = "Enable x86_64 platform on macOS ARM64 hosts",
 })
@@ -69,7 +73,7 @@ newoption({
 })
 
 enableTests = _OPTIONS["tests"] ~= nil
-enableMiscSubprojects = false
+enableMiscSubprojects = _OPTIONS["misc-subprojects"] ~= nil
 
 -- Define an ARCH variable
 -- Only use this to enable architecture-specific functionality.

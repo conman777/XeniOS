@@ -162,6 +162,11 @@ if enableMiscSubprojects or os.istarget("android") then
         "xenia-cpu-backend-x64",
       })
 
+    filter("architecture:ARM64")
+      links({
+        "xenia-cpu-backend-a64",
+      })
+
     filter("platforms:Linux-*")
       links({
         "X11",

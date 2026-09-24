@@ -341,6 +341,23 @@ class CommandProcessor {
     return false;
   }
   virtual bool IssueCopy() { return false; }
+  // Wraps IssueCopy and, when --trace_dump_resolves_path is set, writes the
+  // guest bytes the resolve produced plus its copy registers. Needs
+  // readback_resolve=full so the bytes are in guest memory on return. Used to
+  // compare backends checkpoint by checkpoint when replaying a trace.
+  bool IssueCopyAndDumpResolve();
+  // After each draw in --trace_dump_edram_draws, writes the whole EDRAM
+  // (host render targets dumped into it) next to the resolve dumps.
+  void DumpEdramAfterDrawIfRequested();
+  // Synchronously reads the current EDRAM contents; false if unsupported.
+  virtual bool ReadbackEdramForDump(std::vector<uint8_t>& out) {
+    return false;
+  }
+  // Backends call this with the range Resolve() reported as written.
+  void RecordResolveWritten(uint32_t address, uint32_t length) {
+    last_resolve_address_ = address;
+    last_resolve_length_ = length;
+  }
   virtual bool SupportsGuestOcclusionQueries() const { return false; }
 
   // Debug marker stubs for base class (overridden by D3D12/Vulkan backends).
@@ -361,6 +378,14 @@ class CommandProcessor {
   kernel::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
   RegisterFile* XE_RESTRICT register_file_ = nullptr;
+
+  uint32_t last_resolve_address_ = 0;
+  uint32_t last_resolve_length_ = 0;
+  uint32_t resolve_dump_index_ = 0;
+  uint32_t draw_dump_index_ = 0;
+  // True for the draw selected by --trace_dump_skip_draw_after_setup:
+  // backends set up render targets (ownership transfers) but issue nothing.
+  bool ShouldSkipDrawAfterSetupForDump() const;
 
   TraceWriter trace_writer_;
   enum class TraceState {

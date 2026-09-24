@@ -16,7 +16,16 @@
 
 #include "xenia/base/platform.h"
 
-#if XE_PLATFORM_ANDROID
+// Android builds link SPIRV-Tools only when built with XE_ANDROID_SPIRV_TOOLS
+// (the NDK ships its source; the Vulkan SDK has no Android libraries).
+// Only built for arm64 so far.
+#if XE_PLATFORM_ANDROID && !(defined(XE_ANDROID_SPIRV_TOOLS) && defined(__aarch64__))
+#define XE_SPIRV_TOOLS_STUBBED 1
+#else
+#define XE_SPIRV_TOOLS_STUBBED 0
+#endif
+
+#if XE_SPIRV_TOOLS_STUBBED
 using spv_result_t = int32_t;
 using spv_context = void*;
 enum spv_target_env {
@@ -28,7 +37,7 @@ constexpr spv_result_t SPV_UNSUPPORTED = 1;
 #else
 #include <spirv-tools/libspirv.h>
 #include <spirv-tools/optimizer.hpp>
-#endif  // XE_PLATFORM_ANDROID
+#endif  // XE_SPIRV_TOOLS_STUBBED
 
 namespace xe {
 namespace ui {

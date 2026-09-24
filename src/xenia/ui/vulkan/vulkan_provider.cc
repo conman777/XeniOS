@@ -105,6 +105,14 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(
 
 std::unique_ptr<Presenter> VulkanProvider::CreatePresenter(
     Presenter::HostGpuLossCallback host_gpu_loss_callback) {
+  // Headless users (trace dump) create the provider without presentation but
+  // still need a presenter to capture the guest output.
+  if (!ui_samplers_) {
+    ui_samplers_ = UISamplers::Create(vulkan_device());
+    if (!ui_samplers_) {
+      return nullptr;
+    }
+  }
   return VulkanPresenter::Create(host_gpu_loss_callback, vulkan_device(),
                                  ui_samplers());
 }

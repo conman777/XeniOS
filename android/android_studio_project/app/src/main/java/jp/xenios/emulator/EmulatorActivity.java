@@ -90,6 +90,77 @@ public class EmulatorActivity extends WindowedAppActivity {
         setContentView(R.layout.activity_emulator);
         setWindowSurfaceView(findViewById(R.id.emulator_surface_view));
         configureDebugDiagnostics();
+        if (BuildConfig.DEBUG) {
+            mStateCommandHandler.postDelayed(mStateCommandPoller, 1000L);
+        }
+    }
+
+    // Debug builds: adb-driven save states for repeatable device checks.
+    // Write "save <path>" or "restore <path>" to
+    // <external-files>/android_state_cmd.txt; the file is consumed and the
+    // native result is written to android_state_result.txt. Same native path
+    // as Tools -> Capture + Save State / Restore Saved State.
+    private final android.os.Handler mStateCommandHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private boolean mStateCommandBusy;
+    private final Runnable mStateCommandPoller = new Runnable() {
+        @Override
+        public void run() {
+            pollStateCommand();
+            mStateCommandHandler.postDelayed(this, 1000L);
+        }
+    };
+
+    private void pollStateCommand() {
+        final java.io.File root = getExternalFilesDir(null);
+        if (mStateCommandBusy || root == null) {
+            return;
+        }
+        final java.io.File commandFile = new java.io.File(root, "android_state_cmd.txt");
+        if (!commandFile.isFile()) {
+            return;
+        }
+        String command;
+        try (java.io.BufferedReader reader =
+                     new java.io.BufferedReader(new java.io.FileReader(commandFile))) {
+            command = reader.readLine();
+        } catch (java.io.IOException e) {
+            command = null;
+        }
+        commandFile.delete();
+        if (command == null) {
+            return;
+        }
+        command = command.trim();
+        final int space = command.indexOf(' ');
+        final String verb = space > 0 ? command.substring(0, space) : command;
+        final String path = space > 0 ? command.substring(space + 1).trim() : "";
+        final boolean restore = verb.equals("restore");
+        final java.io.File resultFile = new java.io.File(root, "android_state_result.txt");
+        if (!(restore || verb.equals("save")) || path.isEmpty()) {
+            writeStateResult(resultFile, "error\tusage: save|restore <path>");
+            return;
+        }
+        mStateCommandBusy = true;
+        setWindowPaintingSuspended(true);
+        new Thread(() -> {
+            final long startedAt = SystemClock.elapsedRealtime();
+            final String result = runDiagnosticSaveState(path, restore);
+            writeStateResult(resultFile, result + "\t" + verb + "\t"
+                    + (SystemClock.elapsedRealtime() - startedAt) + "ms");
+            runOnUiThread(() -> {
+                setWindowPaintingSuspended(false);
+                mStateCommandBusy = false;
+            });
+        }, "XeniOS adb state command").start();
+    }
+
+    private static void writeStateResult(final java.io.File file, final String text) {
+        try (java.io.FileWriter writer = new java.io.FileWriter(file)) {
+            writer.write(text + "\n");
+        } catch (java.io.IOException e) {
+            // Nothing to report to; the caller sees no result file.
+        }
     }
 
     private void configureDebugDiagnostics() {
@@ -473,5 +544,11 @@ public class EmulatorActivity extends WindowedAppActivity {
     protected void onPause() {
         clearGamepadState();
         super.onPause();
+    }
+
+    @Override
+    protected void onDestroy() {
+        mStateCommandHandler.removeCallbacks(mStateCommandPoller);
+        super.onDestroy();
     }
 }

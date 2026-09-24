@@ -1313,6 +1313,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
       if (COMMAND_PROCESSOR::debug_markers_enabled()) {
         COMMAND_PROCESSOR::PopDebugMarker();
       }
+      COMMAND_PROCESSOR::DumpEdramAfterDrawIfRequested();
 
       if (!draw_succeeded) {
         XELOGE("{}({}, {}, {}): Failed in backend", opcode_name,

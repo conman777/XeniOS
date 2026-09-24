@@ -23,6 +23,13 @@
 #include "xenia/ui/window.h"
 #include "xenia/ui/windowed_app_context.h"
 
+#if XE_PLATFORM_ANDROID
+#include <filesystem>
+#include <system_error>
+
+#include "xenia/base/filesystem.h"
+#endif  // XE_PLATFORM_ANDROID
+
 DEFINE_uint32(internal_display_resolution, 8,
               "Allow games that support different resolutions to render "
               "in a specific resolution.\n"
@@ -397,6 +404,37 @@ void GraphicsSystem::MarkVblank() {
 
   // Increment vblank counter (so the game sees us making progress).
   command_processor_->increment_counter();
+
+#if XE_PLATFORM_ANDROID
+  // There is no Trace Frame menu on Android: creating
+  // android_trace_frame.txt in the app's external files directory (e.g. via
+  // adb) records the next frame into traces/ next to it. Polled twice a
+  // second.
+  static uint32_t android_trace_request_poll = 0;
+  if (++android_trace_request_poll >= 30) {
+    android_trace_request_poll = 0;
+    static const char* const kAndroidFilesDirs[] = {
+        "/sdcard/Android/data/jp.xenios.emulator.github.debug/files",
+        "/sdcard/Android/data/jp.xenios.emulator.github/files",
+    };
+    for (const char* files_dir : kAndroidFilesDirs) {
+      const std::filesystem::path request =
+          std::filesystem::path(files_dir) / "android_trace_frame.txt";
+      std::error_code error;
+      if (!std::filesystem::exists(request, error)) {
+        continue;
+      }
+      std::filesystem::remove(request, error);
+      const std::filesystem::path trace_dir =
+          std::filesystem::path(files_dir) / "traces";
+      std::filesystem::create_directories(trace_dir, error);
+      XELOGI("Android frame trace requested -> {}",
+             xe::path_to_utf8(trace_dir));
+      command_processor_->RequestFrameTrace(trace_dir);
+      break;
+    }
+  }
+#endif  // XE_PLATFORM_ANDROID
 
   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
   //     something wrong and the CP will block waiting for code that

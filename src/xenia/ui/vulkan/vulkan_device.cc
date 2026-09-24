@@ -188,6 +188,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   bool ext_1_3_EXT_subgroup_size_control = false;
   bool ext_KHR_fragment_shader_barycentric = false;
   bool ext_NV_fragment_shader_barycentric = false;
+  bool ext_KHR_pipeline_executable_properties = false;
   if (with_gpu_emulation) {
     // #15.
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_sampler_mirror_clamp_to_edge, 1,
@@ -218,6 +219,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       // interpolation.
       XE_UI_VULKAN_LOCAL_EXTENSION(KHR_fragment_shader_barycentric)
       XE_UI_VULKAN_LOCAL_EXTENSION(NV_fragment_shader_barycentric)
+      // #270. Driver statistics (instruction counts, registers, scratch)
+      // for diagnosing per-pipeline memory.
+      XE_UI_VULKAN_LOCAL_EXTENSION(KHR_pipeline_executable_properties)
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
       // #237.
@@ -343,6 +347,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR>
       features_KHR_fragment_shader_barycentric;
+  VulkanFeatures<
+      VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR>
+      features_KHR_pipeline_executable_properties;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -397,6 +405,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         ext_NV_fragment_shader_barycentric) {
       features_KHR_fragment_shader_barycentric.Link(supported_features_2,
                                                     device_create_info);
+    }
+    if (ext_KHR_pipeline_executable_properties) {
+      features_KHR_pipeline_executable_properties.Link(supported_features_2,
+                                                       device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -822,6 +834,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   device->extensions_.ext_KHR_fragment_shader_barycentric =
       ext_KHR_fragment_shader_barycentric || ext_NV_fragment_shader_barycentric;
+
+  if (ext_KHR_pipeline_executable_properties && with_gpu_emulation) {
+    XE_UI_VULKAN_FEATURE_2(features_KHR_pipeline_executable_properties,
+                           pipelineExecutableInfo);
+  }
 
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT

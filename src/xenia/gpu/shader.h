@@ -906,6 +906,12 @@ class Shader {
 
   // Labels that jumps (explicit or from loops) can be done to.
   const std::set<uint32_t>& label_addresses() const { return label_addresses_; }
+  // True if the control flow can be translated with structured constructs
+  // instead of a program counter dispatch loop: no calls, every jump goes
+  // forward without leaving or entering a loop body, loops are properly
+  // nested (loop at S skipping to F + 1, endloop at F returning to S + 1),
+  // and the shader doesn't end inside a loop body.
+  bool jumps_forward_only() const { return jumps_forward_only_; }
 
   // Exclusive upper bound of the indexes of paired control flow instructions
   // (each corresponds to 3 dwords).
@@ -1068,6 +1074,7 @@ class Shader {
   uint32_t writes_point_size_edge_flag_kill_vertex_ = 0;
   uint32_t writes_color_targets_ = 0b0000;
   bool uses_register_dynamic_addressing_ = false;
+  bool jumps_forward_only_ = true;
   bool kills_pixels_ = false;
   bool uses_texture_fetch_instruction_results_ = false;
   bool writes_depth_ = false;

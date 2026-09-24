@@ -595,7 +595,10 @@ bool ApplyAndroidProfileOverride(const std::string& name,
       name == "halo_android_compat_skip_depth_to_color_alias" ||
       name == "halo_android_compat_direct_presentable_resolve" ||
       name == "halo_android_compat_linear_to_tiled_frontbuffer" ||
-      name == "halo_android_disable_high_4k_physical_routing") {
+      name == "halo_android_disable_high_4k_physical_routing" ||
+      name == "vulkan_driver_pipeline_cache" ||
+      name == "vulkan_log_pipeline_statistics" ||
+      name == "vulkan_kgsl_reclaim_clears_render_targets") {
     bool parsed_value = false;
     if (!ParseAndroidProfileBool(value, parsed_value)) {
       return false;

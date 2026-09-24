@@ -754,12 +754,20 @@ bool SharedMemory::PrepareForTraceDownload() {
   bool allocation_success = true;
   auto global_lock = global_critical_region_.Acquire();
   uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
+  // The staging copy of the valid flags is swapped in later with only dirty
+  // blocks refreshed, so it must be invalidated too - otherwise CPU-written
+  // pages become valid again without an upload and never reach the trace.
+  uint64_t* staging_valid_flags =
+      staging_valid_flags_.load(std::memory_order_relaxed);
   for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
     // SystemPageFlagsBlock& page_flags_block = system_page_flags_[i];
     uint64_t previously_valid_block = LoadValidFlag(&valid_flags[i]);
     uint64_t gpu_written_block =
         LoadValidFlag(&system_page_flags_valid_and_gpu_written_[i]);
     StoreValidFlag(&valid_flags[i], gpu_written_block);
+    if (staging_valid_flags) {
+      StoreValidFlag(&staging_valid_flags[i], gpu_written_block);
+    }
 
     // Fire watches on the invalidated pages.
     uint64_t fire_watches_block = previously_valid_block & ~gpu_written_block;

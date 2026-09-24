@@ -2682,7 +2682,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    return IssueCopyAndDumpResolve();
   }
 
   if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {
@@ -3250,6 +3250,9 @@ bool D3D12CommandProcessor::IssueCopy() {
     result = render_target_cache_->Resolve(*memory_, *shared_memory_,
                                            *texture_cache_, written_address,
                                            written_length);
+    if (result) {
+      RecordResolveWritten(written_address, written_length);
+    }
   } else {
     result = IssueCopy_ReadbackResolvePath();
   }
@@ -3268,6 +3271,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                                      written_address, written_length)) {
     return false;
   }
+  RecordResolveWritten(written_address, written_length);
 
   if (!written_length) {
     return true;

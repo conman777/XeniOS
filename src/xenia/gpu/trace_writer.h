@@ -21,7 +21,9 @@
 // function calls (even if they just immediately return) is 0.40-0.60% cpu time
 // total. with inlining they just bloat the caller and negatively impact
 // register allocation for the caller
-#ifdef NDEBUG
+// Android keeps it in optimized builds: frame traces (android_trace_frame.txt)
+// are the main way to reproduce device rendering bugs on a PC reference.
+#if defined(NDEBUG) && !defined(__ANDROID__)
 #define XE_ENABLE_TRACE_WRITER_INSTRUMENTATION 0
 #else
 #define XE_ENABLE_TRACE_WRITER_INSTRUMENTATION 1

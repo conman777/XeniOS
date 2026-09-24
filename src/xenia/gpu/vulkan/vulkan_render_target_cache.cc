@@ -1393,6 +1393,62 @@ void VulkanRenderTargetCache::SaveStateSubmitEdramUpload(VkBuffer source) {
   copy->srcOffset = 0;
   copy->dstOffset = 0;
   copy->size = xenos::kEdramSizeBytes;
+
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  // Host render targets are never reloaded from the EDRAM buffer, so like the
+  // Direct3D 12 backend, place the snapshot in a full-EDRAM 32bpp render
+  // target that owns all of the EDRAM. Render targets created afterwards then
+  // receive the restored contents through ownership transfers instead of
+  // starting out undefined. k_32_FLOAT keeps the bits unconverted.
+  auto* full_edram_render_target = static_cast<VulkanRenderTarget*>(
+      PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
+          xenos::ColorRenderTargetFormat::k_32_FLOAT));
+  if (!full_edram_render_target) {
+    XELOGE("Vulkan: couldn't create the render target for EDRAM restoration");
+    return;
+  }
+  const uint32_t pitch_tiles =
+      full_edram_render_target->key().pitch_tiles_at_32bpp;
+  command_processor_.PushImageMemoryBarrier(
+      full_edram_render_target->image(),
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
+      full_edram_render_target->current_stage_mask(),
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      full_edram_render_target->current_access_mask(),
+      VK_ACCESS_TRANSFER_WRITE_BIT, full_edram_render_target->current_layout(),
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  full_edram_render_target->SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_ACCESS_TRANSFER_WRITE_BIT,
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+  // The snapshot stores tiles sequentially, each 80x16 32-bit samples.
+  constexpr uint32_t kTileBytes = xenos::kEdramTileWidthSamples *
+                                  xenos::kEdramTileHeightSamples *
+                                  sizeof(uint32_t);
+  std::vector<VkBufferImageCopy> copy_regions(xenos::kEdramTileCount);
+  for (uint32_t tile = 0; tile < xenos::kEdramTileCount; ++tile) {
+    VkBufferImageCopy& region = copy_regions[tile];
+    region.bufferOffset = VkDeviceSize(tile) * kTileBytes;
+    region.bufferRowLength = xenos::kEdramTileWidthSamples;
+    region.bufferImageHeight = xenos::kEdramTileHeightSamples;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {
+        int32_t((tile % pitch_tiles) * xenos::kEdramTileWidthSamples),
+        int32_t((tile / pitch_tiles) * xenos::kEdramTileHeightSamples), 0};
+    region.imageExtent = {xenos::kEdramTileWidthSamples,
+                          xenos::kEdramTileHeightSamples, 1};
+  }
+  command_processor_.deferred_command_buffer().CmdVkCopyBufferToImage(
+      source, full_edram_render_target->image(),
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copy_regions.size()),
+      copy_regions.data());
+  XELOGI("Vulkan: EDRAM snapshot restored into a {}-tile-pitch render target",
+         pitch_tiles);
 }
 
 void VulkanRenderTargetCache::ClearCache(const char* reason) {

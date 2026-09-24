@@ -90,6 +90,14 @@ DEFINE_uint32(
     "0 disables KGSL-level reclamation or is used when KGSL debug data is "
     "unavailable.",
     "Android");
+DEFINE_bool(
+    vulkan_kgsl_reclaim_clears_render_targets, false,
+    "When KGSL (driver) memory is over vulkan_kgsl_memory_limit_mb, also "
+    "clear the texture and render target caches, not only trim pipelines. "
+    "Off by default: KGSL pressure comes from per-pipeline driver memory "
+    "(scratch), textures and render targets are small, and dropping render "
+    "targets mid-frame loses EDRAM contents - full-screen corruption.",
+    "Android");
 
 namespace xe {
 namespace gpu {
@@ -873,6 +881,11 @@ void VulkanCommandProcessor::PrepareForWait() {
 void VulkanCommandProcessor::ReturnFromWait() {
   CheckSubmissionCompletionAndDeviceLoss(GetCompletedSubmission());
   CommandProcessor::ReturnFromWait();
+}
+
+bool VulkanCommandProcessor::SupportsGuestOcclusionQueries() const {
+  return occlusion_query_resources_available_ &&
+         cvars::occlusion_query_enable;
 }
 
 bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(
@@ -3864,7 +3877,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    return IssueCopyAndDumpResolve();
   }
 
 #if XE_PLATFORM_ANDROID
@@ -4139,11 +4152,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             ? texture_allocator_after.heap_usage_bytes -
                   excluded_sparse_shared_memory_usage
             : 0;
-    if ((vulkan_heap_limit &&
-         vulkan_heap_after_reclaimable > vulkan_heap_limit) ||
-        android_kgsl_limit_exceeded) {
-      texture_cache_->ClearCache();
-      render_target_cache_->ClearCache("kgsl");
+    const bool vulkan_heap_over_limit =
+        vulkan_heap_limit && vulkan_heap_after_reclaimable > vulkan_heap_limit;
+    if (vulkan_heap_over_limit || android_kgsl_limit_exceeded) {
+      // Textures and render targets live in the Vulkan heap - clear them when
+      // that is over its limit. KGSL pressure alone is pipeline driver memory;
+      // see vulkan_kgsl_reclaim_clears_render_targets.
+      if (vulkan_heap_over_limit ||
+          cvars::vulkan_kgsl_reclaim_clears_render_targets) {
+        texture_cache_->ClearCache();
+        render_target_cache_->ClearCache("kgsl");
+      }
       if (!android_kgsl_preserve_pipeline_cache) {
         pipeline_cache_->ClearCache();
         pipeline_cache_cleared = true;
@@ -4269,6 +4288,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   auto vertex_shader = static_cast<VulkanShader*>(active_vertex_shader());
   if (!vertex_shader) {
     // Always need a vertex shader.
+    XELOGE("TraceDiag IssueDraw: no active vertex shader");
     return false;
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
@@ -4335,11 +4355,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // CompletedSubmissionUpdated.
   for (uint32_t i = 0; i < 2; ++i) {
     if (!BeginSubmission(true)) {
+      XELOGE("TraceDiag IssueDraw: BeginSubmission failed");
       return false;
     }
 
     // Process primitives.
     if (!primitive_processor_->Process(primitive_processing_result)) {
+      XELOGE("TraceDiag IssueDraw: primitive processing failed");
       return false;
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
@@ -4370,6 +4392,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             Shader::HostVertexShaderType::kRectangleListAsTriangleStrip &&
         !Shader::IsHostVertexShaderTypeDomain(
             primitive_processing_result.host_vertex_shader_type)) {
+      XELOGE("TraceDiag IssueDraw: unsupported host vertex shader type {}",
+             uint32_t(primitive_processing_result.host_vertex_shader_type));
       return false;
     }
 
@@ -4401,6 +4425,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                      : nullptr;
     if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
                                                   pixel_shader_translation)) {
+      XELOGE("TraceDiag IssueDraw: shader translation failed");
       return false;
     }
 
@@ -4452,6 +4477,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             // anymore (would enter an infinite loop otherwise if the number of
             // attempts was not limited to 2). Possibly too many unique samplers
             // in one draw, or failed to await submission completion.
+            XELOGE("TraceDiag IssueDraw: descriptor/sampler overflow");
             return false;
           }
           ++samplers_overflowed_count;
@@ -4481,7 +4507,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   if (!render_target_cache_->Update(is_rasterization_done,
                                     normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
+    XELOGE("TraceDiag IssueDraw: render target update failed");
     return false;
+  }
+  if (ShouldSkipDrawAfterSetupForDump()) {
+    return true;
   }
 
 #if XE_PLATFORM_ANDROID
@@ -5027,8 +5057,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   }
 
   // Ensure vertex buffers are resident.
-  // Uses caching to avoid redundant RequestRange calls - only re-validates
-  // when fetch constants are written (detected in WriteRegister).
+  // Every draw requests its vertex buffers, like the Direct3D 12 backend:
+  // RequestRange is what re-uploads pages the CPU rewrote (dynamic vertex
+  // buffers are commonly refilled at the same address every frame), and it
+  // already has a lock-free fast path for pages that are still valid. Skipping
+  // it for an unchanged address/size left stale geometry on the GPU and kept
+  // such buffers out of frame traces.
   //
   // Use the vertex_fetch_bitmap instead of vertex_bindings() to avoid using
   // cached/stale vertex binding indices. The bitmap is populated during shader
@@ -5044,11 +5078,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       vfetch_bits_remaining = xe::clear_lowest_bit(vfetch_bits_remaining);
       uint32_t vfetch_index = i * 32 + j;
 
-      // Check if already in sync (validated this frame with same address/size)
       uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
-      if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
-        continue;
-      }
 
       xenos::xe_gpu_vertex_fetch_t vfetch_constant =
           regs.GetVertexFetch(vfetch_index);
@@ -5092,17 +5122,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           return false;
       }
 
-      // Check if address/size changed - if same as cached, just mark in sync
       uint32_t address = vfetch_constant.address;
       uint32_t size = vfetch_constant.size;
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
-      if (state.address == address && state.size == size) {
-        // Same buffer, already resident - just mark in sync
-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
-        continue;
-      }
-
-      // New or changed buffer - need to request range
       if (!shared_memory_->RequestRange(address << 2, size << 2)) {
         XELOGE(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
@@ -5651,6 +5673,7 @@ bool VulkanCommandProcessor::IssueCopy() {
     }
     return false;
   }
+  RecordResolveWritten(written_address, written_length);
 
   // CPU readback resolve path (if not disabled).
   ReadbackResolveMode readback_mode = GetReadbackResolveMode();
@@ -6877,19 +6900,81 @@ void VulkanCommandProcessor::ProcessReadyOcclusionQueries(
   }
 }
 
+bool VulkanCommandProcessor::ReadbackEdramForDump(
+    std::vector<uint8_t>& out) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, xenos::kEdramSizeBytes,
+          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, buffer, memory)) {
+    return false;
+  }
+  bool result = false;
+  if (BeginSubmission(true) &&
+      render_target_cache_->SaveStateSubmitEdramDownload(buffer) &&
+      AwaitAllQueueOperationsCompletion()) {
+    void* mapping = nullptr;
+    if (dfn.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapping) ==
+        VK_SUCCESS) {
+      const uint8_t* bytes = static_cast<const uint8_t*>(mapping);
+      out.assign(bytes, bytes + xenos::kEdramSizeBytes);
+      dfn.vkUnmapMemory(device, memory);
+      result = true;
+    }
+  }
+  AwaitAllQueueOperationsCompletion();
+  dfn.vkDestroyBuffer(device, buffer, nullptr);
+  dfn.vkFreeMemory(device, memory, nullptr);
+  return result;
+}
+
 void VulkanCommandProcessor::InitializeTrace() {
   CommandProcessor::InitializeTrace();
 
   if (!BeginSubmission(true)) {
     return;
   }
-  // TODO(Triang3l): Write the EDRAM.
+  // Snapshot the EDRAM (host render targets dumped into the EDRAM buffer) so a
+  // replay starts from the same render target contents as the recording
+  // instead of whatever the replaying device's memory held.
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkBuffer edram_download_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory edram_download_memory = VK_NULL_HANDLE;
+  bool edram_submitted = false;
+  if (ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, xenos::kEdramSizeBytes,
+          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, edram_download_buffer,
+          edram_download_memory)) {
+    edram_submitted = render_target_cache_->SaveStateSubmitEdramDownload(
+        edram_download_buffer);
+  } else {
+    XELOGE("Trace: failed to allocate the EDRAM snapshot readback buffer");
+  }
   bool shared_memory_submitted =
       shared_memory_->InitializeTraceSubmitDownloads();
-  if (!shared_memory_submitted) {
-    return;
+  if (edram_submitted || shared_memory_submitted) {
+    AwaitAllQueueOperationsCompletion();
   }
-  AwaitAllQueueOperationsCompletion();
+  if (edram_submitted) {
+    void* mapping = nullptr;
+    if (dfn.vkMapMemory(device, edram_download_memory, 0, VK_WHOLE_SIZE, 0,
+                        &mapping) == VK_SUCCESS) {
+      trace_writer_.WriteEdramSnapshot(mapping);
+      dfn.vkUnmapMemory(device, edram_download_memory);
+    }
+  }
+  if (edram_download_buffer != VK_NULL_HANDLE) {
+    // The queue is idle here, or nothing referencing the buffer was submitted.
+    dfn.vkDestroyBuffer(device, edram_download_buffer, nullptr);
+    dfn.vkFreeMemory(device, edram_download_memory, nullptr);
+  }
   if (shared_memory_submitted) {
     shared_memory_->InitializeTraceCompleteDownloads();
   }

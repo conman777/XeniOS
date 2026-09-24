@@ -79,6 +79,28 @@ DEFINE_bool(
     "only affects async pipeline creation and does not block the main thread.",
     "Vulkan");
 
+DEFINE_bool(
+    vulkan_driver_pipeline_cache, true,
+    "Pass a VkPipelineCache to pipeline creation. Adreno drivers keep growing "
+    "GPU (KGSL) memory in it with every compile until the cache is destroyed; "
+    "disable to measure or avoid that.",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_log_pipeline_statistics, false,
+    "Log the driver's statistics (VK_KHR_pipeline_executable_properties) "
+    "for every graphics pipeline created, e.g. instruction count, "
+    "registers and scratch/private memory, to see what pipelines cost.",
+    "Vulkan");
+
+DEFINE_uint32(
+    vulkan_required_subgroup_size, 0,
+    "If non-zero and supported (VK_EXT_subgroup_size_control), request this "
+    "subgroup (wave) size for vertex and fragment shaders. On Adreno, 64 "
+    "rather than 128 gives each fiber more registers, which may avoid "
+    "spilling to scratch memory that the driver allocates per pipeline.",
+    "Vulkan");
+
 DECLARE_bool(vulkan_dynamic_rendering);
 
 namespace xe {
@@ -1232,13 +1254,6 @@ void VulkanPipelineCache::CreationThread() {
                                  creation_arguments.pixel_shader)) {
       XELOGE("Failed to translate shaders for pipeline creation");
     } else {
-      // Optimize shaders on the creation thread before creating the pipeline.
-      // This keeps the main thread fast while still benefiting from
-      // optimization.
-      OptimizeTranslationIfNeeded(*creation_arguments.vertex_shader);
-      if (creation_arguments.pixel_shader) {
-        OptimizeTranslationIfNeeded(*creation_arguments.pixel_shader);
-      }
 #if XE_PLATFORM_ANDROID
       command_processor_.LockAsyncPipelineCreate();
 #endif
@@ -1320,6 +1335,9 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(
   }
 #endif  // NDEBUG
 
+  // Optimize the SPIR-V (if enabled) right before the module is created -
+  // modules are created at translation time, so any later point is too late.
+  OptimizeTranslationIfNeeded(translation);
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;
   }
@@ -1327,6 +1345,8 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(
   // Dump shader files if desired.
   if (!cvars::dump_shaders.empty()) {
     translation.Dump(cvars::dump_shaders, "vulkan");
+    // The guest microcode and its disassembly, to compare with the output.
+    shader.DumpUcode(cvars::dump_shaders);
   }
 
   // Set up the texture binding layout.
@@ -3063,6 +3083,18 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   // Fragment shader.
   VkPipelineShaderStageCreateInfo& shader_stage_fragment =
       shader_stages[shader_stage_count++];
+  // Optional explicit wave size (see vulkan_required_subgroup_size).
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_subgroup_size = {
+      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+  const bool use_required_subgroup_size =
+      cvars::vulkan_required_subgroup_size &&
+      vulkan_device->properties().subgroupSizeControl &&
+      cvars::vulkan_required_subgroup_size >=
+          vulkan_device->properties().minSubgroupSize &&
+      cvars::vulkan_required_subgroup_size <=
+          vulkan_device->properties().maxSubgroupSize;
+  required_subgroup_size.requiredSubgroupSize =
+      cvars::vulkan_required_subgroup_size;
   shader_stage_fragment.sType =
       VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   shader_stage_fragment.pNext = nullptr;
@@ -3446,11 +3478,26 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     }
   }
 
+  if (use_required_subgroup_size) {
+    for (uint32_t i = 0; i < shader_stage_count; ++i) {
+      if (shader_stages[i].stage == VK_SHADER_STAGE_VERTEX_BIT ||
+          shader_stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+        shader_stages[i].pNext = &required_subgroup_size;
+      }
+    }
+  }
+
   VkGraphicsPipelineCreateInfo pipeline_create_info;
   pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
   pipeline_create_info.pNext =
       use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
   pipeline_create_info.flags = 0;
+  const bool log_pipeline_statistics =
+      cvars::vulkan_log_pipeline_statistics &&
+      vulkan_device->properties().pipelineExecutableInfo;
+  if (log_pipeline_statistics) {
+    pipeline_create_info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+  }
   pipeline_create_info.stageCount = shader_stage_count;
   pipeline_create_info.pStages = shader_stages.data();
   pipeline_create_info.pVertexInputState = &vertex_input_state;
@@ -3480,7 +3527,11 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     // vkCreateGraphicsPipelines (t164 hung with 3 workers + CP placeholders).
     // Destroy/reset already take this lock exclusively.
     std::unique_lock<std::shared_mutex> driver_lock(pipeline_driver_mutex_);
-    result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
+    result = dfn.vkCreateGraphicsPipelines(
+        device,
+        cvars::vulkan_driver_pipeline_cache ? vk_pipeline_cache_
+                                            : VK_NULL_HANDLE,
+        1,
                                            &pipeline_create_info, nullptr,
                                            &pipeline);
   }
@@ -3500,6 +3551,63 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
           is_tessellated, static_cast<int>(result));
     }
     return false;
+  }
+
+  if (log_pipeline_statistics) {
+    // Diagnostic: what the driver reports this pipeline costs.
+    auto get_executables = PFN_vkGetPipelineExecutablePropertiesKHR(
+        vulkan_device->vulkan_instance()->functions().vkGetDeviceProcAddr(
+            device, "vkGetPipelineExecutablePropertiesKHR"));
+    auto get_statistics = PFN_vkGetPipelineExecutableStatisticsKHR(
+        vulkan_device->vulkan_instance()->functions().vkGetDeviceProcAddr(
+            device, "vkGetPipelineExecutableStatisticsKHR"));
+    VkPipelineInfoKHR pipeline_info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+    pipeline_info.pipeline = pipeline;
+    uint32_t executable_count = 0;
+    if (get_executables && get_statistics &&
+        get_executables(device, &pipeline_info, &executable_count, nullptr) ==
+            VK_SUCCESS) {
+      std::vector<VkPipelineExecutablePropertiesKHR> executables(
+          executable_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+      get_executables(device, &pipeline_info, &executable_count,
+                      executables.data());
+      for (uint32_t i = 0; i < executable_count; ++i) {
+        VkPipelineExecutableInfoKHR executable_info = {
+            VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+        executable_info.pipeline = pipeline;
+        executable_info.executableIndex = i;
+        uint32_t statistic_count = 0;
+        get_statistics(device, &executable_info, &statistic_count, nullptr);
+        std::vector<VkPipelineExecutableStatisticKHR> statistics(
+            statistic_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+        get_statistics(device, &executable_info, &statistic_count,
+                       statistics.data());
+        std::string line;
+        for (const VkPipelineExecutableStatisticKHR& statistic : statistics) {
+          line += fmt::format(" {}=", statistic.name);
+          switch (statistic.format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+              line += std::to_string(statistic.value.b32);
+              break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+              line += std::to_string(statistic.value.i64);
+              break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+              line += std::to_string(statistic.value.u64);
+              break;
+            default:
+              line += fmt::format("{:.3f}", statistic.value.f64);
+              break;
+          }
+        }
+        XELOGI("PipelineStats VS {:016X} PS {:016X} [{}]{}",
+               creation_arguments.vertex_shader->shader().ucode_data_hash(),
+               creation_arguments.pixel_shader
+                   ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+                   : 0,
+               executables[i].name, line);
+      }
+    }
   }
 
   // Store the new pipeline, handling placeholder hot-swap.
@@ -3586,6 +3694,9 @@ void VulkanPipelineCache::OptimizeTranslationIfNeeded(
   if (!cvars::vulkan_spirv_optimization || !spirv_tools_context_) {
     return;
   }
+  // Pipelines sharing a shader may be created on several threads.
+  static std::mutex optimize_mutex;
+  std::lock_guard<std::mutex> optimize_lock(optimize_mutex);
 
   // Only optimize if the shader module hasn't been created yet.
   // Once created, we can't replace it without the complexity of the old

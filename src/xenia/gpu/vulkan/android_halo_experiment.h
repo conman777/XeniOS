@@ -418,8 +418,18 @@ inline AndroidHaloExperiment LoadAndroidHaloExperiment(
         "/sdcard/Android/data/jp.xenios.emulator.github/files/"
         "halo_experiment.txt",
     };
+  // Trace replays run outside the app and must not pick up whatever the app
+  // currently has installed: XENIA_HALO_EXPERIMENT_PATH names the only file
+  // to read.
+  const char* override_path = std::getenv("XENIA_HALO_EXPERIMENT_PATH");
+  std::vector<const char*> paths;
+  if (override_path && *override_path) {
+    paths.push_back(override_path);
+  } else {
+    paths.assign(std::begin(kPaths), std::end(kPaths));
+  }
   const char* loaded_path = nullptr;
-  for (const char* path : kPaths) {
+  for (const char* path : paths) {
       std::ifstream file(path);
       if (!file) {
         continue;

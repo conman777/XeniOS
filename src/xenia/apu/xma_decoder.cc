@@ -77,13 +77,14 @@ DEFINE_bool(use_dedicated_xma_thread, kUseDedicatedXmaThreadDefault,
             "better results, but decrease performance a bit.",
             "APU");
 
-DEFINE_string(
-    xma_decoder,
+// MSVC can't take preprocessor directives inside macro arguments.
 #if XE_PLATFORM_ANDROID
-    "old",
+#define XE_XMA_DECODER_DEFAULT "old"
 #else
-    "new",
+#define XE_XMA_DECODER_DEFAULT "new"
 #endif
+DEFINE_string(
+    xma_decoder, XE_XMA_DECODER_DEFAULT,
     "Decoder version used to process XMA audio.\n"
     "Use: [fake, master, old, new]\n"
     " fake: \n  No audio will be decoded.\n"

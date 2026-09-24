@@ -9,10 +9,14 @@
 
 #include "xenia/gpu/command_processor.h"
 
+#include <cstdio>
+#include <filesystem>
+
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
@@ -76,6 +80,22 @@ DEFINE_bool(readback_memexport_fast, true,
             "readback_memexport\n"
             "is enabled at the expense of accuracy.",
             "GPU");
+
+DEFINE_path(trace_dump_resolves_path, "",
+            "If set, write every resolve's guest output and copy registers to "
+            "this folder (forces readback_resolve=full). For comparing GPU "
+            "backends checkpoint by checkpoint when replaying a trace.",
+            "GPU");
+DEFINE_string(trace_dump_edram_draws, "",
+              "With trace_dump_resolves_path: also dump the whole EDRAM "
+              "after each draw in this inclusive range of draw indices "
+              "(e.g. 250-300, or a single index).",
+              "GPU");
+
+DEFINE_int32(trace_dump_skip_draw_after_setup, -1,
+             "Debugging: for this draw index, set up render targets (including "
+             "ownership transfers) but don't issue the draw itself.",
+             "GPU");
 
 namespace xe {
 namespace gpu {
@@ -141,11 +161,138 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       write_ptr_index_event_(xe::threading::Event::CreateAutoResetEvent(false)),
       write_ptr_index_(0) {
   assert_not_null(write_ptr_index_event_);
+  // Resolve dumps read the result from guest memory right after the copy.
+  if (!cvars::trace_dump_resolves_path.empty()) {
+    SetReadbackResolveCvar("full");
+  }
   // Parse and cache readback resolve mode once
   cached_readback_resolve_mode_ = ParseReadbackResolveMode();
 }
 
 CommandProcessor::~CommandProcessor() = default;
+
+bool CommandProcessor::ShouldSkipDrawAfterSetupForDump() const {
+  return cvars::trace_dump_skip_draw_after_setup >= 0 &&
+         uint32_t(cvars::trace_dump_skip_draw_after_setup) ==
+             draw_dump_index_;
+}
+
+void CommandProcessor::DumpEdramAfterDrawIfRequested() {
+  const uint32_t draw = draw_dump_index_++;
+  if (cvars::trace_dump_edram_draws.empty() ||
+      cvars::trace_dump_resolves_path.empty()) {
+    return;
+  }
+  unsigned first = 0, last = 0;
+  const int parsed = std::sscanf(cvars::trace_dump_edram_draws.c_str(),
+                                "%u-%u", &first, &last);
+  if (parsed < 1) {
+    return;
+  }
+  if (parsed == 1) {
+    last = first;
+  }
+  if (draw < first || draw > last) {
+    return;
+  }
+  {
+    // Draw state for matching dumps to draws across backends.
+    const RegisterFile& regs = *register_file_;
+    const std::filesystem::path& state_dir =
+        cvars::trace_dump_resolves_path;
+    std::filesystem::create_directories(state_dir);
+    const std::filesystem::path state_path = state_dir / "edram_draws.csv";
+    const bool new_file = !std::filesystem::exists(state_path);
+    FILE* state_file = xe::filesystem::OpenFile(state_path, "ab");
+    if (state_file) {
+      if (new_file) {
+        std::fputs("draw,vgt_draw_initiator,rb_modecontrol,rb_surface_info,rb_color_info,rb_color1_info,rb_color2_info,rb_color3_info,rb_depth_info,rb_color_mask,rb_colorcontrol,rb_blendcontrol0,rb_depthcontrol,pa_su_sc_mode_cntl,sq_program_cntl,pa_sc_window_scissor_tl,pa_sc_window_scissor_br,tf0_0,tf0_1,tf0_2,tf0_3,tf0_4,tf0_5,tf1_0,tf1_1,tf1_2,tf1_3,tf1_4,tf1_5\n", state_file);
+      }
+      std::fputs(
+          fmt::format("{},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X}\n", draw,
+                      regs[XE_GPU_REG_VGT_DRAW_INITIATOR], regs[XE_GPU_REG_RB_MODECONTROL], regs[XE_GPU_REG_RB_SURFACE_INFO], regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_COLOR1_INFO], regs[XE_GPU_REG_RB_COLOR2_INFO], regs[XE_GPU_REG_RB_COLOR3_INFO], regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_RB_COLOR_MASK], regs[XE_GPU_REG_RB_COLORCONTROL], regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], regs[XE_GPU_REG_SQ_PROGRAM_CNTL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+                      regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 0], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 1], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 2], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 3], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 4], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 5], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 7], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 8], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 9], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 10], regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 11])
+              .c_str(),
+          state_file);
+      std::fclose(state_file);
+    }
+  }
+  std::vector<uint8_t> edram;
+  if (!ReadbackEdramForDump(edram)) {
+    XELOGE("EDRAM dump after draw {} is not supported or failed", draw);
+    return;
+  }
+  const std::filesystem::path& dir = cvars::trace_dump_resolves_path;
+  std::filesystem::create_directories(dir);
+  FILE* file = xe::filesystem::OpenFile(
+      dir / fmt::format("edram_draw_{:05}.bin", draw), "wb");
+  if (file) {
+    std::fwrite(edram.data(), 1, edram.size(), file);
+    std::fclose(file);
+  }
+}
+
+bool CommandProcessor::IssueCopyAndDumpResolve() {
+  last_resolve_address_ = 0;
+  last_resolve_length_ = 0;
+  const bool result = IssueCopy();
+  if (cvars::trace_dump_resolves_path.empty()) {
+    return result;
+  }
+
+  const std::filesystem::path& dir = cvars::trace_dump_resolves_path;
+  const uint32_t index = resolve_dump_index_++;
+  if (index == 0) {
+    std::filesystem::create_directories(dir);
+  }
+  const RegisterFile& regs = *register_file_;
+  const uint32_t address = last_resolve_address_;
+  const uint32_t length = last_resolve_length_;
+
+  // One CSV row per resolve, including ones that wrote nothing (clears), so
+  // indices line up across backends.
+  FILE* index_file =
+      xe::filesystem::OpenFile(dir / "resolves.csv", index ? "ab" : "wb");
+  if (index_file) {
+    if (!index) {
+      std::fputs(
+          "index,result,address,length,rb_copy_control,rb_copy_dest_base,"
+          "rb_copy_dest_pitch,rb_copy_dest_info,rb_copy_surface_slice,"
+          "rb_surface_info,rb_color_info,rb_color1_info,rb_depth_info,"
+          "rb_modecontrol,pa_sc_window_offset,draws_before\n",
+          index_file);
+    }
+    std::fputs(
+        fmt::format("{},{},0x{:08X},{},0x{:08X},0x{:08X},0x{:08X},0x{:08X},"
+                    "0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},"
+                    "0x{:08X},{}\n",
+                    index, uint32_t(result), address, length,
+                    regs[XE_GPU_REG_RB_COPY_CONTROL],
+                    regs[XE_GPU_REG_RB_COPY_DEST_BASE],
+                    regs[XE_GPU_REG_RB_COPY_DEST_PITCH],
+                    regs[XE_GPU_REG_RB_COPY_DEST_INFO],
+                    regs[XE_GPU_REG_RB_COPY_SURFACE_SLICE],
+                    regs[XE_GPU_REG_RB_SURFACE_INFO],
+                    regs[XE_GPU_REG_RB_COLOR_INFO],
+                    regs[XE_GPU_REG_RB_COLOR1_INFO],
+                    regs[XE_GPU_REG_RB_DEPTH_INFO],
+                    regs[XE_GPU_REG_RB_MODECONTROL],
+                    regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], draw_dump_index_)
+            .c_str(),
+        index_file);
+    std::fclose(index_file);
+  }
+
+  if (length) {
+    FILE* data_file = xe::filesystem::OpenFile(
+        dir / fmt::format("resolve_{:05}_{:08X}.bin", index, address), "wb");
+    if (data_file) {
+      std::fwrite(memory_->TranslatePhysical(address), 1, length, data_file);
+      std::fclose(data_file);
+    }
+  }
+  return result;
+}
 
 bool CommandProcessor::Initialize() {
   // Android may override cvars after construction; make the cached mode match

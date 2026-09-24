@@ -1141,6 +1141,31 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id main_rect_list_loop_vertex_index_next_;
   spv::Block* main_switch_header_;
   std::unique_ptr<spv::Instruction> main_switch_op_;
+  // Whether the program counter dispatch (loop + switch) is used. Without
+  // it, either there are no jumps, or forward_jump_mode_ is used.
+  bool main_switch_used_ = false;
+  // Forward-only jumps (Shader::jumps_forward_only) are translated as
+  // sequential segments, each executed only if skip_target <= its first
+  // control flow index; a taken jump stores its target in skip_target.
+  // Unlike the dispatch loop, this keeps guest registers out of loop-carried
+  // state, which otherwise forces drivers to spill them to scratch memory.
+  bool forward_jump_mode_ = false;
+  spv::Id var_main_skip_target_ = spv::NoResult;
+  spv::Block* forward_segment_merge_ = nullptr;
+  void OpenForwardSegment(uint32_t cf_index);
+  void CloseForwardSegment();
+  // Structured guest loops in forward_jump_mode_ (innermost last).
+  struct StructuredLoop {
+    // Merge of `if (skip_target <= loop cf index)`.
+    spv::Block* guard_merge;
+    // Merge of `if (count != 0)` around the SPIR-V loop.
+    spv::Block* enter_merge;
+    spv::Block* loop_header;
+    spv::Block* loop_continue;
+    spv::Block* loop_merge;
+    uint32_t body_address;
+  };
+  std::vector<StructuredLoop> structured_loops_;
   spv::Block* main_switch_merge_;
   std::vector<spv::Id> main_switch_next_pc_phi_operands_;
 

@@ -9,11 +9,11 @@
 
 #include "xenia/ui/vulkan/spirv_tools_context.h"
 
-#if !XE_PLATFORM_ANDROID
+#if !XE_SPIRV_TOOLS_STUBBED
 #include <cstdlib>
 
 #include <spirv-tools/optimizer.hpp>
-#endif  // !XE_PLATFORM_ANDROID
+#endif  // !XE_SPIRV_TOOLS_STUBBED
 
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
@@ -22,7 +22,7 @@ namespace xe {
 namespace ui {
 namespace vulkan {
 
-#if XE_PLATFORM_ANDROID
+#if XE_SPIRV_TOOLS_STUBBED
 
 bool SpirvToolsContext::Initialize(unsigned int spirv_version) {
   (void)spirv_version;
@@ -149,15 +149,26 @@ spv_result_t SpirvToolsContext::Optimize(const uint32_t* words,
     optimizer.RegisterSizePasses();
   }
 
-  // Run optimizer
-  if (!optimizer.Run(words, num_words, &optimized_words)) {
+  // Run optimizer. Xenia's uniform buffers use scalar block layout
+  // (VK_EXT_scalar_block_layout), which the optimizer's built-in validation
+  // must be told about, like Validate() does, or it rejects every shader.
+  spvtools::ValidatorOptions validator_options;
+  validator_options.SetScalarBlockLayout(true);
+  spvtools::OptimizerOptions optimizer_options;
+  optimizer_options.set_validator_options(validator_options);
+  // The translator also emits constructs newer SPIR-V versions allow (e.g.
+  // OpSelect with a scalar condition and vector operands) that the validator
+  // rejects for the module's declared version while drivers accept them - the
+  // driver remains the judge of the optimized module.
+  optimizer_options.set_run_validator(false);
+  if (!optimizer.Run(words, num_words, &optimized_words, optimizer_options)) {
     return SPV_ERROR_INVALID_BINARY;
   }
 
   return SPV_SUCCESS;
 }
 
-#endif  // XE_PLATFORM_ANDROID
+#endif  // XE_SPIRV_TOOLS_STUBBED
 
 }  // namespace vulkan
 }  // namespace ui

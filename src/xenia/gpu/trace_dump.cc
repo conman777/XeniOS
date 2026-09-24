@@ -49,12 +49,20 @@ int TraceDump::Main(const std::vector<std::string>& args) {
     // TODO(benvanik): find something better than gflags that supports
     // unicode.
     path = cvars::target_trace_file;
-  } else if (args.size() >= 2) {
-    // Passed as an unnamed argument.
-    path = xe::to_path(args[1]);
-
-    if (args.size() >= 3) {
-      output_path = xe::to_path(args[2]);
+  } else {
+    // Passed as unnamed arguments. Some entry points (Android) hand over the
+    // raw argv, so skip --options.
+    std::vector<std::string> positional;
+    for (size_t i = 1; i < args.size(); ++i) {
+      if (args[i].rfind("--", 0) != 0) {
+        positional.push_back(args[i]);
+      }
+    }
+    if (positional.size() >= 1) {
+      path = xe::to_path(positional[0]);
+    }
+    if (positional.size() >= 2) {
+      output_path = xe::to_path(positional[1]);
     }
   }
 

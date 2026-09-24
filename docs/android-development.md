@@ -1,9 +1,15 @@
 # Android development
 
-Current status: **experimental; Halo Reach is not playable on the tested
-Odin2 Portal**. Menus and input work. The campaign has severe visual corruption
-and long stalls. A successful build or a visible menu does not establish game
-compatibility.
+Current status (2026-09-24): **experimental; Halo Reach reaches campaign
+gameplay on the tested Odin2 Portal but renders incorrectly**. Menus, input,
+the intro cinematic and first-person gameplay with HUD run at 6-18 fps
+(optimized native build). Grass, sky and some characters render magenta, and
+there are frame-rate dips while new shaders compile. A successful build or a
+visible menu does not establish game compatibility.
+
+See [Verified state](#verified-state-2026-09-24) for what was measured, and
+[Trace diff](#trace-diff-finding-rendering-bugs) for how rendering bugs are
+located.
 
 This guide is the entry point for Android work in this checkout. Historical
 work orders and AI reports describe past experiments; their conclusions need
@@ -37,6 +43,20 @@ machine needs its own SDK/NDK paths and dependency setup.
 The APK is `android/android_studio_project/app/build/outputs/apk/github/debug/app-github-debug.apk`.
 Update with `adb install -r <apk>` to preserve app data. Do not uninstall or
 clear storage as part of a routine update.
+
+That build's native code is unoptimized (`-O0`). For performance testing, build
+the same debuggable `.debug` package (same data, saves and `run-as` access)
+with optimized native code, arm64 only:
+
+```powershell
+.\gradlew.bat --offline --no-daemon "-Pandroid.aapt2FromMavenOverride=$env:LOCALAPPDATA\Android\Sdk\build-tools\33.0.2\aapt2.exe" "-PxeniaNativeConfig=Release" "-Pandroid.injected.build.abi=arm64-v8a" assembleGithubDebug
+```
+
+The single-ABI build is marked test-only and written to
+`app/build/intermediates/apk/github/debug/app-github-debug.apk`; install it
+with `adb install -r -t <apk>`. The Release sections of `build/*.prj.Android.mk`
+are hand-maintained. If a source file is added only to the Debug section, the
+optimized link fails with undefined symbols; copy the `LOCAL_SRC_FILES` list.
 
 Run the targeted cleanup regression checks from the source root:
 
@@ -91,6 +111,29 @@ Tools → Capture + Save State writes one diagnostic slot at
 `<external-files>/diagnostic_save/current.xes`. Tools → Restore Saved State
 loads it. Keep a separate copy before replacing a useful diagnostic scene.
 
+Debug builds also accept save/restore from adb, so a test scene need not be
+replayed from boot (about 4 minutes of loading and cutscenes). Write one
+line to `<external-files>/android_state_cmd.txt`: `save <path>` or
+`restore <path>`. The app polls every second, deletes the command file and
+writes the native result to `android_state_result.txt` (`ok\t...` on
+success). It uses the same native path as the Tools buttons
+(`EmulatorActivity.pollStateCommand`). Use your own file names; don't overwrite
+`current.xes` or the `*-20260905.xes` backups.
+
+```powershell
+$f = '/sdcard/Android/data/jp.xenios.emulator.github.debug/files'
+adb shell "am start -W -n jp.xenios.emulator.github.debug/jp.xenios.emulator.EmulatorActivity --es target $f/games/halo\ reach.iso"
+# wait ~25 s for the title to boot, then:
+adb shell "echo 'restore $f/diagnostic_save/pink_grass.xes' > $f/android_state_cmd.txt"
+```
+
+Measured 2026-09-24: save 0.9-2.2 s, restore 0.8 s, and in the mission about
+30 s after launch. A save taken during the intro cinematic resumes at the
+cinematic's start, not at the saved shot. Saved scenes: `pink_cutscene.xes`
+(intro valley shot) and `pink_grass.xes` (Noble Team leaving the hangar,
+magenta grass/sky). Don't run trace replays while the app is running: the
+combined GPU memory got the app killed.
+
 The September 5 baseline restored both a menu and a 3D scene after capture;
 the 3D scene also restored after restarting the app and continued into the
 vehicle tutorial. The measured saves took about 3 seconds, and restoration
@@ -112,6 +155,94 @@ moving Android overlay alone is insufficient.
 Ordinary Halo checkpoints are separate. See
 [checkpoint snapshots](android-halo-checkpoint-snapshots.md) and
 [diagnostic capture](android-debug-diagnostic-capture.md).
+
+## Verified state (2026-09-24)
+
+Each item was measured on the device or checked against the PC reference
+(see [Trace diff](#trace-diff-finding-rendering-bugs)). All changes are uncommitted
+in the working tree unless the git log says otherwise.
+
+Fixed:
+
+- **Mission 0.1 fps stalls and full-screen noise.** Pixel shaders with guest
+  jumps/loops were translated as one program-counter loop plus switch around
+  the whole shader. Adreno then spilled registers and allocated 24-72 MB of
+  driver (KGSL) memory per pipeline. `spirv_structurize_forward_jumps`
+  (default on) translates forward jumps as guarded segments and guest loops as
+  real SPIR-V loops. On the heavy mission frame, driver pipeline memory went
+  from 3.7 GB to 1.1 GB with an identical final image. KGSL-only memory
+  pressure no longer clears render targets
+  (`vulkan_kgsl_reclaim_clears_render_targets`, default off). That clear was
+  the source of the RGB-noise corruption.
+- **Stale CPU-written vertex data.** Vulkan vertex-buffer residency skipped
+  `RequestRange` when address and size were unchanged; it now requests every
+  draw.
+- **Occlusion-query draws.** `VulkanCommandProcessor::SupportsGuestOcclusionQueries`
+  ignored `occlusion_query_enable` (default off). Halo's viz-query draws
+  (`kill_pix_post_hi_z`) were then issued as ordinary draws that wrote depth
+  and color the real GPU discards (11 extra draws per frame). It now matches
+  D3D12 and Canary.
+- **Frame tracing in optimized builds.** The trace writer is compiled into
+  Android NDEBUG builds (`trace_writer.h`).
+
+Identified, not yet fixed:
+
+- **Yellow glowing foliage** is caused by
+  `halo_android_compat_presentable_color_shadow` (default on). Of all 13 Halo
+  patches (9 `halo_experiment.txt` keys plus 4 cvars), it is the only one that
+  breaks the affected buffer. With it off (profile key
+  `halo_android_compat_presentable_color_shadow=false`) the glow is gone live.
+  The phone profile currently has it off.
+- **Magenta grass, sky and characters** remain with every patch off. The
+  lighting/HDR (7e3, EDRAM tile 675) buffer diverges from the reference. It is
+  not the SNORM16 fallback (Adreno supports SNORM16 attachments) and not
+  shader structurization.
+- **Replay artifact that currently hides the magenta cause:** replays diverge
+  at the first ownership transfer out of the replay's restored EDRAM snapshot
+  render target (32_FLOAT, 16-tile pitch). This is `pink_cutscene` draw 280 and
+  `pink_grass` draw 171. The same frame is correct in Canary Vulkan on PC.
+  Save-state restore uses the same snapshot path, so it may also show on the
+  first frame after a restore. Fix this first so later divergences are
+  meaningful.
+- **`writer_gb_fix`** (under `direct_presentable_resolve`) swaps two channels
+  of the final resolve. The present swizzle override `0xA42` appears to
+  compensate for it. Left unchanged.
+
+Performance: optimized native build 6-18 fps in the intro cinematic and
+mission, against 3.5-12.5 unoptimized. The dips coincide with pipeline
+creation backlog (`SwapSummary ... queued=`). KGSL peaks at about 4.1 GB
+against the profile's `vulkan_kgsl_memory_limit_mb=3584`, so a pipeline trim
+still occurs occasionally. A 4608 MB profile
+(`trace-harness\configs\internal_profile.kgsl4608.txt`) is untested.
+
+## Trace diff: finding rendering bugs
+
+Don't tune workarounds by eye. Record the bad frame on the phone, replay the
+same frame with Canary's D3D12/Vulkan trace dump on the PC (the reference) and
+with this tree's Vulkan trace dump on the phone, then find the first resolve
+and draw where they differ. Harness and scripts: `E:\xbox360emu-build\trace-harness`
+(see its `README.md`). The Canary reference build is
+`E:\xbox360emu-build\xenia-canary-src`.
+
+- Record: create `<external-files>/android_trace_frame.txt`; the next frame is
+  written to `<external-files>/traces/` (list with `ls -t`).
+  `capture_when.ps1` triggers a trace and a save state automatically when the
+  screen shows a defect (for example magenta pixels).
+- Replay: `replay-windows.ps1` (pass `--async_shader_compilation=false`, or
+  D3D12 skips draws) and `replay-android.ps1`.
+- Compare: `compare.py resolves`, `channel_stats.py` (per-channel means
+  per resolve; a tint shows as channel drift), `decode_resolves.py` (images).
+- Narrow down: `bisect_patches.ps1` (which Halo patch changes a resolve) and
+  `bisect_draw.ps1` (first draw whose EDRAM tiles diverge, via
+  `--trace_dump_edram_draws`). `--trace_dump_skip_draw_after_setup=N`
+  separates render-target setup (transfers) from the draw itself.
+  `log_ownership_changes=1` with `ownership_watch_start_tiles` and
+  `ownership_watch_end_tiles` in `halo_experiment.txt` logs ownership
+  transfers.
+- Caveats: depth words differ by a few ULP between backends (compare depth
+  as 24-bit values, not as colour channels). Canary D3D12 and Canary Vulkan
+  also differ on some MSAA resolves, so use the Canary Vulkan run as a second
+  reference.
 
 ## Documentation maintenance
 

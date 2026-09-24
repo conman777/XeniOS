@@ -53,6 +53,12 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
   // Gather the upper bound of the control flow instructions, and label
   // addresses, which are needed for disassembly.
   cf_pair_index_bound_ = uint32_t(ucode_data_.size() / 3);
+  // For jumps_forward_only_: (cf index, target) of jumps and loop starts,
+  // (cf index, body address) of loop ends, cf indices ending the shader.
+  std::vector<std::pair<uint32_t, uint32_t>> structure_jumps;
+  std::vector<std::pair<uint32_t, uint32_t>> structure_loop_starts;
+  std::vector<std::pair<uint32_t, uint32_t>> structure_loop_ends;
+  std::vector<uint32_t> structure_shader_ends;
   for (uint32_t i = 0; i < cf_pair_index_bound_; ++i) {
     ControlFlowInstruction cf_ab[2];
     UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
@@ -65,21 +71,119 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
         cf_pair_index_bound_ =
             std::min(cf_pair_index_bound_, cf.exec.address());
       }
+      if (DoesControlFlowOpcodeEndShader(cf.opcode())) {
+        structure_shader_ends.push_back(i * 2 + j);
+      }
       switch (cf.opcode()) {
         case ControlFlowOpcode::kCondCall:
           label_addresses_.insert(cf.cond_call.address());
+          jumps_forward_only_ = false;
           break;
         case ControlFlowOpcode::kCondJmp:
           label_addresses_.insert(cf.cond_jmp.address());
+          structure_jumps.emplace_back(i * 2 + j, cf.cond_jmp.address());
           break;
         case ControlFlowOpcode::kLoopStart:
           label_addresses_.insert(cf.loop_start.address());
+          structure_loop_starts.emplace_back(i * 2 + j,
+                                             cf.loop_start.address());
           break;
         case ControlFlowOpcode::kLoopEnd:
           label_addresses_.insert(cf.loop_end.address());
+          structure_loop_ends.emplace_back(i * 2 + j, cf.loop_end.address());
           break;
         default:
           break;
+      }
+    }
+  }
+
+  // Decide whether the control flow can be structured (see
+  // jumps_forward_only()). Only instructions within the final bound count.
+  {
+    const uint32_t cf_bound = cf_pair_index_bound_ * 2;
+    // Loops as [start, end] cf index ranges, validated for nesting.
+    std::vector<std::pair<uint32_t, uint32_t>> loops;
+    size_t loop_end_index = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> loop_ends;
+    for (const auto& e : structure_loop_ends) {
+      if (e.first < cf_bound) {
+        loop_ends.push_back(e);
+      }
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> loop_starts;
+    for (const auto& s : structure_loop_starts) {
+      if (s.first < cf_bound) {
+        loop_starts.push_back(s);
+      }
+    }
+    for (const auto& s : loop_starts) {
+      // loop at S skips to F + 1; the matching endloop at F returns to
+      // S + 1.
+      if (s.second == 0) {
+        jumps_forward_only_ = false;
+        break;
+      }
+      const uint32_t end = s.second - 1;
+      bool matched = false;
+      for (const auto& e : loop_ends) {
+        if (e.first == end && e.second == s.first + 1) {
+          matched = true;
+          break;
+        }
+      }
+      if (!matched || end <= s.first) {
+        jumps_forward_only_ = false;
+        break;
+      }
+      loops.emplace_back(s.first, end);
+    }
+    if (loops.size() != loop_ends.size()) {
+      jumps_forward_only_ = false;
+    }
+    (void)loop_end_index;
+    // Proper nesting: any two loops are disjoint or one contains the other.
+    for (size_t a = 0; jumps_forward_only_ && a < loops.size(); ++a) {
+      for (size_t b = a + 1; b < loops.size(); ++b) {
+        const auto& la = loops[a];
+        const auto& lb = loops[b];
+        bool disjoint = la.second < lb.first || lb.second < la.first;
+        bool a_in_b = lb.first < la.first && la.second < lb.second;
+        bool b_in_a = la.first < lb.first && lb.second < la.second;
+        if (!disjoint && !a_in_b && !b_in_a) {
+          jumps_forward_only_ = false;
+          break;
+        }
+      }
+    }
+    // The innermost loop body (start, end] containing a cf index, or -1.
+    auto innermost_loop = [&](uint32_t cf_index) -> int {
+      int best = -1;
+      for (size_t l = 0; l < loops.size(); ++l) {
+        if (loops[l].first < cf_index && cf_index <= loops[l].second &&
+            (best < 0 || loops[l].first > loops[size_t(best)].first)) {
+          best = int(l);
+        }
+      }
+      return best;
+    };
+    for (const auto& jmp : structure_jumps) {
+      if (!jumps_forward_only_) {
+        break;
+      }
+      if (jmp.first >= cf_bound) {
+        continue;
+      }
+      // Forward, and neither leaving nor entering a loop body. A target at
+      // the endloop itself is still inside the body.
+      if (jmp.second <= jmp.first ||
+          innermost_loop(jmp.first) != innermost_loop(jmp.second)) {
+        jumps_forward_only_ = false;
+      }
+    }
+    for (uint32_t end_index : structure_shader_ends) {
+      if (end_index < cf_bound && innermost_loop(end_index) >= 0) {
+        jumps_forward_only_ = false;
       }
     }
   }

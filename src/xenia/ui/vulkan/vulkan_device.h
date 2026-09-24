@@ -166,6 +166,8 @@ class VulkanDevice {
     // VK_KHR_fragment_shader_barycentric (#322)
 
     bool fragmentShaderBarycentric = false;
+    // VK_KHR_pipeline_executable_properties (#270), for diagnostics.
+    bool pipelineExecutableInfo = false;
 
     // Vulkan 1.1 Subgroup Properties
     uint32_t subgroupSize = 32;

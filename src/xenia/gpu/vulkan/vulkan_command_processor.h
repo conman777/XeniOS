@@ -172,9 +172,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void PrepareForWait() override;
   void ReturnFromWait() override;
-  bool SupportsGuestOcclusionQueries() const override {
-    return occlusion_query_resources_available_;
-  }
+  // Like D3D12: with occlusion_query_enable off, the guest's viz query draws
+  // (kill_pix_post_hi_z) must be dropped, not issued as ordinary draws - they
+  // would write depth/color that the real GPU discards.
+  bool SupportsGuestOcclusionQueries() const override;
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(
@@ -340,6 +341,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void IssueDraw_MemexportReadbackFastPath(uint32_t memexport_total_size);
 
   void InitializeTrace() override;
+  bool ReadbackEdramForDump(std::vector<uint8_t>& out) override;
 
  private:
   struct CommandBuffer {
