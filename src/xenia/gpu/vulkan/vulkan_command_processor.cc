@@ -98,6 +98,11 @@ DEFINE_bool(
     "(scratch), textures and render targets are small, and dropping render "
     "targets mid-frame loses EDRAM contents - full-screen corruption.",
     "Android");
+DEFINE_bool(vulkan_debug_clear_textures_after_resolve, false,
+            "Diagnostic: after every resolve, wait for the GPU and clear the "
+            "whole texture cache (rules out stale textures over resolved "
+            "memory). Very slow.",
+            "GPU");
 
 namespace xe {
 namespace gpu {
@@ -5674,6 +5679,13 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
   RecordResolveWritten(written_address, written_length);
+  if (cvars::vulkan_debug_clear_textures_after_resolve && written_length) {
+    // Diagnostic: rules out stale texture cache entries over resolved memory.
+    if (EndSubmission(false) && AwaitAllQueueOperationsCompletion()) {
+      texture_cache_->ClearCache();
+    }
+    BeginSubmission(true);
+  }
 
   // CPU readback resolve path (if not disabled).
   ReadbackResolveMode readback_mode = GetReadbackResolveMode();

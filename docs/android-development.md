@@ -197,13 +197,26 @@ Identified, not yet fixed:
   lighting/HDR (7e3, EDRAM tile 675) buffer diverges from the reference. It is
   not the SNORM16 fallback (Adreno supports SNORM16 attachments) and not
   shader structurization.
-- **Replay artifact that currently hides the magenta cause:** replays diverge
-  at the first ownership transfer out of the replay's restored EDRAM snapshot
-  render target (32_FLOAT, 16-tile pitch). This is `pink_cutscene` draw 280 and
-  `pink_grass` draw 171. The same frame is correct in Canary Vulkan on PC.
-  Save-state restore uses the same snapshot path, so it may also show on the
-  first frame after a restore. Fix this first so later divergences are
-  meaningful.
+- **Replays must use the app's configuration.** The trace dump doesn't apply
+  the cvar overrides the app forces on Android (`xenia_main.cc`: dynamic
+  rendering off, `tiled_shared_memory`, memory limits). Use
+  `replay-android.ps1 -AppConfig`. The earlier "draw 280 / draw 171" whole-
+  buffer corruption was `vulkan_dynamic_rendering=true`, which only the trace
+  dump used. With dynamic rendering, the MRT draw wrote its second output
+  (normals) into RT0. The app is unaffected.
+- **Lit scene missing (dark / wrongly lit frames), located:** in `pink_grass`
+  with `-AppConfig`, draw 1196 is a full-screen depth-linearization pass. It
+  point-samples the 1152x720 k_8_8_8_8 texture at 0x02D08000 (resolve 6) and
+  writes `1/(d*c100.y+c100.x)` into the 7e3 buffer at EDRAM tile 675. The
+  phone writes ~0 almost everywhere (97.7% zero pixels against 45.8% on D3D12
+  and Canary Vulkan), so all later lighting is missing. Ruled out: the input
+  bytes (resolve 6 matches), the binding (key, format, swizzle 0x60A),
+  stale textures (`vulkan_debug_clear_textures_after_resolve`), the fork's
+  host color clamp (`spirv_host_color_clamp`), `vulkan_precise_interpolation`,
+  and all Halo patches. Remaining: how the phone loads or samples that
+  texture (load shader for tiled 8in32 8888), or this shader's SPIR-V. It has
+  validation warnings (scalar-condition `OpSelect` on vectors) from the fork's
+  clamp code.
 - **`writer_gb_fix`** (under `direct_presentable_resolve`) swaps two channels
   of the final resolve. The present swizzle override `0xA42` appears to
   compensate for it. Left unchanged.

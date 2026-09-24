@@ -18,6 +18,8 @@
 #include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/spirv_compatibility.h"
 
+DECLARE_bool(spirv_host_color_clamp);
+
 namespace xe {
 namespace gpu {
 
@@ -912,7 +914,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
                                    uniform_system_constants_, id_vector_temp_),
                                spv::NoPrecision));
 
-      if (!edram_fragment_shader_interlock_) {
+      if (!edram_fragment_shader_interlock_ && cvars::spirv_host_color_clamp) {
         // Float host attachments don't clamp their alpha before fixed-function
         // blending. For Xenos formats with fixed-point alpha, do that in the
         // shader so source-alpha blend factors can't consume exponent-scaled

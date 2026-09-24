@@ -32,6 +32,11 @@ DEFINE_bool(spirv_structurize_forward_jumps, true,
             "counter loop and switch. Avoids register spilling to scratch "
             "memory on drivers like Adreno's.",
             "GPU");
+DEFINE_bool(spirv_host_color_clamp, true,
+            "With host render targets, clamp fragment color to the Xenos "
+            "format range (and fixed-point alpha to 0...1) in the shader. "
+            "Not done by upstream Xenia.",
+            "GPU");
 DEFINE_string(spirv_version_override, "1.0",
               "Override the SPIR-V version used in shader translation.\n"
               "Use: [1.0, 1.3, 1.4, 1.5, 1.6, auto]\n"

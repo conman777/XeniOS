@@ -687,7 +687,9 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
   if (binding && AreDimensionsCompatible(dimension, binding->key.dimension)) {
 #if XE_PLATFORM_ANDROID
     if (GetAndroidHaloExperiment().log_texture_bindings &&
-        android_texture_binding_log_count < 512) {
+        (android_texture_binding_log_count < 512 ||
+         (binding->key.base_page == 0x2D08 &&
+          android_texture_binding_log_count < 4096))) {
       const TextureKey& key = binding->key;
       XELOGI(
           "Android texture binding {}: slot={} request_dim={} key_dim={} "
