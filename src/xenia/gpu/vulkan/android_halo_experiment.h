@@ -241,10 +241,11 @@ struct AndroidHaloExperiment {
   int32_t dump_msaa_sample_index_override = -1;
   // Force the swap texture to read this guest base page (0 = no override).
   uint32_t swap_base_page_override = 0;
-  // Override the frontbuffer fetch swizzle (12-bit Xenos swizzle). Device A/B
-  // confirms 0xA42 for Reach menus; the guest's raw 0xA0A is incorrect on the
-  // Adreno presentation path.
-  uint32_t swap_swizzle_override = 0xA42;
+  // Override the frontbuffer fetch swizzle (12-bit Xenos swizzle, 0 = use the
+  // guest's). 0xA42 compensated for the Adreno float-controls FragCoord bug;
+  // with spirv_adreno_float_controls_workaround it tints the frame
+  // green/magenta, so the guest swizzle is correct (device-verified 2026-09-24).
+  uint32_t swap_swizzle_override = 0;
   // Auto-select swizzle: 0xA42 for menus/intro/UI, 0xAC2 during 3D gameplay.
   // Default OFF: auto misclassifies difficulty as gameplay and greens the UI.
   bool swap_swizzle_auto = false;

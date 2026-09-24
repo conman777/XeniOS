@@ -1,11 +1,11 @@
 # Android development
 
-Current status (2026-09-24): **experimental; Halo Reach reaches campaign
-gameplay on the tested Odin2 Portal but renders incorrectly**. Menus, input,
-the intro cinematic and first-person gameplay with HUD run at 6-18 fps
-(optimized native build). Grass, sky and some characters render magenta, and
-there are frame-rate dips while new shaders compile. A successful build or a
-visible menu does not establish game compatibility.
+Current status (2026-09-24): **experimental; Halo Reach plays its campaign
+with correct lighting and colours on the tested Odin2 Portal**. Menus, input,
+the intro cinematic and first-person gameplay with HUD render like the PC
+reference at 8-15 fps (optimized native build), with frame-rate dips while new
+shaders compile. A successful build or a visible menu does not establish game
+compatibility.
 
 See [Verified state](#verified-state-2026-09-24) for what was measured, and
 [Trace diff](#trace-diff-finding-rendering-bugs) for how rendering bugs are
@@ -130,8 +130,8 @@ adb shell "echo 'restore $f/diagnostic_save/pink_grass.xes' > $f/android_state_c
 Measured 2026-09-24: save 0.9-2.2 s, restore 0.8 s, and in the mission about
 30 s after launch. A save taken during the intro cinematic resumes at the
 cinematic's start, not at the saved shot. Saved scenes: `pink_cutscene.xes`
-(intro valley shot) and `pink_grass.xes` (Noble Team leaving the hangar,
-magenta grass/sky). Don't run trace replays while the app is running: the
+(intro valley shot), `pink_grass.xes` (Noble Team leaving the hangar) and
+`gameplay_hud.xes` (first-person gameplay with HUD). Don't run trace replays while the app is running: the
 combined GPU memory got the app killed.
 
 The September 5 baseline restored both a menu and a 3D scene after capture;
@@ -159,8 +159,7 @@ Ordinary Halo checkpoints are separate. See
 ## Verified state (2026-09-24)
 
 Each item was measured on the device or checked against the PC reference
-(see [Trace diff](#trace-diff-finding-rendering-bugs)). All changes are uncommitted
-in the working tree unless the git log says otherwise.
+(see [Trace diff](#trace-diff-finding-rendering-bugs)). See the git log for the commits.
 
 Fixed:
 
@@ -184,53 +183,39 @@ Fixed:
   D3D12 and Canary.
 - **Frame tracing in optimized builds.** The trace writer is compiled into
   Android NDEBUG builds (`trace_writer.h`).
+- **Dark / wrongly lit frames (the "magenta" scenes).** On Adreno, fragment
+  shaders that declare the SPIR-V float-controls execution modes
+  `DenormFlushToZero` or `SignedZeroInfNanPreserve` read `gl_FragCoord.xy` as
+  0. Every shader using the guest's screen-position parameter (PsParamGen,
+  75 shaders in the `pink_grass` frame, including depth linearization and
+  deferred lighting) then sampled texel (0,0). `SpirvShaderTranslator` no
+  longer declares these modes on Qualcomm
+  (`spirv_adreno_float_controls_workaround`, default on;
+  `spirv_disable_float_controls` disables them on any vendor). Both recorded
+  traces now match the PC reference (final frame channel means within 0.2).
+  The earlier per-draw RT0 dump observations for draw 1196 predate this and
+  should not be reused.
+- **Green/magenta colour cast.** The present swizzle override `0xA42`
+  compensated for the broken lighting and now tints the frame.
+  `swap_swizzle_override` now defaults to 0 (the guest's swizzle). An old
+  `halo_experiment.txt` with `swap_swizzle_override=0xA42` still applies it;
+  remove that line. `writer_gb_fix` made no visible difference and is left on.
+- **Yellow glowing foliage** was `halo_android_compat_presentable_color_shadow`,
+  now off in the code default and the bundled profile. Existing installs keep
+  their storage copy of the profile; set the key to false there.
 
-Identified, not yet fixed:
+Notes:
 
-- **Yellow glowing foliage** is caused by
-  `halo_android_compat_presentable_color_shadow` (default on). Of all 13 Halo
-  patches (9 `halo_experiment.txt` keys plus 4 cvars), it is the only one that
-  breaks the affected buffer. With it off (profile key
-  `halo_android_compat_presentable_color_shadow=false`) the glow is gone live.
-  The phone profile currently has it off.
-- **Magenta grass, sky and characters** remain with every patch off. The
-  lighting/HDR (7e3, EDRAM tile 675) buffer diverges from the reference. It is
-  not the SNORM16 fallback (Adreno supports SNORM16 attachments) and not
-  shader structurization.
 - **Replays must use the app's configuration.** The trace dump doesn't apply
   the cvar overrides the app forces on Android (`xenia_main.cc`: dynamic
   rendering off, `tiled_shared_memory`, memory limits). Use
-  `replay-android.ps1 -AppConfig`. The earlier "draw 280 / draw 171" whole-
-  buffer corruption was `vulkan_dynamic_rendering=true`, which only the trace
-  dump used. With dynamic rendering, the MRT draw wrote its second output
-  (normals) into RT0. The app is unaffected.
-- **Lit scene missing (dark / wrongly lit frames), located:** in `pink_grass`
-  with `-AppConfig`, draw 1196 is a full-screen depth-linearization pass. It
-  point-samples the 1152x720 k_8_8_8_8 texture at 0x02D08000 (resolve 6) and
-  writes `1/(d*c100.y+c100.x)` into the 7e3 buffer at EDRAM tile 675. The
-  phone writes ~0 almost everywhere (97.7% zero pixels against 45.8% on D3D12
-  and Canary Vulkan), so all later lighting is missing. Ruled out: the input
-  bytes (resolve 6 matches), the binding (key, format, swizzle 0x60A),
-  stale textures (`vulkan_debug_clear_textures_after_resolve`), the fork's
-  host color clamp (`spirv_host_color_clamp`), `vulkan_precise_interpolation`,
-  and all Halo patches. Narrowed further with raw host dumps
-  (`--trace_dump_texture_slot`, `--trace_dump_color0_host`) and shader output
-  replacement (`--spirv_debug_ps_hash`, `--spirv_debug_ps_output`, where -100
-  means a literal):
-  - The sampled texture's host contents match the guest bytes exactly.
-  - `c100` is sane: (0.0001, 128).
-  - With the draw skipped, the float16 RT0 keeps the transferred contents.
-  - With the draw, RT0 is all 0.0, even when the shader outputs a literal
-    (1,2,3,4).
-  - No GPU fault appears in logcat or dmesg.
-
-  So the draw's pixels never reach this image, and the image is wiped. The
-  suspects are the framebuffer or image view bound for this RT key (7e3
-  "AS_16_16_16_16", EDRAM tile 675, 1200x2192) and render-pass behaviour on
-  Adreno. The next step is the Vulkan validation layer on the device.
-- **`writer_gb_fix`** (under `direct_presentable_resolve`) swaps two channels
-  of the final resolve. The present swizzle override `0xA42` appears to
-  compensate for it. Left unchanged.
+  `replay-android.ps1 -AppConfig`. With `vulkan_dynamic_rendering=true`,
+  which only the trace dump used, MRT draws wrote their second output into
+  RT0.
+- **Shader debugging:** `--spirv_debug_ps_hash` with `--spirv_debug_ps_output`
+  replaces a pixel shader's oC0 (N >= 0: register rN; -1-N: float constant N;
+  -100: literal (1,2,3,4); -800: `gl_FragCoord`). `--trace_dump_texture_slot`
+  and `--trace_dump_color0_host` dump host images per draw.
 
 Performance: optimized native build 6-18 fps in the intro cinematic and
 mission, against 3.5-12.5 unoptimized. The dips coincide with pipeline

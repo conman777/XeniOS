@@ -19,6 +19,8 @@
 #include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/spirv_compatibility.h"
 
+DECLARE_int32(spirv_debug_ps_output);
+
 namespace xe {
 namespace gpu {
 
@@ -733,6 +735,31 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             texture_bindings_[image_3d_signed_index];
         image_3d_signed = builder_->createLoad(image_3d_signed_binding.variable,
                                                spv::NoPrecision);
+      }
+      // Diagnostic -600-N: texelFetch of the unsigned view at (576, 360).
+      if (IsDebugPsTarget() && cvars::spirv_debug_ps_output <= -600 &&
+          cvars::spirv_debug_ps_output > -700 &&
+          uint32_t(-600 - cvars::spirv_debug_ps_output) ==
+              fetch_constant_index) {
+        if (var_debug_fetch_ == spv::NoResult) {
+          var_debug_fetch_ = builder_->createVariable(
+              spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+              "xe_var_debug_fetch", const_float4_0_);
+        }
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(builder_->makeIntConstant(576));
+        id_vector_temp_.push_back(builder_->makeIntConstant(360));
+        id_vector_temp_.push_back(const_int_0_);
+        spv::Id fetch_coords =
+            builder_->makeCompositeConstant(type_int3_, id_vector_temp_);
+        std::vector<spv::IdImmediate> fetch_operands = {
+            {true, image_2d_array_or_cube_unsigned},
+            {true, fetch_coords},
+            {false, spv::ImageOperandsLodMask},
+            {true, const_int_0_}};
+        builder_->createStore(
+            builder_->createOp(spv::OpImageFetch, type_float4_, fetch_operands),
+            var_debug_fetch_);
       }
     }
 
@@ -1660,6 +1687,36 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         }
         spv::Id is_any_unsigned = builder_->createUnaryOp(
             spv::OpLogicalNot, type_bool_, is_all_signed);
+        if (IsDebugPsTarget() && cvars::spirv_debug_ps_output <= -500 &&
+            cvars::spirv_debug_ps_output > -600 &&
+            uint32_t(-500 - cvars::spirv_debug_ps_output) ==
+                fetch_constant_index) {
+          if (var_debug_fetch_ == spv::NoResult) {
+            var_debug_fetch_ = builder_->createVariable(
+                spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+                "xe_var_debug_fetch", const_float4_0_);
+          }
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->createTriOp(
+              spv::OpSelect, type_float_, is_any_unsigned, const_float_1_,
+              const_float_0_));
+          id_vector_temp_.push_back(builder_->createTriOp(
+              spv::OpSelect, type_float_,
+              is_any_signed != spv::NoResult ? is_any_signed
+                                             : builder_->makeBoolConstant(false),
+              const_float_1_, const_float_0_));
+          id_vector_temp_.push_back(builder_->createUnaryOp(
+              spv::OpConvertUToF, type_float_,
+              builder_->createTriOp(
+                  spv::OpBitFieldUExtract, type_uint_, swizzled_signs_word,
+                  builder_->makeUintConstant(swizzled_signs_word_offset),
+                  builder_->makeUintConstant(8))));
+          id_vector_temp_.push_back(builder_->makeFloatConstant(
+              float(used_result_nonzero_components)));
+          builder_->createStore(
+              builder_->createCompositeConstruct(type_float4_, id_vector_temp_),
+              var_debug_fetch_);
+        }
 
         // Load the fetch constant word 3, needed for result exponent biasing.
         // exp_adjust is in word 3, bits 13:18 (6-bit signed).
@@ -2176,6 +2233,28 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
           texture_parameters.coords =
               builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
+          // Diagnostic -700-N: the coordinates and x gradient of this sample.
+          if (IsDebugPsTarget() && cvars::spirv_debug_ps_output <= -700 &&
+              cvars::spirv_debug_ps_output > -800 &&
+              uint32_t(-700 - cvars::spirv_debug_ps_output) ==
+                  fetch_constant_index) {
+            if (var_debug_fetch_ == spv::NoResult) {
+              var_debug_fetch_ = builder_->createVariable(
+                  spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+                  "xe_var_debug_fetch", const_float4_0_);
+            }
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(coordinates[0]);
+            id_vector_temp_.push_back(coordinates[1]);
+            id_vector_temp_.push_back(coordinates[2]);
+            id_vector_temp_.push_back(
+                use_computed_lod ? builder_->createCompositeExtract(
+                                       gradients_h, type_float_, 0)
+                                 : const_float_0_);
+            builder_->createStore(builder_->createCompositeConstruct(
+                                      type_float4_, id_vector_temp_),
+                                  var_debug_fetch_);
+          }
           SampleTexture(texture_parameters, image_operands_mask,
                         image_2d_array_or_cube_unsigned,
                         image_2d_array_or_cube_signed, sampler, is_any_unsigned,
@@ -2183,6 +2262,21 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                         sample_result_signed);
         }
 
+        const int32_t debug_fetch_mode = cvars::spirv_debug_ps_output;
+        const bool debug_fetch_signed = debug_fetch_mode <= -300;
+        if (IsDebugPsTarget() && debug_fetch_mode <= -200 &&
+            debug_fetch_mode > -400 &&
+            uint32_t((debug_fetch_signed ? -300 : -200) - debug_fetch_mode) ==
+                fetch_constant_index) {
+          if (var_debug_fetch_ == spv::NoResult) {
+            var_debug_fetch_ = builder_->createVariable(
+                spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+                "xe_var_debug_fetch", const_float4_0_);
+          }
+          builder_->createStore(debug_fetch_signed ? sample_result_signed
+                                                   : sample_result_unsigned,
+                                var_debug_fetch_);
+        }
         // Swizzle the result components manually if needed, to `result`.
         // Because the same host format component may be replicated into
         // multiple guest components (such as for formats with less than 4

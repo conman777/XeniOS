@@ -108,6 +108,10 @@ DEFINE_int32(trace_dump_texture_slot, -1,
              "With trace_dump_edram_draws: also dump the host texture bound "
              "to this fetch constant slot after each dumped draw.",
              "GPU");
+DEFINE_bool(vulkan_debug_sync_after_request_textures, false,
+            "Diagnostic: submit and wait for the GPU after texture requests "
+            "on every draw.",
+            "GPU");
 DEFINE_bool(vulkan_debug_reupload_constants, false,
             "Diagnostic: rewrite every constant buffer for every draw.",
             "GPU");
@@ -4965,6 +4969,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
            ? pixel_shader->GetUsedTextureMaskAfterTranslation()
            : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  if (cvars::vulkan_debug_sync_after_request_textures) {
+    // Diagnostic: make texture loads complete before the draw samples them.
+    SubmitBarriers(true);
+    if (EndSubmission(false)) {
+      AwaitAllQueueOperationsCompletion();
+    }
+    BeginSubmission(true);
+  }
 
   auto pipeline_layout =
       static_cast<const PipelineLayout*>(pipeline->pipeline_layout);

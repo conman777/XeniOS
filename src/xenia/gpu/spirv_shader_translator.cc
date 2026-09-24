@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/spirv_shader_translator.h"
 
+#include <cstdlib>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -36,6 +38,15 @@ DEFINE_bool(spirv_host_color_clamp, true,
             "With host render targets, clamp fragment color to the Xenos "
             "format range (and fixed-point alpha to 0...1) in the shader. "
             "Not done by upstream Xenia.",
+            "GPU");
+DEFINE_bool(spirv_adreno_float_controls_workaround, true,
+            "On Qualcomm GPUs, don't declare the DenormFlushToZero and "
+            "SignedZeroInfNanPreserve execution modes: Adreno drivers return 0 "
+            "for gl_FragCoord.xy with them, breaking screen-space shaders.",
+            "GPU");
+DEFINE_bool(spirv_disable_float_controls, false,
+            "Diagnostic: don't declare the DenormFlushToZero and "
+            "SignedZeroInfNanPreserve execution modes.",
             "GPU");
 DEFINE_string(spirv_debug_ps_hash, "",
               "Diagnostic: ucode hash (hex) of a pixel shader whose color 0 "
@@ -73,6 +84,12 @@ DEFINE_bool(
 
 namespace xe {
 namespace gpu {
+
+bool SpirvShaderTranslator::IsDebugPsTarget() const {
+  return is_pixel_shader() && !cvars::spirv_debug_ps_hash.empty() &&
+         std::strtoull(cvars::spirv_debug_ps_hash.c_str(), nullptr, 16) ==
+             current_shader().ucode_data_hash();
+}
 
 namespace {
 #if !XE_PLATFORM_APPLE
@@ -156,6 +173,14 @@ SpirvShaderTranslator::Features::Features(bool all)
       fragment_shader_barycentric(all) {}
 
 #if !XE_PLATFORM_APPLE
+namespace {
+bool IsQualcommFloatControlsBroken(const ui::vulkan::VulkanDevice* vulkan_device) {
+  constexpr uint32_t kVendorIdQualcomm = 0x5143;
+  return vulkan_device->properties().vendorID == kVendorIdQualcomm &&
+         cvars::spirv_adreno_float_controls_workaround;
+}
+}  // namespace
+
 SpirvShaderTranslator::Features::Features(
     const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(
@@ -169,10 +194,17 @@ SpirvShaderTranslator::Features::Features(
       cull_distance(vulkan_device->properties().shaderCullDistance),
       image_view_format_swizzle(
           vulkan_device->properties().imageViewFormatSwizzle),
+      // Qualcomm Adreno (tested: Adreno 740, driver 0676.53) returns 0 for
+      // gl_FragCoord.xy in fragment shaders that declare these float control
+      // execution modes, which breaks every PsParamGen (screen position)
+      // shader - deferred lighting, post-processing. Verified by trace diff
+      // against Canary (Halo Reach pink_grass draw 1196).
       signed_zero_inf_nan_preserve_float32(
-          vulkan_device->properties().shaderSignedZeroInfNanPreserveFloat32),
+          vulkan_device->properties().shaderSignedZeroInfNanPreserveFloat32 &&
+          !IsQualcommFloatControlsBroken(vulkan_device)),
       denorm_flush_to_zero_float32(
-          vulkan_device->properties().shaderDenormFlushToZeroFloat32),
+          vulkan_device->properties().shaderDenormFlushToZeroFloat32 &&
+          !IsQualcommFloatControlsBroken(vulkan_device)),
       rounding_mode_rte_float32(
           vulkan_device->properties().shaderRoundingModeRTEFloat32),
       fragment_shader_sample_interlock(
@@ -292,6 +324,7 @@ void SpirvShaderTranslator::Reset() {
 
   main_interface_.clear();
   var_main_registers_ = spv::NoResult;
+  var_debug_fetch_ = spv::NoResult;
   var_main_memexport_address_ = spv::NoResult;
   for (size_t memexport_eM_index = 0;
        memexport_eM_index < xe::countof(var_main_memexport_data_);
@@ -1087,14 +1120,16 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
       execution_model = spv::ExecutionModelVertex;
     }
   }
-  if (features_.denorm_flush_to_zero_float32) {
+  if (features_.denorm_flush_to_zero_float32 &&
+      !cvars::spirv_disable_float_controls) {
     // Flush to zero, similar to the real hardware, also for things like Shader
     // Model 3 multiplication emulation.
     builder_->addCapability(spv::CapabilityDenormFlushToZero);
     builder_->addExecutionMode(function_main_,
                                spv::ExecutionModeDenormFlushToZero, 32);
   }
-  if (features_.signed_zero_inf_nan_preserve_float32) {
+  if (features_.signed_zero_inf_nan_preserve_float32 &&
+      !cvars::spirv_disable_float_controls) {
     // Signed zero used to get VFACE from ps_param_gen, also special behavior
     // for infinity in certain instructions (such as logarithm, reciprocal,
     // muls_prev2).

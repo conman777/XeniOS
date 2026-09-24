@@ -92,6 +92,11 @@ DEFINE_string(trace_dump_edram_draws, "",
               "(e.g. 250-300, or a single index).",
               "GPU");
 
+DEFINE_bool(trace_dump_draw_shaders, false,
+            "With trace_dump_resolves_path: log the vertex and pixel shader "
+            "hashes of every draw to all_draw_shaders.csv.",
+            "GPU");
+
 DEFINE_int32(trace_dump_skip_draw_after_setup, -1,
              "Debugging: for this draw index, set up render targets (including "
              "ownership transfers) but don't issue the draw itself.",
@@ -179,6 +184,25 @@ bool CommandProcessor::ShouldSkipDrawAfterSetupForDump() const {
 
 void CommandProcessor::DumpEdramAfterDrawIfRequested() {
   const uint32_t draw = draw_dump_index_++;
+  if (cvars::trace_dump_draw_shaders &&
+      !cvars::trace_dump_resolves_path.empty()) {
+    FILE* all_shaders_file = xe::filesystem::OpenFile(
+        std::filesystem::path(cvars::trace_dump_resolves_path) /
+            "all_draw_shaders.csv",
+        "ab");
+    if (all_shaders_file) {
+      std::fputs(fmt::format("{},{:016X},{:016X}\n", draw,
+                             active_vertex_shader_
+                                 ? active_vertex_shader_->ucode_data_hash()
+                                 : 0,
+                             active_pixel_shader_
+                                 ? active_pixel_shader_->ucode_data_hash()
+                                 : 0)
+                     .c_str(),
+                 all_shaders_file);
+      std::fclose(all_shaders_file);
+    }
+  }
   if (cvars::trace_dump_edram_draws.empty() ||
       cvars::trace_dump_resolves_path.empty()) {
     return;
@@ -215,6 +239,20 @@ void CommandProcessor::DumpEdramAfterDrawIfRequested() {
               .c_str(),
           state_file);
       std::fclose(state_file);
+    }
+    FILE* shader_file =
+        xe::filesystem::OpenFile(state_dir / "edram_draw_shaders.csv", "ab");
+    if (shader_file) {
+      std::fputs(fmt::format("{},{:016X},{:016X}\n", draw,
+                             active_vertex_shader_
+                                 ? active_vertex_shader_->ucode_data_hash()
+                                 : 0,
+                             active_pixel_shader_
+                                 ? active_pixel_shader_->ucode_data_hash()
+                                 : 0)
+                     .c_str(),
+                 shader_file);
+      std::fclose(shader_file);
     }
   }
   std::vector<uint8_t> edram;

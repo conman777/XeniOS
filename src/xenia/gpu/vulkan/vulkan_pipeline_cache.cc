@@ -79,6 +79,10 @@ DEFINE_bool(
     "only affects async pipeline creation and does not block the main thread.",
     "Vulkan");
 
+DEFINE_bool(vulkan_debug_force_depth_clamp, false,
+            "Diagnostic: enable depth clamping (no near/far clipping) for "
+            "every pipeline.",
+            "Vulkan");
 DEFINE_bool(
     vulkan_driver_pipeline_cache, true,
     "Pass a VkPipelineCache to pipeline creation. Adreno drivers keep growing "
@@ -1696,7 +1700,8 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
 
   description_out.depth_clamp_enable =
       device_properties.depthClamp &&
-      regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+      (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ||
+       cvars::vulkan_debug_force_depth_clamp);
 
   // TODO(Triang3l): Tessellation.
   bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);

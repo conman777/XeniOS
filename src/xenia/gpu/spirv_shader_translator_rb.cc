@@ -910,7 +910,14 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         const int32_t source = cvars::spirv_debug_ps_output;
         XELOGI("spirv_debug_ps: replacing oC0 of {:016X} with source {}",
                current_shader().ucode_data_hash(), source);
-        if (source == -100) {
+        if (source == -800 && input_fragment_coordinates_ != spv::NoResult) {
+          color = builder_->createLoad(input_fragment_coordinates_,
+                                       spv::NoPrecision);
+        } else if (source <= -200 && source > -800) {
+          if (var_debug_fetch_ != spv::NoResult) {
+            color = builder_->createLoad(var_debug_fetch_, spv::NoPrecision);
+          }
+        } else if (source == -100) {
           id_vector_temp_.clear();
           for (uint32_t c = 0; c < 4; ++c) {
             id_vector_temp_.push_back(builder_->makeFloatConstant(float(c + 1)));
