@@ -353,6 +353,10 @@ class CommandProcessor {
   virtual bool ReadbackEdramForDump(std::vector<uint8_t>& out) {
     return false;
   }
+  // Writes the host texture bound to --trace_dump_texture_slot after a
+  // dumped draw (host contents, to compare with the guest bytes).
+  virtual void DumpTextureAfterDraw(uint32_t draw,
+                                    const std::filesystem::path& dir) {}
   // Backends call this with the range Resolve() reported as written.
   void RecordResolveWritten(uint32_t address, uint32_t length) {
     last_resolve_address_ = address;

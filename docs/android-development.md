@@ -213,10 +213,21 @@ Identified, not yet fixed:
   bytes (resolve 6 matches), the binding (key, format, swizzle 0x60A),
   stale textures (`vulkan_debug_clear_textures_after_resolve`), the fork's
   host color clamp (`spirv_host_color_clamp`), `vulkan_precise_interpolation`,
-  and all Halo patches. Remaining: how the phone loads or samples that
-  texture (load shader for tiled 8in32 8888), or this shader's SPIR-V. It has
-  validation warnings (scalar-condition `OpSelect` on vectors) from the fork's
-  clamp code.
+  and all Halo patches. Narrowed further with raw host dumps
+  (`--trace_dump_texture_slot`, `--trace_dump_color0_host`) and shader output
+  replacement (`--spirv_debug_ps_hash`, `--spirv_debug_ps_output`, where -100
+  means a literal):
+  - The sampled texture's host contents match the guest bytes exactly.
+  - `c100` is sane: (0.0001, 128).
+  - With the draw skipped, the float16 RT0 keeps the transferred contents.
+  - With the draw, RT0 is all 0.0, even when the shader outputs a literal
+    (1,2,3,4).
+  - No GPU fault appears in logcat or dmesg.
+
+  So the draw's pixels never reach this image, and the image is wiped. The
+  suspects are the framebuffer or image view bound for this RT key (7e3
+  "AS_16_16_16_16", EDRAM tile 675, 1200x2192) and render-pass behaviour on
+  Adreno. The next step is the Vulkan validation layer on the device.
 - **`writer_gb_fix`** (under `direct_presentable_resolve`) swaps two channels
   of the final resolve. The present swizzle override `0xA42` appears to
   compensate for it. Left unchanged.

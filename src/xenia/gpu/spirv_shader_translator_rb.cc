@@ -10,15 +10,19 @@
 #include "xenia/gpu/spirv_shader_translator.h"
 
 #include <cstdint>
+#include <cstdlib>
 
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/spirv_compatibility.h"
 
 DECLARE_bool(spirv_host_color_clamp);
+DECLARE_string(spirv_debug_ps_hash);
+DECLARE_int32(spirv_debug_ps_output);
 
 namespace xe {
 namespace gpu {
@@ -898,6 +902,38 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
       spv::Id color_variable = output_or_var_fragment_data_[color_target_index];
       spv::Id color = builder_->createLoad(color_variable, spv::NoPrecision);
+      // Diagnostic: output a guest register (or a float constant with -1-N)
+      // instead of oC0 for the pixel shader with the given ucode hash.
+      if (color_target_index == 0 && !cvars::spirv_debug_ps_hash.empty() &&
+          std::strtoull(cvars::spirv_debug_ps_hash.c_str(), nullptr, 16) ==
+              current_shader().ucode_data_hash()) {
+        const int32_t source = cvars::spirv_debug_ps_output;
+        XELOGI("spirv_debug_ps: replacing oC0 of {:016X} with source {}",
+               current_shader().ucode_data_hash(), source);
+        if (source == -100) {
+          id_vector_temp_.clear();
+          for (uint32_t c = 0; c < 4; ++c) {
+            id_vector_temp_.push_back(builder_->makeFloatConstant(float(c + 1)));
+          }
+          color = builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
+        } else if (source >= 0 && var_main_registers_ != spv::NoResult) {
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->makeIntConstant(source));
+          color = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassFunction,
+                                          var_main_registers_, id_vector_temp_),
+              spv::NoPrecision);
+        } else if (source < 0) {
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_int_0_);
+          id_vector_temp_.push_back(builder_->makeIntConstant(-1 - source));
+          color = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassUniform,
+                                          uniform_float_constants_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+        }
+      }
       spv::Id color_unbiased = color;
 
       // Apply the exponent bias after the alpha test and alpha to coverage

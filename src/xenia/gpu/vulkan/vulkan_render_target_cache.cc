@@ -1359,6 +1359,29 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
 
 void VulkanRenderTargetCache::ClearCache() { ClearCache("deferred"); }
 
+bool VulkanRenderTargetCache::DebugGetColor0Image(
+    VkImage& image, uint32_t& width, uint32_t& height, uint32_t& vk_format,
+    VkPipelineStageFlags& stage_mask, VkAccessFlags& access_mask,
+    VkImageLayout& layout) const {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  RenderTarget* const* rts = last_update_accumulated_render_targets();
+  if (!rts || !rts[1]) {
+    return false;
+  }
+  const auto& rt = *static_cast<const VulkanRenderTarget*>(rts[1]);
+  const RenderTargetKey key = rt.key();
+  image = rt.image();
+  width = key.GetWidth();
+  height = GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples);
+  vk_format = uint32_t(GetColorVulkanFormat(key.GetColorFormat()));
+  stage_mask = rt.current_stage_mask();
+  access_mask = rt.current_access_mask();
+  layout = rt.current_layout();
+  return key.msaa_samples == xenos::MsaaSamples::k1X;
+}
+
 bool VulkanRenderTargetCache::SaveStateSubmitEdramDownload(
     VkBuffer destination) {
   if (destination == VK_NULL_HANDLE || IsDrawResolutionScaled()) {

@@ -342,6 +342,12 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void InitializeTrace() override;
   bool ReadbackEdramForDump(std::vector<uint8_t>& out) override;
+  void DumpTextureAfterDraw(uint32_t draw,
+                            const std::filesystem::path& dir) override;
+  void DumpImageForTrace(VkImage image, uint32_t width, uint32_t height,
+                         VkPipelineStageFlags stage_mask,
+                         VkAccessFlags access_mask, VkImageLayout layout,
+                         const std::filesystem::path& path);
 
  private:
   struct CommandBuffer {

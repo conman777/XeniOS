@@ -37,6 +37,14 @@ DEFINE_bool(spirv_host_color_clamp, true,
             "format range (and fixed-point alpha to 0...1) in the shader. "
             "Not done by upstream Xenia.",
             "GPU");
+DEFINE_string(spirv_debug_ps_hash, "",
+              "Diagnostic: ucode hash (hex) of a pixel shader whose color 0 "
+              "output is replaced by spirv_debug_ps_output.",
+              "GPU");
+DEFINE_int32(spirv_debug_ps_output, 0,
+             "Diagnostic: N >= 0 outputs guest register rN; -1-N outputs the "
+             "Nth packed float constant.",
+             "GPU");
 DEFINE_string(spirv_version_override, "1.0",
               "Override the SPIR-V version used in shader translation.\n"
               "Use: [1.0, 1.3, 1.4, 1.5, 1.6, auto]\n"

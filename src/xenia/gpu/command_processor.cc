@@ -230,6 +230,7 @@ void CommandProcessor::DumpEdramAfterDrawIfRequested() {
     std::fwrite(edram.data(), 1, edram.size(), file);
     std::fclose(file);
   }
+  DumpTextureAfterDraw(draw, dir);
 }
 
 bool CommandProcessor::IssueCopyAndDumpResolve() {

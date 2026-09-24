@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 
+#include "xenia/base/filesystem.h"
+
 #if XE_PLATFORM_ANDROID
 #include "xenia/gpu/vulkan/android_halo_experiment.h"
 #endif
@@ -98,6 +100,17 @@ DEFINE_bool(
     "(scratch), textures and render targets are small, and dropping render "
     "targets mid-frame loses EDRAM contents - full-screen corruption.",
     "Android");
+DEFINE_bool(trace_dump_color0_host, false,
+            "With trace_dump_edram_draws: also dump the raw host image of "
+            "color render target 0 after each dumped draw.",
+            "GPU");
+DEFINE_int32(trace_dump_texture_slot, -1,
+             "With trace_dump_edram_draws: also dump the host texture bound "
+             "to this fetch constant slot after each dumped draw.",
+             "GPU");
+DEFINE_bool(vulkan_debug_reupload_constants, false,
+            "Diagnostic: rewrite every constant buffer for every draw.",
+            "GPU");
 DEFINE_bool(vulkan_debug_clear_textures_after_resolve, false,
             "Diagnostic: after every resolve, wait for the GPU and clear the "
             "whole texture cache (rules out stale textures over resolved "
@@ -6944,6 +6957,98 @@ bool VulkanCommandProcessor::ReadbackEdramForDump(
   return result;
 }
 
+void VulkanCommandProcessor::DumpTextureAfterDraw(
+    uint32_t draw, const std::filesystem::path& dir) {
+  if (cvars::trace_dump_texture_slot >= 0 && texture_cache_) {
+    const uint32_t slot = uint32_t(cvars::trace_dump_texture_slot);
+    VkImage image;
+    uint32_t width, height, vk_format;
+    VkPipelineStageFlags stage_mask;
+    VkAccessFlags access_mask;
+    VkImageLayout layout;
+    if (texture_cache_->DebugGetBindingImage(slot, false, image, width, height,
+                                             vk_format, stage_mask,
+                                             access_mask, layout)) {
+      DumpImageForTrace(
+          image, width, height, stage_mask, access_mask, layout,
+          dir / fmt::format("texture_draw_{:05}_slot{}_{}x{}_vkfmt{}.bin",
+                            draw, slot, width, height, vk_format));
+    }
+  }
+  if (cvars::trace_dump_color0_host && render_target_cache_) {
+    VkImage image;
+    uint32_t width, height, vk_format;
+    VkPipelineStageFlags stage_mask;
+    VkAccessFlags access_mask;
+    VkImageLayout layout;
+    if (render_target_cache_->DebugGetColor0Image(image, width, height,
+                                                  vk_format, stage_mask,
+                                                  access_mask, layout)) {
+      DumpImageForTrace(
+          image, width, height, stage_mask, access_mask, layout,
+          dir / fmt::format("rt0_draw_{:05}_{}x{}_vkfmt{}.bin", draw, width,
+                            height, vk_format));
+    }
+  }
+}
+
+void VulkanCommandProcessor::DumpImageForTrace(
+    VkImage image, uint32_t width, uint32_t height,
+    VkPipelineStageFlags stage_mask, VkAccessFlags access_mask,
+    VkImageLayout layout, const std::filesystem::path& path) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // Upper bound: 16 bytes per texel.
+  const VkDeviceSize buffer_size = VkDeviceSize(width) * height * 16;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, buffer_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, buffer, memory)) {
+    return;
+  }
+  if (BeginSubmission(true)) {
+    const VkImageSubresourceRange range =
+        ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+    PushImageMemoryBarrier(image, range, stage_mask,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, access_mask,
+                           VK_ACCESS_TRANSFER_READ_BIT, layout,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    SubmitBarriers(true);
+    VkBufferImageCopy region = {};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {width, height, 1};
+    deferred_command_buffer_.CmdVkCopyImageToBuffer(
+        image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+    PushImageMemoryBarrier(image, range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           stage_mask, VK_ACCESS_TRANSFER_READ_BIT, access_mask,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layout);
+    PushBufferMemoryBarrier(buffer, 0, VK_WHOLE_SIZE,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_HOST_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_ACCESS_HOST_READ_BIT);
+    SubmitBarriers(true);
+    if (EndSubmission(false) && AwaitAllQueueOperationsCompletion()) {
+      void* mapping = nullptr;
+      if (dfn.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapping) ==
+          VK_SUCCESS) {
+        FILE* file = xe::filesystem::OpenFile(path, "wb");
+        if (file) {
+          std::fwrite(mapping, 1, size_t(buffer_size), file);
+          std::fclose(file);
+        }
+        dfn.vkUnmapMemory(device, memory);
+      }
+    }
+  }
+  AwaitAllQueueOperationsCompletion();
+  dfn.vkDestroyBuffer(device, buffer, nullptr);
+  dfn.vkFreeMemory(device, memory, nullptr);
+}
+
 void VulkanCommandProcessor::InitializeTrace() {
   CommandProcessor::InitializeTrace();
 
@@ -8482,6 +8587,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   const VkDevice device = vulkan_device->device();
 
   // Invalidate constant buffers and descriptors for changed data.
+  if (cvars::vulkan_debug_reupload_constants) {
+    current_constant_buffers_up_to_date_ = 0;
+  }
 
   // Float constants.
   // These are the constant base addresses/ranges for shaders.

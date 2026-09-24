@@ -127,6 +127,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Records a bit-exact 10 MiB EDRAM transfer for the diagnostic save-state
   // path. The command processor owns the staging buffers and submission.
   bool SaveStateSubmitEdramDownload(VkBuffer destination);
+  // Diagnostic: host image of the render target bound to color output 0 by
+  // the last Update, with its current synchronization state.
+  bool DebugGetColor0Image(VkImage& image, uint32_t& width, uint32_t& height,
+                           uint32_t& vk_format, VkPipelineStageFlags& stage_mask,
+                           VkAccessFlags& access_mask,
+                           VkImageLayout& layout) const;
   void SaveStateSubmitEdramUpload(VkBuffer source);
 
   // Performs the resolve to a shared memory area according to the current

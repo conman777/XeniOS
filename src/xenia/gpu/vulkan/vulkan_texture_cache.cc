@@ -3264,6 +3264,35 @@ VulkanTextureCache::VulkanTextureCache(
       command_processor_(command_processor),
       guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {}
 
+bool VulkanTextureCache::DebugGetBindingImage(
+    uint32_t fetch_constant_index, bool is_signed, VkImage& image,
+    uint32_t& width, uint32_t& height, uint32_t& vk_format,
+    VkPipelineStageFlags& stage_mask, VkAccessFlags& access_mask,
+    VkImageLayout& layout) {
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    return false;
+  }
+  Texture* texture = (is_signed && binding->texture_signed)
+                         ? binding->texture_signed
+                         : binding->texture;
+  if (!texture) {
+    return false;
+  }
+  auto& vulkan_texture = *static_cast<VulkanTexture*>(texture);
+  const TextureKey& key = vulkan_texture.key();
+  const HostFormatPair& host_format_pair = GetHostFormatPair(key);
+  vk_format = uint32_t(is_signed ? host_format_pair.format_signed.format
+                                 : host_format_pair.format_unsigned.format);
+  image = vulkan_texture.image();
+  width = key.GetWidth();
+  height = key.GetHeight();
+  // Called right after a draw that sampled it, so it's in the sampled state.
+  GetTextureUsageMasks(VulkanTexture::Usage::kGuestShaderSampled, stage_mask,
+                       access_mask, layout);
+  return true;
+}
+
 VulkanTextureCache::AllocatorMemoryUsage
 VulkanTextureCache::GetAllocatorMemoryUsage() const {
   AllocatorMemoryUsage result;

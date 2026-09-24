@@ -91,6 +91,14 @@ class VulkanTextureCache final : public TextureCache {
   };
   AllocatorMemoryUsage GetAllocatorMemoryUsage() const;
 
+  // Diagnostic: the host image of the texture bound to a fetch constant and
+  // the synchronization state it is in after being sampled by a draw.
+  bool DebugGetBindingImage(uint32_t fetch_constant_index, bool is_signed,
+                            VkImage& image, uint32_t& width, uint32_t& height,
+                            uint32_t& vk_format,
+                            VkPipelineStageFlags& stage_mask,
+                            VkAccessFlags& access_mask, VkImageLayout& layout);
+
   void BeginSubmission(uint64_t new_submission_index) override;
 
   // Must be called within a frame - creates and untiles textures needed by
