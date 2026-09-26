@@ -71,6 +71,11 @@ DEFINE_bool(spirv_guest_zero_multiply_nan_to_zero, kZeroMultiplyNanToZeroDefault
             "replacing NaN products with +0 (cheaper; differs only for NaN "
             "operands and the sign of zero).",
             "GPU");
+DEFINE_int32(spirv_texture_sign_mode, 0,
+            "How texture fetches that may need unsigned and signed views are "
+            "sampled: 0 - each in a branch on the fetch constant, 1 - both "
+            "unconditionally (no branches), 2 - diagnostic, unsigned only.",
+            "GPU");
 DEFINE_bool(spirv_guest_zero_multiply_vector_mul, true,
             "Diagnostic: apply the zero multiplication rule to vector mul/mad.",
             "GPU");

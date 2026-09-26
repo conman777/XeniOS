@@ -11,6 +11,7 @@
 
 #include <climits>
 #include <cmath>
+#include <memory>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
@@ -20,6 +21,7 @@
 #include "xenia/gpu/spirv_compatibility.h"
 
 DECLARE_int32(spirv_debug_ps_output);
+DECLARE_int32(spirv_texture_sign_mode);
 
 namespace xe {
 namespace gpu {
@@ -2655,9 +2657,20 @@ void SpirvShaderTranslator::SampleTexture(
     spv::Id& result_signed_out, spv::Id lerp_factor,
     spv::Id lerp_first_unsigned, spv::Id lerp_first_signed) {
   for (uint32_t i = 0; i < 2; ++i) {
-    SpirvBuilder::IfBuilder sign_if(i ? is_any_signed : is_any_unsigned,
-                                    spv::SelectionControlDontFlattenMask,
-                                    *builder_);
+    // 1: sample both views unconditionally (no branches, so samples can be
+    // issued together; the caller selects per component), 2: diagnostic -
+    // unsigned only.
+    const int32_t sign_mode = cvars::spirv_texture_sign_mode;
+    if (sign_mode == 2 && i) {
+      result_signed_out = const_float4_0_;
+      continue;
+    }
+    std::unique_ptr<SpirvBuilder::IfBuilder> sign_if;
+    if (sign_mode == 0) {
+      sign_if = std::make_unique<SpirvBuilder::IfBuilder>(
+          i ? is_any_signed : is_any_unsigned,
+          spv::SelectionControlDontFlattenMask, *builder_);
+    }
     spv::Id sign_result;
     {
       spv::Id image = i ? image_signed : image_unsigned;
@@ -2682,11 +2695,15 @@ void SpirvShaderTranslator::SampleTexture(
         }
       }
     }
-    sign_if.makeEndIf();
+    if (!sign_if) {
+      (i ? result_signed_out : result_unsigned_out) = sign_result;
+      continue;
+    }
+    sign_if->makeEndIf();
     // This may overwrite the first lerp endpoint for the sign (such usage of
     // this function is allowed).
     (i ? result_signed_out : result_unsigned_out) =
-        sign_if.createMergePhi(sign_result, const_float4_0_);
+        sign_if->createMergePhi(sign_result, const_float4_0_);
   }
 }
 
