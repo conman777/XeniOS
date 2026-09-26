@@ -7,6 +7,7 @@ import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -46,6 +47,8 @@ public class EmulatorActivity extends WindowedAppActivity {
 
     private native void resetGamepadStateNative();
 
+    private native long getGuestFrameCountNative();
+
     @Override
     protected String getWindowedAppIdentifier() {
         return "xenia";
@@ -83,11 +86,15 @@ public class EmulatorActivity extends WindowedAppActivity {
             }
         }
         super.onCreate(savedInstanceState);
+        // Cutscenes and loading run without input; don't let the screen time
+        // out (pausing the activity and dropping GPU caches) mid-game.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (!isWindowedAppReady()) {
             return;
         }
 
         setContentView(R.layout.activity_emulator);
+        startFpsCounter();
         setWindowSurfaceView(findViewById(R.id.emulator_surface_view));
         configureDebugDiagnostics();
         if (BuildConfig.DEBUG) {
@@ -100,6 +107,42 @@ public class EmulatorActivity extends WindowedAppActivity {
     // <external-files>/android_state_cmd.txt; the file is consumed and the
     // native result is written to android_state_result.txt. Same native path
     // as Tools -> Capture + Save State / Restore Saved State.
+    // In-game FPS overlay: guest frames presented per second, updated twice
+    // a second.
+    private final android.os.Handler mFpsHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private long mFpsLastFrames = -1;
+    private long mFpsLastNanos;
+
+    private void startFpsCounter() {
+        final TextView fpsView = findViewById(R.id.fps_counter);
+        if (fpsView == null) {
+            return;
+        }
+        mFpsHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                long frames;
+                try {
+                    frames = getGuestFrameCountNative();
+                } catch (UnsatisfiedLinkError e) {
+                    fpsView.setVisibility(View.GONE);
+                    return;
+                }
+                final long now = System.nanoTime();
+                if (mFpsLastFrames >= 0 && now > mFpsLastNanos) {
+                    final double fps = (frames - mFpsLastFrames) * 1e9
+                            / (now - mFpsLastNanos);
+                    fpsView.setText(String.format(java.util.Locale.US,
+                            "FPS %.1f", fps));
+                }
+                mFpsLastFrames = frames;
+                mFpsLastNanos = now;
+                mFpsHandler.postDelayed(this, 500L);
+            }
+        });
+    }
+
     private final android.os.Handler mStateCommandHandler =
             new android.os.Handler(android.os.Looper.getMainLooper());
     private boolean mStateCommandBusy;

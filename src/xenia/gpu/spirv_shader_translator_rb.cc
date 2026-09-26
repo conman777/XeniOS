@@ -904,12 +904,13 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       spv::Id color = builder_->createLoad(color_variable, spv::NoPrecision);
       // Diagnostic: output a guest register (or a float constant with -1-N)
       // instead of oC0 for the pixel shader with the given ucode hash.
-      if (color_target_index == 0 && !cvars::spirv_debug_ps_hash.empty() &&
-          std::strtoull(cvars::spirv_debug_ps_hash.c_str(), nullptr, 16) ==
-              current_shader().ucode_data_hash()) {
+      const bool debug_all_ps = cvars::spirv_debug_ps_hash == "all";
+      if ((color_target_index == 0 || debug_all_ps) && IsDebugPsTarget()) {
         const int32_t source = cvars::spirv_debug_ps_output;
-        XELOGI("spirv_debug_ps: replacing oC0 of {:016X} with source {}",
-               current_shader().ucode_data_hash(), source);
+        if (!debug_all_ps) {
+          XELOGI("spirv_debug_ps: replacing oC0 of {:016X} with source {}",
+                 current_shader().ucode_data_hash(), source);
+        }
         if (source == -800 && input_fragment_coordinates_ != spv::NoResult) {
           color = builder_->createLoad(input_fragment_coordinates_,
                                        spv::NoPrecision);

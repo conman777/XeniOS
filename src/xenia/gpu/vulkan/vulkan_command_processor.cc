@@ -108,6 +108,19 @@ DEFINE_int32(trace_dump_texture_slot, -1,
              "With trace_dump_edram_draws: also dump the host texture bound "
              "to this fetch constant slot after each dumped draw.",
              "GPU");
+DEFINE_uint32(readback_resolve_max_kb, 0,
+            "Only copy resolves up to this size (KB) back to guest memory for "
+            "the CPU (0 = all). Games read back small results such as exposure "
+            "luminance, not whole render targets.",
+            "GPU");
+DEFINE_bool(vulkan_debug_tiny_scissor, false,
+            "Diagnostic: clamp guest draw scissors to 1x1 pixel to measure "
+            "vertex cost without rasterization.",
+            "Vulkan");
+DEFINE_bool(vulkan_log_render_pass_breaks, false,
+            "Diagnostic: record the call stack of every render pass end and "
+            "log the most frequent ones (module offsets) with each summary.",
+            "Vulkan");
 DEFINE_bool(vulkan_debug_sync_after_request_textures, false,
             "Diagnostic: submit and wait for the GPU after texture requests "
             "on every draw.",
@@ -120,6 +133,80 @@ DEFINE_bool(vulkan_debug_clear_textures_after_resolve, false,
             "whole texture cache (rules out stale textures over resolved "
             "memory). Very slow.",
             "GPU");
+
+#if XE_PLATFORM_ANDROID
+#include <jni.h>
+// Guest frames presented, for the in-game FPS overlay.
+static std::atomic<uint64_t> g_android_guest_frame_count{0};
+extern "C" JNIEXPORT jlong JNICALL
+Java_jp_xenios_emulator_EmulatorActivity_getGuestFrameCountNative(JNIEnv*,
+                                                                  jobject) {
+  return jlong(g_android_guest_frame_count.load(std::memory_order_relaxed));
+}
+#endif  // XE_PLATFORM_ANDROID
+
+#if XE_PLATFORM_ANDROID
+#include <dlfcn.h>
+#include <unwind.h>
+#include <map>
+namespace {
+struct RenderPassBreakBacktrace {
+  uintptr_t pcs[6];
+  size_t count;
+};
+_Unwind_Reason_Code RenderPassBreakUnwind(_Unwind_Context* context,
+                                          void* arg) {
+  auto& bt = *static_cast<RenderPassBreakBacktrace*>(arg);
+  uintptr_t pc = _Unwind_GetIP(context);
+  if (pc && bt.count < 6) {
+    bt.pcs[bt.count++] = pc;
+  }
+  return bt.count < 6 ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+std::map<std::array<uintptr_t, 5>, uint64_t>& RenderPassBreakCensus(
+    int kind = 0) {
+  static std::map<std::array<uintptr_t, 5>, uint64_t> census[2];
+  return census[kind];
+}
+void RecordRenderPassBreak(int kind = 0) {
+  RenderPassBreakBacktrace bt = {};
+  _Unwind_Backtrace(RenderPassBreakUnwind, &bt);
+  std::array<uintptr_t, 5> key = {};
+  // Skip this function itself.
+  for (size_t i = 1; i < bt.count && i <= 5; ++i) {
+    key[i - 1] = bt.pcs[i];
+  }
+  ++RenderPassBreakCensus(kind)[key];
+}
+void LogRenderPassBreakCensus(uint32_t swaps, int kind = 0) {
+  auto& census = RenderPassBreakCensus(kind);
+  std::vector<std::pair<uint64_t, std::array<uintptr_t, 5>>> sorted;
+  for (auto& entry : census) {
+    sorted.emplace_back(entry.second, entry.first);
+  }
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (size_t i = 0; i < std::min(sorted.size(), size_t(12)); ++i) {
+    std::string frames;
+    for (uintptr_t pc : sorted[i].second) {
+      if (!pc) {
+        break;
+      }
+      Dl_info info = {};
+      uintptr_t offset = pc;
+      if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_fbase) {
+        offset = pc - reinterpret_cast<uintptr_t>(info.dli_fbase);
+      }
+      frames += fmt::format(" 0x{:X}", offset);
+    }
+    XELOGI("HaloReach {} per_swap={:.1f} frames={}",
+           kind ? "RPBarrier" : "RPBreak",
+           swaps ? double(sorted[i].first) / swaps : 0.0, frames);
+  }
+  census.clear();
+}
+}  // namespace
+#endif  // XE_PLATFORM_ANDROID
 
 namespace xe {
 namespace gpu {
@@ -1183,7 +1270,7 @@ bool VulkanCommandProcessor::SetupContext() {
       render_target_cache_->GetPath() ==
       RenderTargetCache::Path::kPixelShaderInterlock;
   VkDescriptorSetLayoutBinding
-      shared_memory_and_edram_descriptor_set_layout_bindings[2];
+      shared_memory_and_edram_descriptor_set_layout_bindings[3];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1216,6 +1303,19 @@ bool VulkanCommandProcessor::SetupContext() {
   } else {
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
   }
+  const bool shared_memory_texel_buffer =
+      shared_memory_->texel_buffer_view() != VK_NULL_HANDLE;
+  if (shared_memory_texel_buffer) {
+    VkDescriptorSetLayoutBinding& texel_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info
+                 .bindingCount++];
+    texel_binding.binding = 2;
+    texel_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    texel_binding.descriptorCount = 1;
+    texel_binding.stageFlags = guest_shader_stages;
+    texel_binding.pImmutableSamplers = nullptr;
+  }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info,
           nullptr,
@@ -1245,17 +1345,20 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   // Shared memory and EDRAM common bindings.
-  VkDescriptorPoolSize descriptor_pool_sizes[1];
+  VkDescriptorPoolSize descriptor_pool_sizes[2];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
       shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock);
+  descriptor_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+  descriptor_pool_sizes[1].descriptorCount = 1;
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType =
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   descriptor_pool_create_info.pNext = nullptr;
   descriptor_pool_create_info.flags = 0;
   descriptor_pool_create_info.maxSets = 1;
-  descriptor_pool_create_info.poolSizeCount = 1;
+  descriptor_pool_create_info.poolSizeCount =
+      shared_memory_texel_buffer ? 2 : 1;
   descriptor_pool_create_info.pPoolSizes = descriptor_pool_sizes;
   if (dfn.vkCreateDescriptorPool(device, &descriptor_pool_create_info, nullptr,
                                  &shared_memory_and_edram_descriptor_pool_) !=
@@ -1295,7 +1398,25 @@ bool VulkanCommandProcessor::SetupContext() {
         shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[2];
+  VkWriteDescriptorSet write_descriptor_sets[3];
+  uint32_t write_descriptor_set_count =
+      1 + uint32_t(edram_fragment_shader_interlock);
+  VkBufferView shared_memory_texel_buffer_view =
+      shared_memory_->texel_buffer_view();
+  if (shared_memory_texel_buffer) {
+    VkWriteDescriptorSet& write_texel =
+        write_descriptor_sets[write_descriptor_set_count++];
+    write_texel.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_texel.pNext = nullptr;
+    write_texel.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_texel.dstBinding = 2;
+    write_texel.dstArrayElement = 0;
+    write_texel.descriptorCount = 1;
+    write_texel.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    write_texel.pImageInfo = nullptr;
+    write_texel.pBufferInfo = nullptr;
+    write_texel.pTexelBufferView = &shared_memory_texel_buffer_view;
+  }
   VkWriteDescriptorSet& write_descriptor_set_shared_memory =
       write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType =
@@ -1331,8 +1452,7 @@ bool VulkanCommandProcessor::SetupContext() {
     write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
     write_descriptor_set_edram.pTexelBufferView = nullptr;
   }
-  dfn.vkUpdateDescriptorSets(device,
-                             1 + uint32_t(edram_fragment_shader_interlock),
+  dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count,
                              write_descriptor_sets, 0, nullptr);
 
   // Swap objects.
@@ -1806,6 +1926,8 @@ bool VulkanCommandProcessor::SetupContext() {
       dfn.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1,
                                    &swap_apply_gamma_pipeline_create_info,
                                    nullptr, &swap_apply_gamma_pwl_pipeline_);
+  DeferredCommandBuffer::NameComputePipeline(swap_apply_gamma_pwl_pipeline_,
+                                             "gamma_pwl");
   swap_apply_gamma_pipeline_create_info.stage.module =
       swap_apply_gamma_table_fxaa_luma_shader_module;
   VkResult swap_apply_gamma_pipeline_256_entry_table_fxaa_luma_create_result =
@@ -2990,6 +3112,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     static uint64_t android_swap_last_summary_ms = 0;
 
     ++android_swap_total;
+    g_android_guest_frame_count.fetch_add(1, std::memory_order_relaxed);
     if (guest_output_refreshed) {
       ++android_swap_refreshed_total;
     }
@@ -3025,6 +3148,126 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           pipeline_stats.live, pipeline_stats.placeholders,
           pipeline_stats.null_handles, pipeline_stats.queued,
           pipeline_stats.busy, pipeline_stats.deferred);
+      {
+        static DeferredCommandBuffer::WorkStats last_work;
+        const DeferredCommandBuffer::WorkStats& work =
+            DeferredCommandBuffer::work_stats();
+        double per_swap = delta_swaps ? 1.0 / delta_swaps : 0.0;
+        XELOGI(
+            "HaloReach GpuWork per_swap render_passes={:.1f} rp_mpix={:.1f} "
+            "draws={:.1f} dispatches={:.1f} barriers={:.1f} copies={:.1f} "
+            "clears={:.1f} hoisted_uploads={:.1f} draw_use skip={:.1f} "
+            "raw={:.1f} waw_or_war={:.1f} other={:.1f} readback "
+            "copies={:.1f} kb={:.0f} waits={:.2f}",
+            (work.render_passes - last_work.render_passes) * per_swap,
+            (work.render_pass_pixels - last_work.render_pass_pixels) *
+                per_swap / 1e6,
+            (work.draws - last_work.draws) * per_swap,
+            (work.dispatches - last_work.dispatches) * per_swap,
+            (work.barriers - last_work.barriers) * per_swap,
+            (work.copies - last_work.copies) * per_swap,
+            (work.clears - last_work.clears) * per_swap,
+            (work.hoisted_uploads - last_work.hoisted_uploads) * per_swap,
+            (work.draw_use_skipped - last_work.draw_use_skipped) * per_swap,
+            (work.draw_use_raw - last_work.draw_use_raw) * per_swap,
+            (work.draw_use_war - last_work.draw_use_war) * per_swap,
+            (work.draw_use_ineligible - last_work.draw_use_ineligible) *
+                per_swap,
+            (work.readback_copies - last_work.readback_copies) * per_swap,
+            (work.readback_bytes - last_work.readback_bytes) * per_swap /
+                1024.0,
+            (work.readback_waits - last_work.readback_waits) * per_swap);
+        last_work = work;
+        static DeferredCommandBuffer::GpuTiming last_timing;
+        const DeferredCommandBuffer::GpuTiming& timing =
+            DeferredCommandBuffer::gpu_timing();
+        if (timing.submissions != last_timing.submissions) {
+          std::string buckets;
+          static const char* const kBucketNames[] = {"0", "1", "2-5",
+                                                     "6-20", "21-100", "100+"};
+          for (size_t i = 0; i < DeferredCommandBuffer::kGpuTimingBuckets;
+               ++i) {
+            buckets += fmt::format(
+                " d{}={:.1f}ms/{:.0f}", kBucketNames[i],
+                (timing.bucket_ms[i] - last_timing.bucket_ms[i]) * per_swap,
+                (timing.bucket_passes[i] - last_timing.bucket_passes[i]) *
+                    per_swap);
+          }
+          XELOGI(
+              "HaloReach GpuTime per_swap total={:.1f}ms glue={:.1f}ms "
+              "(dispatch={:.1f}ms/{:.0f} copy={:.1f}ms/{:.0f}) "
+              "submissions={:.2f} passes(ms/count):{}",
+              (timing.total_ms - last_timing.total_ms) * per_swap,
+              (timing.glue_ms - last_timing.glue_ms) * per_swap,
+              (timing.dispatch_ms - last_timing.dispatch_ms) * per_swap,
+              double(timing.dispatches - last_timing.dispatches) * per_swap,
+              (timing.copy_ms - last_timing.copy_ms) * per_swap,
+              double(timing.copies - last_timing.copies) * per_swap,
+              (timing.submissions - last_timing.submissions) * per_swap,
+              buckets);
+          last_timing = timing;
+          // Top compute pipelines by GPU time since the last summary.
+          static std::unordered_map<VkPipeline,
+                                    DeferredCommandBuffer::DispatchTiming>
+              last_dispatch;
+          std::vector<std::pair<double, VkPipeline>> dispatch_sorted;
+          for (const auto& entry : DeferredCommandBuffer::dispatch_timing()) {
+            double ms = entry.second.ms - last_dispatch[entry.first].ms;
+            if (ms > 0.0) {
+              dispatch_sorted.emplace_back(ms, entry.first);
+            }
+          }
+          std::sort(dispatch_sorted.begin(), dispatch_sorted.end(),
+                    [](const auto& a, const auto& b) { return a.first > b.first; });
+          std::string dispatch_text;
+          for (size_t i = 0; i < std::min(dispatch_sorted.size(), size_t(8));
+               ++i) {
+            VkPipeline pipeline = dispatch_sorted[i].second;
+            auto name_it =
+                DeferredCommandBuffer::compute_pipeline_names().find(pipeline);
+            uint64_t count =
+                DeferredCommandBuffer::dispatch_timing()[pipeline].count -
+                last_dispatch[pipeline].count;
+            dispatch_text += fmt::format(
+                " {}={:.2f}ms/{:.1f}",
+                name_it != DeferredCommandBuffer::compute_pipeline_names().end()
+                    ? name_it->second
+                    : fmt::format("{:X}", uint64_t(pipeline)),
+                dispatch_sorted[i].first * per_swap, double(count) * per_swap);
+          }
+          last_dispatch = DeferredCommandBuffer::dispatch_timing();
+          XELOGI("HaloReach GpuDispatch per_swap:{}", dispatch_text);
+          static std::unordered_map<std::string,
+                                    DeferredCommandBuffer::DispatchTiming>
+              last_pass;
+          std::vector<std::pair<double, std::string>> pass_sorted;
+          for (const auto& entry : DeferredCommandBuffer::pass_timing()) {
+            double ms = entry.second.ms - last_pass[entry.first].ms;
+            if (ms > 0.0) {
+              pass_sorted.emplace_back(ms, entry.first);
+            }
+          }
+          std::sort(pass_sorted.begin(), pass_sorted.end(),
+                    [](const auto& a, const auto& b) { return a.first > b.first; });
+          for (size_t i = 0; i < std::min(pass_sorted.size(), size_t(30));
+               ++i) {
+            const auto& now = DeferredCommandBuffer::pass_timing()[pass_sorted[i].second];
+            const auto& before = last_pass[pass_sorted[i].second];
+            XELOGI("HaloReach GpuPass {:.2f}ms count={:.1f} draws={:.1f} {}",
+                   pass_sorted[i].first * per_swap,
+                   double(now.count - before.count) * per_swap,
+                   double(now.draws - before.draws) * per_swap,
+                   pass_sorted[i].second);
+          }
+          last_pass = DeferredCommandBuffer::pass_timing();
+        }
+#if XE_PLATFORM_ANDROID
+        if (cvars::vulkan_log_render_pass_breaks) {
+          LogRenderPassBreakCensus(delta_swaps);
+          LogRenderPassBreakCensus(delta_swaps, 1);
+        }
+#endif
+      }
       if (pipeline_cache_ &&
           GetAndroidHaloExperiment().log_pipeline_key_census) {
         pipeline_cache_->LogPipelineKeyCensus("swap");
@@ -3164,6 +3407,11 @@ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
       src_queue_family_index == dst_queue_family_index) {
     return false;
   }
+#if XE_PLATFORM_ANDROID
+  if (cvars::vulkan_log_render_pass_breaks && in_render_pass_) {
+    RecordRenderPassBreak(1);
+  }
+#endif
 
   // Separate different barriers for overlapping buffer ranges into different
   // pipeline barrier commands.
@@ -3223,6 +3471,11 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
       src_queue_family_index == dst_queue_family_index) {
     return false;
   }
+#if XE_PLATFORM_ANDROID
+  if (cvars::vulkan_log_render_pass_breaks && in_render_pass_) {
+    RecordRenderPassBreak(1);
+  }
+#endif
 
   // Separate different barriers for overlapping image subresource ranges into
   // different pipeline barrier commands.
@@ -3360,6 +3613,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   // End current render pass/rendering if active.
   if (in_render_pass_) {
+#if XE_PLATFORM_ANDROID
+    if (cvars::vulkan_log_render_pass_breaks) {
+      RecordRenderPassBreak();
+    }
+#endif
     if (use_dynamic_rendering) {
       deferred_command_buffer_.CmdVkEndRendering();
     } else {
@@ -3448,6 +3706,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   // End current render pass/rendering if active.
   if (in_render_pass_) {
+#if XE_PLATFORM_ANDROID
+    if (cvars::vulkan_log_render_pass_breaks) {
+      RecordRenderPassBreak();
+    }
+#endif
     if (use_dynamic_rendering) {
       deferred_command_buffer_.CmdVkEndRendering();
     } else {
@@ -3531,6 +3794,11 @@ void VulkanCommandProcessor::EndRenderPass() {
   if (!in_render_pass_) {
     return;
   }
+#if XE_PLATFORM_ANDROID
+  if (cvars::vulkan_log_render_pass_breaks) {
+    RecordRenderPassBreak();
+  }
+#endif
   // Use current_render_pass_ to determine which end command to use.
   // VK_NULL_HANDLE means we used dynamic rendering, otherwise traditional.
   if (current_render_pass_ == VK_NULL_HANDLE) {
@@ -3861,7 +4129,13 @@ void VulkanCommandProcessor::SetViewport(const VkViewport& viewport) {
   }
 }
 
-void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
+void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor_in) {
+  VkRect2D scissor = scissor_in;
+  if (cvars::vulkan_debug_tiny_scissor) {
+    // Diagnostic: keep vertex work, rasterize (almost) nothing.
+    scissor.extent.width = std::min(scissor.extent.width, 1u);
+    scissor.extent.height = std::min(scissor.extent.height, 1u);
+  }
   if (!dynamic_scissor_update_needed_) {
     dynamic_scissor_update_needed_ |=
         dynamic_scissor_.offset.x != scissor.offset.x;
@@ -3915,7 +4189,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     constexpr size_t kBacklogThrottleResume = 4;
     constexpr uint64_t kBacklogThrottleMaxMillis = 6;
     VulkanPipelineCache::CreationStats throttle_stats =
-        pipeline_cache_->GetCreationStats();
+        pipeline_cache_->GetCreationQueueStats();
     if (throttle_stats.queued >= kBacklogThrottleThreshold) {
       const uint64_t throttle_deadline_ms =
           xe::Clock::QueryHostUptimeMillis() + kBacklogThrottleMaxMillis;
@@ -3933,7 +4207,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           break;
         }
         xe::threading::Sleep(std::chrono::milliseconds(1));
-        throttle_stats = pipeline_cache_->GetCreationStats();
+        throttle_stats = pipeline_cache_->GetCreationQueueStats();
       }
     }
   }
@@ -4021,7 +4295,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       android_pipeline_pressure_deadline_ms_ = android_kgsl_now_millis + 5000;
     }
     const VulkanPipelineCache::CreationStats creation_stats =
-        pipeline_cache_->GetCreationStats();
+        pipeline_cache_->GetCreationQueueStats();
     const bool creating = creation_stats.queued || creation_stats.busy;
     skip_kgsl_reclaim_for_growth =
         creating && !android_kgsl_emergency_pressure &&
@@ -5197,12 +5471,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // when memexports should be awaited instead of inserting the barrier in Use
   // every time if memory export was done in the previous draw?
   if (memexport_extent_start < memexport_extent_end) {
+    static thread_local std::vector<std::pair<uint32_t, uint32_t>>
+        memexport_exact_ranges;
+    memexport_exact_ranges.clear();
+    for (const draw_util::MemExportRange& memexport_range :
+         memexport_ranges_) {
+      memexport_exact_ranges.emplace_back(
+          memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
+    }
     shared_memory_->Use(
         VulkanSharedMemory::Usage::kGuestDrawReadWrite,
         std::make_pair(memexport_extent_start,
-                       memexport_extent_end - memexport_extent_start));
+                       memexport_extent_end - memexport_extent_start),
+        true, &memexport_exact_ranges);
   } else {
-    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+    shared_memory_->Use(VulkanSharedMemory::Usage::kRead, {}, true);
   }
 
   // After all commands that may dispatch, copy or insert barriers, submit the
@@ -5265,6 +5548,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     deferred_command_buffer_.CmdVkDrawIndexed(
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
   }
+  shared_memory_->CommitPendingPassReads();
 
   // Pop debug marker for draw call.
   PopDebugMarker();
@@ -5747,7 +6031,9 @@ bool VulkanCommandProcessor::IssueCopy() {
   }
 #endif  // XE_PLATFORM_ANDROID
   if (readback_mode != ReadbackResolveMode::kDisabled &&
-      !texture_cache_->IsDrawResolutionScaled() && written_length > 0) {
+      !texture_cache_->IsDrawResolutionScaled() && written_length > 0 &&
+      (!cvars::readback_resolve_max_kb ||
+       written_length <= cvars::readback_resolve_max_kb * 1024)) {
 #if XE_PLATFORM_ANDROID
     ++android_resolve_unscaled_readback_total;
 #endif  // XE_PLATFORM_ANDROID
@@ -5944,6 +6230,7 @@ bool VulkanCommandProcessor::IssueCopy() {
     if (use_delayed_sync && (rb.buffers[read_index] == VK_NULL_HANDLE ||
                              written_length > rb.sizes[read_index])) {
       is_cache_miss = true;
+      ++DeferredCommandBuffer::work_stats().readback_waits;
       read_index = write_index;
       if (!AwaitAllQueueOperationsCompletion()) {
         XELOGE(
@@ -5969,6 +6256,8 @@ bool VulkanCommandProcessor::IssueCopy() {
       }
 #endif  // XE_PLATFORM_ANDROID
       memory::vastcpy(dest_ptr, readback_ptr, written_length);
+      ++DeferredCommandBuffer::work_stats().readback_copies;
+      DeferredCommandBuffer::work_stats().readback_bytes += written_length;
 #if XE_PLATFORM_ANDROID
       if (android_resolve_stats_log) {
         LogAndroidResolveBufferStats(android_resolve_written_total,
@@ -6487,6 +6776,7 @@ bool VulkanCommandProcessor::IssueCopy() {
                              rb.mapped_data[read_index] == nullptr)) {
       // Cache miss - need to sync and use current buffer
       is_cache_miss = true;
+      ++DeferredCommandBuffer::work_stats().readback_waits;
       read_index = write_index;
       if (!AwaitAllQueueOperationsCompletion()) {
         XELOGE(

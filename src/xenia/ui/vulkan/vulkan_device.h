@@ -118,6 +118,10 @@ class VulkanDevice {
 
     bool samplerMirrorClampToEdge = false;
 
+    // VK_EXT_descriptor_indexing (#162, promoted to 1.2)
+
+    bool shaderStorageBufferArrayNonUniformIndexing = false;
+
     // VK_KHR_uniform_buffer_standard_layout (#253, promoted to 1.2)
 
     bool uniformBufferStandardLayout = false;

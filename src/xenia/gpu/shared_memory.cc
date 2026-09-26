@@ -502,6 +502,14 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
 
 // todo: optimize, an enormous amount of cpu time (1.34%) is spent here.
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+  bool result = RequestRangeImpl(start, length);
+  if (result && length) {
+    OnRangeRequested(start, length);
+  }
+  return result;
+}
+
+bool SharedMemory::RequestRangeImpl(uint32_t start, uint32_t length) {
   if (!length) {
     // Some texture or buffer is empty, for example - safe to draw in this case.
     return true;

@@ -21,6 +21,37 @@
 
 DECLARE_bool(gpu_allow_invalid_upload_range);
 
+// Render pass splitting is expensive on mobile (tiled) GPUs.
+#if XE_PLATFORM_ANDROID
+static constexpr bool kVulkanTiledGpuDefault = true;
+#else
+static constexpr bool kVulkanTiledGpuDefault = false;
+#endif
+
+DEFINE_bool(vulkan_shared_memory_texel_buffer, false,
+            "Read shared memory in shaders (vertex fetch and similar) through "
+            "one R32_UINT uniform texel buffer covering all of it, instead of "
+            "storage buffers. Needs maxTexelBufferElements of 128M.",
+            "Vulkan");
+DEFINE_bool(vulkan_hoist_shared_memory_uploads, kVulkanTiledGpuDefault,
+            "Record CPU-to-GPU shared memory uploads needed by a draw before "
+            "the open render pass instead of ending it, when no draw already "
+            "in the pass read the uploaded range. Avoids splitting render "
+            "passes, which is expensive on mobile GPUs.",
+            "Vulkan");
+DEFINE_bool(vulkan_shared_memory_skip_waw_barriers, kVulkanTiledGpuDefault,
+            "With vulkan_shared_memory_hazard_barriers, don't order guest draws "
+            "whose memexport streams overlap each other (unless something reads "
+            "the data in between). Xenia sees each stream as its whole buffer, "
+            "while draws usually export to different elements of it.",
+            "Vulkan");
+DEFINE_bool(vulkan_shared_memory_hazard_barriers, kVulkanTiledGpuDefault,
+            "Between guest draws, insert shared memory barriers only when a "
+            "draw reads or writes a range memexported since the last barrier, "
+            "or memexports to a range read since then, rather than around "
+            "every memexport draw. Barriers end render passes.",
+            "Vulkan");
+
 DEFINE_bool(vulkan_sparse_shared_memory, true,
             "Enable sparse binding for shared memory emulation. Disabling it "
             "increases video memory usage - a 512 MB buffer is created - but "
@@ -66,6 +97,9 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.usage =
       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+  if (cvars::vulkan_shared_memory_texel_buffer) {
+    buffer_create_info.usage |= VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+  }
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
@@ -182,6 +216,25 @@ bool VulkanSharedMemory::Initialize() {
   last_usage_ = Usage::kTransferDestination;
   last_written_range_ = std::make_pair<uint32_t, uint32_t>(0, 0);
 
+  if (cvars::vulkan_shared_memory_texel_buffer) {
+    VkBufferViewCreateInfo view_create_info = {};
+    view_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+    view_create_info.buffer = buffer_;
+    view_create_info.format = VK_FORMAT_R32_UINT;
+    view_create_info.offset = 0;
+    view_create_info.range = kBufferSize;
+    if (dfn.vkCreateBufferView(device, &view_create_info, nullptr,
+                               &texel_buffer_view_) != VK_SUCCESS) {
+      XELOGW(
+          "Shared memory: Failed to create the texel buffer view, using "
+          "storage buffers for shader reads");
+      texel_buffer_view_ = VK_NULL_HANDLE;
+      OVERRIDE_bool(vulkan_shared_memory_texel_buffer, false);
+    } else {
+      XELOGI("Shared memory: shader reads use an R32_UINT texel buffer");
+    }
+  }
+
   upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
       xe::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize,
@@ -200,6 +253,8 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBufferView, device,
+                                         texel_buffer_view_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, buffer_);
   for (VkDeviceMemory memory : buffer_memory_) {
     dfn.vkFreeMemory(device, memory, nullptr);
@@ -225,12 +280,194 @@ void VulkanSharedMemory::CompletedSubmissionUpdated() {
 
 void VulkanSharedMemory::EndSubmission() { upload_buffer_pool_->FlushWrites(); }
 
-void VulkanSharedMemory::Use(Usage usage,
-                             std::pair<uint32_t, uint32_t> written_range) {
+void VulkanSharedMemory::ResetBarrierHazardTracking() {
+  reads_since_barrier_.clear();
+  reads_since_barrier_overflow_ = false;
+  unsynced_writes_.clear();
+  unsynced_writes_overflow_ = false;
+}
+
+bool VulkanSharedMemory::OverlapsUnsyncedWrites(uint32_t start,
+                                                uint32_t end) const {
+  if (unsynced_writes_overflow_) {
+    return true;
+  }
+  for (const std::pair<uint32_t, uint32_t>& write : unsynced_writes_) {
+    if (write.first < end && start < write.second) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void VulkanSharedMemory::AddUnsyncedWrites(
+    std::pair<uint32_t, uint32_t> written_range,
+    const std::vector<std::pair<uint32_t, uint32_t>>* exact_written_ranges) {
+  if (!written_range.second) {
+    return;
+  }
+  if (exact_written_ranges && !exact_written_ranges->empty()) {
+    for (const std::pair<uint32_t, uint32_t>& range : *exact_written_ranges) {
+      if (unsynced_writes_.size() >= kMaxPassReads) {
+        unsynced_writes_overflow_ = true;
+        return;
+      }
+      unsynced_writes_.emplace_back(range.first, range.first + range.second);
+    }
+    return;
+  }
+  if (unsynced_writes_.size() >= kMaxPassReads) {
+    unsynced_writes_overflow_ = true;
+    return;
+  }
+  unsynced_writes_.emplace_back(written_range.first,
+                                written_range.first + written_range.second);
+}
+
+bool VulkanSharedMemory::DrawHasSharedMemoryHazard(
+    std::pair<uint32_t, uint32_t> written_range,
+    const std::vector<std::pair<uint32_t, uint32_t>>* exact_written_ranges)
+    const {
+  auto is_own_stream = [&](const std::pair<uint32_t, uint32_t>& read) {
+    if (!written_range.second) {
+      return false;
+    }
+    if (exact_written_ranges && !exact_written_ranges->empty()) {
+      for (const std::pair<uint32_t, uint32_t>& range :
+           *exact_written_ranges) {
+        if (read.first == range.first &&
+            read.second == range.first + range.second) {
+          return true;
+        }
+      }
+      return false;
+    }
+    return read.first >= written_range.first &&
+           read.second <= written_range.first + written_range.second;
+  };
+  if (pending_pass_reads_overflow_) {
+    return true;
+  }
+  const uint32_t write_start = written_range.first;
+  const uint32_t write_end = written_range.first + written_range.second;
+  // Read-after-write and write-after-write: anything this draw requested
+  // (vertex and index buffers, its own memexport streams) against writes not
+  // yet made visible.
+  DeferredCommandBuffer::WorkStats& stats = DeferredCommandBuffer::work_stats();
+  for (const std::pair<uint32_t, uint32_t>& read : pending_pass_reads_) {
+    if (cvars::vulkan_shared_memory_skip_waw_barriers && is_own_stream(read)) {
+      continue;
+    }
+    if (OverlapsUnsyncedWrites(read.first, read.second)) {
+      // Own export stream overlapping earlier exports: write-after-write.
+      ++(is_own_stream(read) ? stats.draw_use_war : stats.draw_use_raw);
+      static uint32_t hazard_log_count = 0;
+      if (hazard_log_count < 24) {
+        ++hazard_log_count;
+        std::string writes;
+        for (const std::pair<uint32_t, uint32_t>& write : unsynced_writes_) {
+          if (write.first < read.second && read.first < write.second) {
+            writes += fmt::format(" [{:08X},{:08X})", write.first,
+                                  write.second);
+          }
+        }
+        XELOGI(
+            "SharedMemHazard own={} read=[{:08X},{:08X}) unsynced={} "
+            "overlapping:{}",
+            is_own_stream(read), read.first, read.second,
+            unsynced_writes_.size(), writes);
+      }
+      return true;
+    }
+  }
+  if (!written_range.second) {
+    return false;
+  }
+  // Write-after-read: earlier readers of the range this draw exports to. The
+  // draw's own requests inside its export range are its streams.
+  if (reads_since_barrier_overflow_) {
+    ++stats.draw_use_war;
+    return true;
+  }
+  for (const std::pair<uint32_t, uint32_t>& read : reads_since_barrier_) {
+    if (read.first < write_end && write_start < read.second) {
+      ++stats.draw_use_war;
+      return true;
+    }
+  }
+  for (const std::pair<uint32_t, uint32_t>& read : pending_pass_reads_) {
+    if (!is_own_stream(read) && read.first < write_end &&
+        write_start < read.second) {
+      ++stats.draw_use_war;
+      return true;
+    }
+  }
+  return false;
+}
+
+void VulkanSharedMemory::Use(
+    Usage usage, std::pair<uint32_t, uint32_t> written_range, bool from_draw,
+    const std::vector<std::pair<uint32_t, uint32_t>>* exact_written_ranges) {
+  UseImpl(usage, written_range, from_draw, exact_written_ranges);
+  // A draw's memexport streams are requested like reads, but are writes -
+  // tracked as unsynchronized writes, not as reads of later hazard checks.
+  if (from_draw && written_range.second && exact_written_ranges &&
+      !pending_pass_reads_overflow_) {
+    pending_pass_reads_.erase(
+        std::remove_if(
+            pending_pass_reads_.begin(), pending_pass_reads_.end(),
+            [&](const std::pair<uint32_t, uint32_t>& read) {
+              for (const std::pair<uint32_t, uint32_t>& range :
+                   *exact_written_ranges) {
+                if (read.first == range.first &&
+                    read.second == range.first + range.second) {
+                  return true;
+                }
+              }
+              return false;
+            }),
+        pending_pass_reads_.end());
+  }
+}
+
+void VulkanSharedMemory::UseImpl(
+    Usage usage, std::pair<uint32_t, uint32_t> written_range, bool from_draw,
+    const std::vector<std::pair<uint32_t, uint32_t>>* exact_written_ranges) {
   written_range.first = std::min(written_range.first, kBufferSize);
   written_range.second =
       std::min(written_range.second, kBufferSize - written_range.first);
   assert_true(usage != Usage::kRead || !written_range.second);
+  if (from_draw && cvars::vulkan_shared_memory_hazard_barriers &&
+      cvars::vulkan_hoist_shared_memory_uploads &&
+      (last_usage_ == Usage::kRead ||
+       last_usage_ == Usage::kGuestDrawReadWrite) &&
+      (usage == Usage::kRead || usage == Usage::kGuestDrawReadWrite) &&
+      !DrawHasSharedMemoryHazard(written_range, exact_written_ranges)) {
+    if (written_range.second) {
+      // Stay in (or enter) the read-write state without a barrier; a later
+      // barrier covers the union of the unsynchronized writes.
+      last_usage_ = Usage::kGuestDrawReadWrite;
+      AddUnsyncedWrites(written_range, exact_written_ranges);
+      if (last_written_range_.second) {
+        uint32_t start = std::min(last_written_range_.first,
+                                  written_range.first);
+        uint32_t end = std::max(
+            last_written_range_.first + last_written_range_.second,
+            written_range.first + written_range.second);
+        last_written_range_ = std::make_pair(start, end - start);
+      } else {
+        last_written_range_ = written_range;
+      }
+    }
+    ++DeferredCommandBuffer::work_stats().draw_use_skipped;
+    return;
+  }
+  if (from_draw && !((last_usage_ == Usage::kRead ||
+                       last_usage_ == Usage::kGuestDrawReadWrite) &&
+                      (usage == Usage::kRead ||
+                       usage == Usage::kGuestDrawReadWrite))) {
+    ++DeferredCommandBuffer::work_stats().draw_use_ineligible;
+  }
   if (last_usage_ != usage || last_written_range_.second) {
     VkPipelineStageFlags src_stage_mask, dst_stage_mask;
     VkAccessFlags src_access_mask, dst_access_mask;
@@ -254,8 +491,10 @@ void VulkanSharedMemory::Use(Usage usage,
         buffer_, offset, size, src_stage_mask, dst_stage_mask, src_access_mask,
         dst_access_mask, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         false);
+    ResetBarrierHazardTracking();
   }
   last_written_range_ = written_range;
+  AddUnsyncedWrites(written_range, exact_written_ranges);
 }
 
 bool VulkanSharedMemory::InitializeTraceSubmitDownloads(bool* capture_success) {
@@ -407,6 +646,66 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(
   return true;
 }
 
+void VulkanSharedMemory::OnRangeRequested(uint32_t start, uint32_t length) {
+  if (!cvars::vulkan_hoist_shared_memory_uploads) {
+    return;
+  }
+  if (pending_pass_reads_.size() >= kMaxPassReads) {
+    pending_pass_reads_overflow_ = true;
+    return;
+  }
+  pending_pass_reads_.emplace_back(start, start + length);
+}
+
+void VulkanSharedMemory::CommitPendingPassReads() {
+  if (!cvars::vulkan_hoist_shared_memory_uploads) {
+    return;
+  }
+  uint64_t serial =
+      command_processor_.deferred_command_buffer().render_pass_serial();
+  if (serial != pass_reads_serial_) {
+    pass_reads_serial_ = serial;
+    pass_reads_.clear();
+    pass_reads_overflow_ = false;
+  }
+  if (pending_pass_reads_overflow_ ||
+      pass_reads_.size() + pending_pass_reads_.size() > kMaxPassReads) {
+    pass_reads_overflow_ = true;
+  } else {
+    pass_reads_.insert(pass_reads_.end(), pending_pass_reads_.begin(),
+                       pending_pass_reads_.end());
+  }
+  if (pending_pass_reads_overflow_ ||
+      reads_since_barrier_.size() + pending_pass_reads_.size() >
+          kMaxPassReads) {
+    reads_since_barrier_overflow_ = true;
+  } else {
+    reads_since_barrier_.insert(reads_since_barrier_.end(),
+                                pending_pass_reads_.begin(),
+                                pending_pass_reads_.end());
+  }
+  pending_pass_reads_.clear();
+  pending_pass_reads_overflow_ = false;
+}
+
+bool VulkanSharedMemory::UploadConflictsWithPassReads(uint32_t start,
+                                                      uint32_t end) const {
+  if (pass_reads_serial_ !=
+      command_processor_.deferred_command_buffer().render_pass_serial()) {
+    // No draw recorded in this render pass yet.
+    return false;
+  }
+  if (pass_reads_overflow_) {
+    return true;
+  }
+  for (const std::pair<uint32_t, uint32_t>& read : pass_reads_) {
+    if (read.first < end && start < read.second) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool VulkanSharedMemory::UploadRanges(
     const std::pair<uint32_t, uint32_t>* upload_page_ranges,
     uint32_t num_upload_ranges) {
@@ -416,28 +715,46 @@ bool VulkanSharedMemory::UploadRanges(
 
   auto& range_front = upload_page_ranges[0];
   auto& range_back = upload_page_ranges[num_upload_ranges - 1];
+  const uint32_t upload_span_start = range_front.first << page_size_log2();
+  const uint32_t upload_span_end = (range_back.first + range_back.second)
+                                   << page_size_log2();
 
-  // upload_page_ranges are sorted, use them to determine the range for the
-  // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(range_front.first << page_size_log2(),
-                     (range_back.first + range_back.second - range_front.first)
-                         << page_size_log2()));
-  // Submit barriers (may end render pass) before pushing debug marker so
-  // EndRenderPass is not inside the SharedMem Upload marker.
-  command_processor_.SubmitBarriers(true);
-
-  // Calculate total upload size for debug marker.
-  uint32_t total_upload_bytes =
-      (range_back.first + range_back.second - range_front.first)
-      << page_size_log2();
-  command_processor_.PushDebugMarker(
-      "UploadRanges (SharedMem): 0x%08X-0x%08X (%u KB, %u ranges)",
-      range_front.first << page_size_log2(),
-      (range_back.first + range_back.second) << page_size_log2(),
-      total_upload_bytes / 1024, num_upload_ranges);
   DeferredCommandBuffer& command_buffer =
       command_processor_.deferred_command_buffer();
+
+  // Inside a render pass where the buffer is only being read, the upload can
+  // go before the pass (with its own barriers) if no draw already in the pass
+  // read the range - otherwise those draws would see the new data.
+  const bool hoist = cvars::vulkan_hoist_shared_memory_uploads &&
+                     command_buffer.can_hoist_before_render_pass() &&
+                     ((last_usage_ == Usage::kRead &&
+                       !last_written_range_.second) ||
+                      (last_usage_ == Usage::kGuestDrawReadWrite &&
+                       !OverlapsUnsyncedWrites(upload_span_start,
+                                               upload_span_end))) &&
+                     !UploadConflictsWithPassReads(upload_span_start,
+                                                   upload_span_end);
+  VkPipelineStageFlags read_stage_mask = 0;
+  VkAccessFlags read_access_mask = 0;
+  if (hoist) {
+    GetUsageMasks(last_usage_, read_stage_mask, read_access_mask);
+  } else {
+    // upload_page_ranges are sorted, use them to determine the range for the
+    // ordering barrier.
+    Use(Usage::kTransferDestination,
+        std::make_pair(upload_span_start,
+                       upload_span_end - upload_span_start));
+    // Submit barriers (may end render pass) before pushing debug marker so
+    // EndRenderPass is not inside the SharedMem Upload marker.
+    command_processor_.SubmitBarriers(true);
+
+    // Calculate total upload size for debug marker.
+    uint32_t total_upload_bytes = upload_span_end - upload_span_start;
+    command_processor_.PushDebugMarker(
+        "UploadRanges (SharedMem): 0x%08X-0x%08X (%u KB, %u ranges)",
+        upload_span_start, upload_span_end, total_upload_bytes / 1024,
+        num_upload_ranges);
+  }
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
   upload_regions_.clear();
@@ -500,19 +817,31 @@ bool VulkanSharedMemory::UploadRanges(
             memory().TranslatePhysical(upload_range_start << page_size_log2()),
             upload_buffer_size);
       }
-      if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
-        assert_true(upload_buffer_previous != VK_NULL_HANDLE);
-        command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
-                                       uint32_t(upload_regions_.size()),
-                                       upload_regions_.data());
-        upload_regions_.clear();
+      if (hoist) {
+        VkBufferCopy hoisted_region;
+        hoisted_region.srcOffset = upload_buffer_offset;
+        hoisted_region.dstOffset =
+            VkDeviceSize(upload_range_start << page_size_log2());
+        hoisted_region.size = upload_buffer_size;
+        command_buffer.HoistBufferCopyBeforeRenderPass(
+            upload_buffer, buffer_, hoisted_region, read_stage_mask,
+            read_access_mask, read_stage_mask, read_access_mask);
+      } else {
+        if (upload_buffer_previous != upload_buffer &&
+            !upload_regions_.empty()) {
+          assert_true(upload_buffer_previous != VK_NULL_HANDLE);
+          command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+                                         uint32_t(upload_regions_.size()),
+                                         upload_regions_.data());
+          upload_regions_.clear();
+        }
+        upload_buffer_previous = upload_buffer;
+        VkBufferCopy& upload_region = upload_regions_.emplace_back();
+        upload_region.srcOffset = upload_buffer_offset;
+        upload_region.dstOffset =
+            VkDeviceSize(upload_range_start << page_size_log2());
+        upload_region.size = upload_buffer_size;
       }
-      upload_buffer_previous = upload_buffer;
-      VkBufferCopy& upload_region = upload_regions_.emplace_back();
-      upload_region.srcOffset = upload_buffer_offset;
-      upload_region.dstOffset =
-          VkDeviceSize(upload_range_start << page_size_log2());
-      upload_region.size = upload_buffer_size;
       uint32_t upload_buffer_pages =
           uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
@@ -529,7 +858,10 @@ bool VulkanSharedMemory::UploadRanges(
                                    upload_regions_.data());
     upload_regions_.clear();
   }
-  command_processor_.PopDebugMarker();
+  // Hoisted copies are recorded before the render pass when it ends.
+  if (!hoist) {
+    command_processor_.PopDebugMarker();
+  }
   return successful;
 }
 

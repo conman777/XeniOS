@@ -408,6 +408,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool demote_to_helper_invocation;
 
     bool fragment_shader_barycentric;
+    // Index the shared memory storage buffer array directly instead of a
+    // switch over the bindings when the memory is split into several.
+    bool storage_buffer_array_nonuniform_indexing;
+    // Shared memory reads through a uniform texel buffer at binding 2.
+    bool shared_memory_texel_buffer;
   };
 
   SpirvShaderTranslator(
@@ -674,6 +679,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // For Shader Model 3 multiplication (+-0 or denormal * anything = +0),
   // replaces the value with +0 if the minimum of the two operands is 0. This
   // must be called with absolute values of operands - use GetAbsoluteOperand!
+  bool IsGuestZeroMultiplyEnabled() const;
   spv::Id ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs,
                                  spv::Id operand_1_abs);
   // Reduces floating-point precision by truncating mantissa bits with rounding.
@@ -958,6 +964,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id uniform_fetch_constants_;
 
   spv::Id buffers_shared_memory_;
+  spv::Id texel_buffer_shared_memory_ = spv::NoResult;
   spv::Id buffer_edram_;
 
   // Not using combined images and samplers because

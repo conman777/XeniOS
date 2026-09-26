@@ -90,6 +90,14 @@ DEFINE_bool(
     "disable to measure or avoid that.",
     "Vulkan");
 
+DEFINE_uint32(
+    vulkan_pipeline_cache_save_interval_s, 20,
+    "Save the driver VkPipelineCache to disk at most this often (seconds) "
+    "while new pipelines are being created and the creation queue is idle, so "
+    "compiled pipelines survive the app being killed. 0 saves only on clean "
+    "shutdown.",
+    "Vulkan");
+
 DEFINE_bool(
     vulkan_log_pipeline_statistics, false,
     "Log the driver's statistics (VK_KHR_pipeline_executable_properties) "
@@ -907,7 +915,99 @@ void VulkanPipelineCache::EndSubmission() {
     creation_request_cond_.notify_one();
   }
 
+  MaybeSaveVkPipelineCacheInBackground();
+
   ProcessDeferredDestructions();
+}
+
+void VulkanPipelineCache::MaybeSaveVkPipelineCacheInBackground() {
+  if (!cvars::vulkan_pipeline_cache_save_interval_s ||
+      vk_pipeline_cache_path_.empty() ||
+      !pipelines_created_since_cache_save_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  uint64_t now_ms = uint64_t(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  if (now_ms - last_vk_pipeline_cache_save_ms_ <
+      uint64_t(cvars::vulkan_pipeline_cache_save_interval_s) * 1000) {
+    return;
+  }
+  // Only once creation is idle, so the save doesn't delay queued compiles.
+  if (!creation_threads_.empty()) {
+    std::unique_lock<std::mutex> lock(creation_request_lock_,
+                                      std::try_to_lock);
+    if (!lock.owns_lock() || !creation_queue_.empty() ||
+        creation_threads_busy_.load() != 0) {
+      return;
+    }
+  }
+  last_vk_pipeline_cache_save_ms_ = now_ms;
+  JoinVkPipelineCacheSaveThread();
+  vk_pipeline_cache_save_thread_ = std::thread([this]() { SaveVkPipelineCache(); });
+}
+
+void VulkanPipelineCache::JoinVkPipelineCacheSaveThread() {
+  if (vk_pipeline_cache_save_thread_.joinable()) {
+    vk_pipeline_cache_save_thread_.join();
+  }
+}
+
+void VulkanPipelineCache::SaveVkPipelineCache() {
+  if (vk_pipeline_cache_ == VK_NULL_HANDLE ||
+      vk_pipeline_cache_path_.empty()) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  std::filesystem::path path = vk_pipeline_cache_path_;
+  uint32_t created = pipelines_created_since_cache_save_.exchange(0);
+  std::vector<uint8_t> cache_data;
+  {
+    std::shared_lock<std::shared_mutex> driver_lock(pipeline_driver_mutex_);
+    if (vk_pipeline_cache_ == VK_NULL_HANDLE) {
+      return;
+    }
+    size_t cache_size = 0;
+    if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
+                                   nullptr) != VK_SUCCESS ||
+        !cache_size) {
+      return;
+    }
+    cache_data.resize(cache_size);
+    if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
+                                   cache_data.data()) != VK_SUCCESS) {
+      return;
+    }
+    cache_data.resize(cache_size);
+  }
+  // Write to a temporary file and rename, so a kill mid-write can't leave a
+  // truncated cache behind.
+  std::filesystem::path temp_path = path;
+  temp_path += ".tmp";
+  FILE* cache_file = xe::filesystem::OpenFile(temp_path, "wb");
+  if (!cache_file) {
+    return;
+  }
+  bool written =
+      fwrite(cache_data.data(), 1, cache_data.size(), cache_file) ==
+      cache_data.size();
+  written = (fclose(cache_file) == 0) && written;
+  std::error_code ec;
+  if (written) {
+    std::filesystem::rename(temp_path, path, ec);
+  }
+  if (written && !ec) {
+    XELOGI("Saved {} bytes of VkPipelineCache data ({} new pipelines)",
+           cache_data.size(), created);
+  } else {
+    XELOGW("Failed to save VkPipelineCache data to {}",
+           xe::path_to_utf8(path));
+  }
 }
 
 void VulkanPipelineCache::DrainCreationThreads() {
@@ -1183,6 +1283,15 @@ VulkanPipelineCache::CreationStats VulkanPipelineCache::GetCreationStats() {
     std::lock_guard<std::mutex> lock(deferred_destroy_mutex_);
     stats.deferred = deferred_destroy_pipelines_.size();
   }
+  return stats;
+}
+
+VulkanPipelineCache::CreationStats
+VulkanPipelineCache::GetCreationQueueStats() {
+  CreationStats stats;
+  std::lock_guard<std::mutex> lock(creation_request_lock_);
+  stats.queued = creation_queue_.size();
+  stats.busy = creation_threads_busy_.load(std::memory_order_relaxed);
   return stats;
 }
 
@@ -3540,6 +3649,10 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
                                            &pipeline_create_info, nullptr,
                                            &pipeline);
   }
+  if (result == VK_SUCCESS) {
+    pipelines_created_since_cache_save_.fetch_add(1,
+                                                  std::memory_order_relaxed);
+  }
   if (result != VK_SUCCESS) {
     if (creation_arguments.pixel_shader) {
       XELOGE(
@@ -4128,30 +4241,8 @@ void VulkanPipelineCache::InitializeShaderStorage(
 
 void VulkanPipelineCache::ShutdownShaderStorage() {
   // Save VkPipelineCache to disk before shutting down storage.
-  if (vk_pipeline_cache_ != VK_NULL_HANDLE &&
-      !vk_pipeline_cache_path_.empty()) {
-    const ui::vulkan::VulkanDevice* const vulkan_device =
-        command_processor_.GetVulkanDevice();
-    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-    const VkDevice device = vulkan_device->device();
-
-    std::shared_lock<std::shared_mutex> driver_lock(pipeline_driver_mutex_);
-    size_t cache_size = 0;
-    if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
-                                   nullptr) == VK_SUCCESS &&
-        cache_size > 0) {
-      std::vector<uint8_t> cache_data(cache_size);
-      if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
-                                     cache_data.data()) == VK_SUCCESS) {
-        if (FILE* cache_file =
-                xe::filesystem::OpenFile(vk_pipeline_cache_path_, "wb")) {
-          fwrite(cache_data.data(), 1, cache_size, cache_file);
-          fclose(cache_file);
-          XELOGI("Saved {} bytes of VkPipelineCache data", cache_size);
-        }
-      }
-    }
-  }
+  JoinVkPipelineCacheSaveThread();
+  SaveVkPipelineCache();
   vk_pipeline_cache_path_.clear();
 
   // Shut down the storage writer (closes files, stops write thread).

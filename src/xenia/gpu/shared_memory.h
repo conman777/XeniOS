@@ -83,6 +83,7 @@ class SharedMemory {
   // ensures the host GPU memory backing the range are resident. Returns true if
   // the range has been fully updated and is usable.
   bool RequestRange(uint32_t start, uint32_t length);
+  bool RequestRangeImpl(uint32_t start, uint32_t length);
 
   void TryFindUploadRange(const uint32_t& block_first,
                           const uint32_t& block_last,
@@ -154,6 +155,9 @@ class SharedMemory {
   // MakeRangeValid has page granularity). upload_page_ranges are sorted in
   // ascending address order, so front and back can be used to determine the
   // overall bounds of pages to be uploaded.
+  // Called after every successful non-empty RequestRange.
+  virtual void OnRangeRequested(uint32_t start, uint32_t length) {}
+
   virtual bool UploadRanges(
       const std::pair<uint32_t, uint32_t>* upload_page_ranges,
       uint32_t num_upload_ranges) = 0;

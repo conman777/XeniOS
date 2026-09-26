@@ -3,8 +3,8 @@
 Current status (2026-09-24): **experimental; Halo Reach plays its campaign
 with correct lighting and colours on the tested Odin2 Portal**. Menus, input,
 the intro cinematic and first-person gameplay with HUD render like the PC
-reference at 8-15 fps (optimized native build), with frame-rate dips while new
-shaders compile. A successful build or a visible menu does not establish game
+reference at about 15 fps in gameplay (optimized native build); see
+[Performance](#performance-2026-09-25). A successful build or a visible menu does not establish game
 compatibility.
 
 See [Verified state](#verified-state-2026-09-24) for what was measured, and
@@ -217,12 +217,106 @@ Notes:
   -100: literal (1,2,3,4); -800: `gl_FragCoord`). `--trace_dump_texture_slot`
   and `--trace_dump_color0_host` dump host images per draw.
 
-Performance: optimized native build 6-18 fps in the intro cinematic and
-mission, against 3.5-12.5 unoptimized. The dips coincide with pipeline
-creation backlog (`SwapSummary ... queued=`). KGSL peaks at about 4.1 GB
-against the profile's `vulkan_kgsl_memory_limit_mb=3584`, so a pipeline trim
-still occurs occasionally. A 4608 MB profile
-(`trace-harness\configs\internal_profile.kgsl4608.txt`) is untested.
+## Performance (2026-09-25)
+
+Measured in `gameplay_hud.xes` (Winter Contingency, first person) with
+`trace-harness\perf_run.ps1`. The GPU is the limit: KGSL reports 99% busy at
+the maximum 680 MHz, and no CPU thread exceeds about 50%.
+
+| State | fps | GPU ms/frame | Render passes/frame |
+| --- | --- | --- | --- |
+| Before (2026-09-24 build) | 11.3 | 88 | 448 |
+| Upload hoisting | 13.3 | 71 | 256 |
+| + hazard-based memexport barriers | 14.9 | 64 | 128 |
+
+Where the time went (GPU timestamps, `vulkan_gpu_timing`): 285 single-draw
+render passes cost 35 ms; each Adreno render pass costs about 120 µs whatever
+it draws. The passes were split by CPU-to-GPU shared memory uploads (about
+190 per frame, vertex and index data written by the CPU each frame) and by
+shared memory barriers around memexport draws (about 120 per frame). A
+smaller render area did not help (`vulkan_shrink_render_area`, off), so the
+cost is per pass, not load/store bandwidth.
+
+Fixed (defaults on for Android):
+
+- **Upload hoisting** (`vulkan_hoist_shared_memory_uploads`). An upload a
+  draw needs while a render pass is open is recorded before that pass
+  (`DeferredCommandBuffer::HoistBufferCopyBeforeRenderPass`), batched into
+  one copy between one pair of barriers, unless a draw already in the pass
+  read the range.
+- **Hazard-based memexport barriers**
+  (`vulkan_shared_memory_hazard_barriers`,
+  `vulkan_shared_memory_skip_waw_barriers`). Between draws, a shared memory
+  barrier is inserted only for a real read-after-write or write-after-read
+  on the exact memexport stream ranges. Reach's 120 per-frame hazards were
+  all draws exporting to the same 560 KB stream (Xenia sees the stream as its
+  whole buffer), with nothing reading it in between.
+- **Persistent pipeline cache.** The shader and pipeline storage files were
+  opened with `"a+b"`, which on Bionic starts reading at the end of the file;
+  every launch saw an invalid header and wiped them. Now rewound before
+  reading (`shader_storage.h`). The driver `VkPipelineCache` is also saved
+  every 20 s while pipelines are being created
+  (`vulkan_pipeline_cache_save_interval_s`), since Android rarely shuts the
+  app down cleanly. Restoring a gameplay save no longer drops to 0.5 fps for
+  40 s while 390 pipelines compile.
+- **Screen timeout.** The emulator activity keeps the screen on; a timeout
+  paused the app and dropped the GPU caches (`TRIM_MEMORY_UI_HIDDEN`).
+
+Remaining per frame (64 ms): 7 large passes 30 ms (real shading), 67
+single-draw passes 9 ms (render target transfers and resolve dumps, about 35
+each), dispatches 7 ms (116 resolves and texture loads), copies and barrier
+waits 6 ms. Translated shaders are large: fragment shaders average 3,800
+Adreno instructions, and Reach's per-vertex lighting shader
+(VS `838B50F94967ACAD`, used by the memexport draws) 46,000.
+
+Measured and rejected:
+
+- `spirv_guest_zero_multiply=false` (skip the Shader Model 3 "0 × anything =
+  0" emulation): 16.1 fps, but HUD text loses glyphs. Keep on.
+- `spirv_no_contraction=false`, `spirv_shared_memory_nonuniform_indexing`
+  (index the four 128 MB shared memory bindings directly instead of a switch
+  per fetch): no change.
+
+Diagnostics (profile keys, all default off): `vulkan_gpu_timing` (GpuTime
+line: pass time by draw count, dispatch and copy time),
+`vulkan_log_render_pass_breaks` (RPBreak and RPBarrier stacks; symbolize
+with `llvm-addr2line` on
+`app/build/intermediates/ndkBuild/githubDebug/obj/local/arm64-v8a/libxenia-app.so`),
+and `vulkan_log_pipeline_statistics` (Adreno instruction counts per
+pipeline). Every summary also logs a GpuWork line (passes, draws, barriers,
+copies, hoisted uploads per frame).
+
+Later measurements (2026-09-26, same scene, about 15 fps):
+
+- The emulator shows an FPS overlay (guest frames presented per second) in
+  the top-left corner.
+- Presenter fix: the swapchain paint pipeline's format was never recorded, so
+  every frame waited for the previous present and recompiled the pipeline.
+  The command processor thread dropped from 66% to 53% of a core.
+- The main 7e3 scene pass (about 16 ms) is roughly vertex work 4 ms, pixel
+  shading 6 ms and raster/depth/blending 6 ms (`vulkan_debug_tiny_scissor`,
+  `spirv_debug_ps_hash=all` with `spirv_debug_ps_output=-100`,
+  `spirv_debug_null_vs`). No single fix remains there.
+- A CPU-side cap sits near 20 fps even with the GPU work removed. Resolve
+  readback copies 38 resolves (about 46 MB) per frame into guest memory.
+  `readback_resolve=none` lifts the cap to about 25 fps but darkens the
+  image (the game reads exposure on the CPU). `readback_resolve_max_kb`
+  keeps exposure but leaves stale-page artifacts, so readback needs to be
+  done on demand.
+- No gain: texel-buffer vertex fetch (`vulkan_shared_memory_texel_buffer`),
+  non-sparse shared memory, NaN-guarded dot products
+  (`spirv_guest_zero_multiply_fast`), and disabling the Halo compatibility
+  workarounds (which also didn't change the image).
+
+Profile gotchas:
+
+- The Android profile accepts any registered cvar by name, so experiments
+  need no rebuild.
+- `files/xenios_android_profile.txt` on external storage loads after the
+  internal one and overrides the keys it contains.
+- `xenios.config.toml` stores every cvar's value when it's written, so a
+  changed code default doesn't apply to an install that already saved the
+  old value. Delete the line to get the new default.
 
 ## Trace diff: finding rendering bugs
 

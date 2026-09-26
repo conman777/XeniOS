@@ -239,6 +239,10 @@ class ShaderStorageWriter {
           xe::path_to_utf8(pipeline_storage_file_path));
       return false;
     }
+    // "a+" leaves the read position at the end of the file on Bionic (Android)
+    // and other BSD-derived C libraries, so the header read below would fail
+    // and the valid file would be wiped on every launch. Writes still append.
+    xe::filesystem::Seek(pipeline_storage_file_, 0, SEEK_SET);
 
     // Read pipeline descriptions.
     const uint32_t pipeline_storage_version_swapped =
@@ -314,6 +318,7 @@ class ShaderStorageWriter {
       pipeline_storage_file_ = nullptr;
       return false;
     }
+    xe::filesystem::Seek(shader_storage_file_, 0, SEEK_SET);
 
     // Load shaders from storage.
     size_t shaders_loaded = 0;

@@ -11,16 +11,104 @@
 
 #include <cstring>
 
+#include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #include "xenia/ui/vulkan/vulkan_instance.h"
 
+DEFINE_bool(vulkan_shrink_render_area, false,
+            "Shrink each host render pass's render area to the union of its "
+            "draw scissors. Attachments are loaded and stored, so results are "
+            "unchanged; tiled GPUs skip the unused part of each render target.",
+            "Vulkan");
+
+DEFINE_bool(vulkan_gpu_timing, false,
+            "Diagnostic: write GPU timestamps around every render pass and log "
+            "where GPU time goes with each performance summary.",
+            "Vulkan");
+
 namespace xe {
 namespace gpu {
 namespace vulkan {
+
+void DeferredCommandBuffer::CollectGpuTiming(uint32_t slot) {
+  uint32_t count = gpu_timing_query_counts_[slot];
+  gpu_timing_query_counts_[slot] = 0;
+  if (count < 2 || !gpu_timing_pools_[slot]) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  std::vector<uint64_t> ts(count);
+  if (dfn.vkGetQueryPoolResults(vulkan_device->device(),
+                                gpu_timing_pools_[slot], 0, count,
+                                sizeof(uint64_t) * count, ts.data(),
+                                sizeof(uint64_t),
+                                VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+    return;
+  }
+  // Layout: [start, (pass begin, pass end)..., end].
+  const double to_ms = gpu_timing_period_ns_ / 1e6;
+  GpuTiming& timing = gpu_timing();
+  double total_ms = double(ts[count - 1] - ts[0]) * to_ms;
+  double in_pass_ms = 0.0;
+  const std::vector<uint32_t>& pass_draws = gpu_timing_pass_draws_[slot];
+  const std::vector<VkPipeline>& dispatch_pipelines =
+      gpu_timing_dispatch_pipelines_[slot];
+  size_t dispatch_index = 0;
+  const std::vector<TimedPass>& timed_passes = gpu_timing_passes_[slot];
+  size_t timed_pass_index = 0;
+  for (size_t i = 0; i < pass_draws.size() && 2 * i + 2 < count; ++i) {
+    double pass_ms = double(ts[2 * i + 2] - ts[2 * i + 1]) * to_ms;
+    uint32_t draws = pass_draws[i];
+    if (draws == kGpuTimingSegmentDispatch) {
+      timing.dispatch_ms += pass_ms;
+      ++timing.dispatches;
+      if (dispatch_index < dispatch_pipelines.size()) {
+        DispatchTiming& pipeline_timing =
+            dispatch_timing()[dispatch_pipelines[dispatch_index++]];
+        pipeline_timing.ms += pass_ms;
+        ++pipeline_timing.count;
+      }
+      continue;
+    }
+    if (draws == kGpuTimingSegmentCopy) {
+      timing.copy_ms += pass_ms;
+      ++timing.copies;
+      continue;
+    }
+    in_pass_ms += pass_ms;
+    if (timed_pass_index < timed_passes.size()) {
+      const TimedPass& timed_pass = timed_passes[timed_pass_index++];
+      auto name_it = render_pass_names().find(timed_pass.render_pass);
+      DispatchTiming& pass_entry = pass_timing()[fmt::format(
+          "{}@{}x{}",
+          name_it != render_pass_names().end()
+              ? name_it->second
+              : fmt::format("{:X}", uint64_t(timed_pass.render_pass)),
+          timed_pass.width, timed_pass.height)];
+      pass_entry.ms += pass_ms;
+      ++pass_entry.count;
+      pass_entry.draws += draws;
+    }
+    size_t bucket = draws == 0     ? 0
+                    : draws == 1   ? 1
+                    : draws <= 5   ? 2
+                    : draws <= 20  ? 3
+                    : draws <= 100 ? 4
+                                   : 5;
+    timing.bucket_ms[bucket] += pass_ms;
+    ++timing.bucket_passes[bucket];
+  }
+  timing.total_ms += total_ms;
+  timing.glue_ms += total_ms - in_pass_ms;
+  ++timing.submissions;
+}
 
 DeferredCommandBuffer::DeferredCommandBuffer(
     const VulkanCommandProcessor& command_processor, size_t initial_size)
@@ -28,7 +116,124 @@ DeferredCommandBuffer::DeferredCommandBuffer(
   command_stream_.reserve(initial_size / sizeof(uintmax_t));
 }
 
-void DeferredCommandBuffer::Reset() { command_stream_.clear(); }
+void DeferredCommandBuffer::Reset() {
+  assert_false(hoisting_);
+  assert_true(hoisted_copies_.empty());
+  hoisted_copies_.clear();
+  command_stream_.clear();
+  render_pass_args_offset_ = SIZE_MAX;
+  ++render_pass_serial_;
+  current_scissor_valid_ = false;
+}
+
+void DeferredCommandBuffer::HoistBufferCopyBeforeRenderPass(
+    VkBuffer src_buffer, VkBuffer dst_buffer, const VkBufferCopy& region,
+    VkPipelineStageFlags before_stage_mask, VkAccessFlags before_access_mask,
+    VkPipelineStageFlags after_stage_mask, VkAccessFlags after_access_mask) {
+  assert_true(can_hoist_before_render_pass());
+  assert_true(hoisted_copies_.empty() ||
+              hoisted_copies_dst_buffer_ == dst_buffer);
+  hoisted_copies_dst_buffer_ = dst_buffer;
+  hoisted_copies_.push_back({src_buffer, region});
+  hoisted_before_stage_mask_ |= before_stage_mask;
+  hoisted_before_access_mask_ |= before_access_mask;
+  hoisted_after_stage_mask_ |= after_stage_mask;
+  hoisted_after_access_mask_ |= after_access_mask;
+  ++work_stats().hoisted_uploads;
+}
+
+void DeferredCommandBuffer::FlushHoistedBufferCopies() {
+  if (hoisted_copies_.empty()) {
+    return;
+  }
+  assert_true(render_pass_args_offset_ != SIZE_MAX);
+  // Record into a separate stream, then insert it before the pass.
+  hoisting_ = true;
+  hoist_saved_stream_.swap(command_stream_);
+  command_stream_.clear();
+
+  VkBufferMemoryBarrier barrier = {};
+  barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.buffer = hoisted_copies_dst_buffer_;
+  barrier.offset = 0;
+  barrier.size = VK_WHOLE_SIZE;
+  barrier.srcAccessMask = hoisted_before_access_mask_;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  CmdVkPipelineBarrier(hoisted_before_stage_mask_,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
+                       &barrier, 0, nullptr);
+  // One copy command per source buffer, keeping the order of the copies to
+  // the same destination.
+  size_t first = 0;
+  while (first < hoisted_copies_.size()) {
+    VkBuffer src_buffer = hoisted_copies_[first].src_buffer;
+    hoisted_copy_regions_.clear();
+    size_t next_first = hoisted_copies_.size();
+    for (size_t i = first; i < hoisted_copies_.size(); ++i) {
+      if (hoisted_copies_[i].src_buffer == VK_NULL_HANDLE) {
+        continue;
+      }
+      if (hoisted_copies_[i].src_buffer == src_buffer) {
+        hoisted_copy_regions_.push_back(hoisted_copies_[i].region);
+        hoisted_copies_[i].src_buffer = VK_NULL_HANDLE;
+      } else if (next_first == hoisted_copies_.size()) {
+        next_first = i;
+      }
+    }
+    CmdVkCopyBuffer(src_buffer, hoisted_copies_dst_buffer_,
+                    uint32_t(hoisted_copy_regions_.size()),
+                    hoisted_copy_regions_.data());
+    first = next_first;
+  }
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = hoisted_after_access_mask_;
+  CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       hoisted_after_stage_mask_, 0, 0, nullptr, 1, &barrier,
+                       0, nullptr);
+
+  hoisting_ = false;
+  command_stream_.swap(hoist_saved_stream_);
+  size_t insert_at = render_pass_args_offset_ - kCommandHeaderSizeElements;
+  command_stream_.insert(command_stream_.begin() + insert_at,
+                         hoist_saved_stream_.begin(),
+                         hoist_saved_stream_.end());
+  render_pass_args_offset_ += hoist_saved_stream_.size();
+  hoist_saved_stream_.clear();
+
+  hoisted_copies_.clear();
+  hoisted_copies_dst_buffer_ = VK_NULL_HANDLE;
+  hoisted_before_stage_mask_ = 0;
+  hoisted_before_access_mask_ = 0;
+  hoisted_after_stage_mask_ = 0;
+  hoisted_after_access_mask_ = 0;
+}
+
+void DeferredCommandBuffer::ShrinkRenderPassArea() {
+  size_t args_offset = render_pass_args_offset_;
+  render_pass_args_offset_ = SIZE_MAX;
+  if (args_offset == SIZE_MAX || !cvars::vulkan_shrink_render_area ||
+      render_pass_unbounded_ || !render_pass_has_bounds_) {
+    return;
+  }
+  VkRect2D& area = reinterpret_cast<ArgsVkBeginRenderPass*>(
+                       command_stream_.data() + args_offset)
+                       ->render_area;
+  int32_t x0 = std::max(area.offset.x, render_pass_bounds_[0]);
+  int32_t y0 = std::max(area.offset.y, render_pass_bounds_[1]);
+  int32_t x1 = std::min(area.offset.x + int32_t(area.extent.width),
+                        render_pass_bounds_[2]);
+  int32_t y1 = std::min(area.offset.y + int32_t(area.extent.height),
+                        render_pass_bounds_[3]);
+  if (x1 <= x0 || y1 <= y0) {
+    return;
+  }
+  area.offset.x = x0;
+  area.offset.y = y0;
+  area.extent.width = uint32_t(x1 - x0);
+  area.extent.height = uint32_t(y1 - y0);
+}
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -39,11 +244,133 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       command_processor_.GetVulkanDevice()->functions();
   const uintmax_t* stream = command_stream_.data();
   size_t stream_remaining = command_stream_.size();
+  WorkStats& work_stats = DeferredCommandBuffer::work_stats();
+
+  VkQueryPool timing_pool = VK_NULL_HANDLE;
+  uint32_t timing_slot = 0;
+  uint32_t timing_pass_draws = 0;
+  if (cvars::vulkan_gpu_timing) {
+    timing_slot = gpu_timing_ring_index_;
+    gpu_timing_ring_index_ = (timing_slot + 1) % kGpuTimingRing;
+    // The slot was last used kGpuTimingRing submissions ago.
+    CollectGpuTiming(timing_slot);
+    const ui::vulkan::VulkanDevice* vulkan_device =
+        command_processor_.GetVulkanDevice();
+    if (!gpu_timing_pools_[timing_slot]) {
+      VkQueryPoolCreateInfo pool_info = {};
+      pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+      pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      pool_info.queryCount = kGpuTimingMaxQueries;
+      dfn.vkCreateQueryPool(vulkan_device->device(), &pool_info, nullptr,
+                            &gpu_timing_pools_[timing_slot]);
+      if (gpu_timing_period_ns_ == 0.0) {
+        VkPhysicalDeviceProperties properties;
+        vulkan_device->vulkan_instance()
+            ->functions()
+            .vkGetPhysicalDeviceProperties(vulkan_device->physical_device(),
+                                           &properties);
+        gpu_timing_period_ns_ = properties.limits.timestampPeriod;
+      }
+    }
+    timing_pool = gpu_timing_pools_[timing_slot];
+    if (timing_pool) {
+      dfn.vkCmdResetQueryPool(command_buffer, timing_pool, 0,
+                              kGpuTimingMaxQueries);
+      dfn.vkCmdWriteTimestamp(command_buffer,
+                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              timing_pool, 0);
+      gpu_timing_query_counts_[timing_slot] = 1;
+      gpu_timing_pass_draws_[timing_slot].clear();
+      gpu_timing_dispatch_pipelines_[timing_slot].clear();
+      gpu_timing_passes_[timing_slot].clear();
+    }
+  }
+  // A pass begin only gets a timestamp if room for its end and the final
+  // timestamp remains, so the pairs never misalign.
+  auto write_pass_begin_timestamp = [&]() {
+    uint32_t& query = gpu_timing_query_counts_[timing_slot];
+    if (timing_pool && query + 2 < kGpuTimingMaxQueries) {
+      dfn.vkCmdWriteTimestamp(command_buffer,
+                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              timing_pool, query++);
+      return true;
+    }
+    return false;
+  };
+  bool timing_in_pass = false;
+  // Outside render passes, dispatches and copies are timed individually.
+  uint32_t timing_segment = 0;
+  bool timing_in_segment = false;
+  VkPipeline timing_compute_pipeline = VK_NULL_HANDLE;
+
   while (stream_remaining) {
     const CommandHeader& header =
         *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
     stream_remaining -= kCommandHeaderSizeElements;
+
+    switch (header.command) {
+      case Command::kVkBeginRenderPass: {
+        const VkRect2D& area =
+            reinterpret_cast<const ArgsVkBeginRenderPass*>(stream)
+                ->render_area;
+        timing_in_pass = write_pass_begin_timestamp();
+        timing_pass_draws = 0;
+        if (timing_in_pass) {
+          const auto& pass_args =
+              *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
+          gpu_timing_passes_[timing_slot].push_back(
+              {pass_args.render_pass, area.extent.width, area.extent.height});
+        }
+        ++work_stats.render_passes;
+        work_stats.render_pass_pixels +=
+            uint64_t(area.extent.width) * area.extent.height;
+      } break;
+      case Command::kVkBeginRendering:
+        ++work_stats.render_passes;
+        break;
+      case Command::kVkDraw:
+      case Command::kVkDrawIndexed:
+        ++work_stats.draws;
+        ++timing_pass_draws;
+        break;
+      case Command::kVkBindPipeline: {
+        auto& args = *reinterpret_cast<const ArgsVkBindPipeline*>(stream);
+        if (args.pipeline_bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
+          timing_compute_pipeline = args.pipeline;
+        }
+      } break;
+      case Command::kVkDispatch:
+        ++work_stats.dispatches;
+        if (!timing_in_pass) {
+          timing_in_segment = write_pass_begin_timestamp();
+          timing_segment = kGpuTimingSegmentDispatch;
+          if (timing_in_segment) {
+            gpu_timing_dispatch_pipelines_[timing_slot].push_back(
+                timing_compute_pipeline);
+          }
+        }
+        break;
+      case Command::kVkPipelineBarrier:
+        ++work_stats.barriers;
+        break;
+      case Command::kVkCopyBuffer:
+      case Command::kVkCopyBufferToImage:
+      case Command::kVkCopyImageToBuffer:
+      case Command::kVkBlitImage:
+        ++work_stats.copies;
+        if (!timing_in_pass) {
+          timing_in_segment = write_pass_begin_timestamp();
+          timing_segment = kGpuTimingSegmentCopy;
+        }
+        break;
+      case Command::kVkClearAttachments:
+      case Command::kVkClearColorImage:
+        ++work_stats.clears;
+        break;
+      default:
+        break;
+    }
 
     switch (header.command) {
       case Command::kVkBeginRenderPass: {
@@ -419,8 +746,32 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         break;
     }
 
+    if (timing_in_segment) {
+      uint32_t& query = gpu_timing_query_counts_[timing_slot];
+      dfn.vkCmdWriteTimestamp(command_buffer,
+                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              timing_pool, query++);
+      gpu_timing_pass_draws_[timing_slot].push_back(timing_segment);
+      timing_in_segment = false;
+    }
+    if (timing_in_pass && header.command == Command::kVkEndRenderPass) {
+      uint32_t& query = gpu_timing_query_counts_[timing_slot];
+      dfn.vkCmdWriteTimestamp(command_buffer,
+                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              timing_pool, query++);
+      gpu_timing_pass_draws_[timing_slot].push_back(timing_pass_draws);
+      timing_in_pass = false;
+    }
+
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
+  }
+
+  if (timing_pool) {
+    uint32_t& query = gpu_timing_query_counts_[timing_slot];
+    dfn.vkCmdWriteTimestamp(command_buffer,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing_pool,
+                            query++);
   }
 }
 

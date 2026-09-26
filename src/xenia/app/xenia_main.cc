@@ -597,6 +597,8 @@ bool ApplyAndroidProfileOverride(const std::string& name,
       name == "halo_android_compat_linear_to_tiled_frontbuffer" ||
       name == "halo_android_disable_high_4k_physical_routing" ||
       name == "vulkan_driver_pipeline_cache" ||
+      name == "vulkan_shrink_render_area" ||
+      name == "vulkan_log_render_pass_breaks" ||
       name == "vulkan_log_pipeline_statistics" ||
       name == "vulkan_kgsl_reclaim_clears_render_targets" ||
       name == "vulkan_validation" || name == "vulkan_log_debug_messages") {
@@ -644,6 +646,61 @@ bool ApplyAndroidProfileOverride(const std::string& name,
     }
     OverrideAndroidConfigVar<uint64_t>(name.c_str(), parsed_value);
     return true;
+  }
+
+  // Any other registered cvar, by its type, so experiments don't need a
+  // rebuild to extend the list above.
+  if (cvar::ConfigVars) {
+    auto it = cvar::ConfigVars->find(name);
+    if (it != cvar::ConfigVars->end()) {
+      cvar::IConfigVar* var = it->second;
+      if (auto* v = dynamic_cast<cvar::ConfigVar<bool>*>(var)) {
+        bool parsed = false;
+        if (!ParseAndroidProfileBool(value, parsed)) {
+          return false;
+        }
+        v->SetCommandLineValue(parsed);
+        return true;
+      }
+      if (auto* v = dynamic_cast<cvar::ConfigVar<int32_t>*>(var)) {
+        int32_t parsed = 0;
+        if (!ParseAndroidProfileInt32(value, parsed)) {
+          return false;
+        }
+        v->SetCommandLineValue(parsed);
+        return true;
+      }
+      if (auto* v = dynamic_cast<cvar::ConfigVar<uint32_t>*>(var)) {
+        uint32_t parsed = 0;
+        if (!ParseAndroidProfileUint32(value, parsed)) {
+          return false;
+        }
+        v->SetCommandLineValue(parsed);
+        return true;
+      }
+      if (auto* v = dynamic_cast<cvar::ConfigVar<uint64_t>*>(var)) {
+        uint64_t parsed = 0;
+        if (!ParseAndroidProfileUint64(value, parsed)) {
+          return false;
+        }
+        v->SetCommandLineValue(parsed);
+        return true;
+      }
+      if (auto* v = dynamic_cast<cvar::ConfigVar<std::string>*>(var)) {
+        v->SetCommandLineValue(UnquoteAndroidProfileValue(value));
+        return true;
+      }
+      if (auto* v = dynamic_cast<cvar::ConfigVar<double>*>(var)) {
+        std::string unquoted = UnquoteAndroidProfileValue(value);
+        char* end = nullptr;
+        double parsed = std::strtod(unquoted.c_str(), &end);
+        if (end == unquoted.c_str() || *end) {
+          return false;
+        }
+        v->SetCommandLineValue(parsed);
+        return true;
+      }
+    }
   }
 
   return false;

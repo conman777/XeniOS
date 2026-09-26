@@ -23,6 +23,7 @@
 #include <queue>
 #include <set>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -176,6 +177,9 @@ class VulkanPipelineCache {
   // deferred-destroy queues so SwapSummary can show compile backlog without
   // waiting on workers.
   CreationStats GetCreationStats();
+  // Only the creation queue fields (queued, busy) - cheap enough per draw,
+  // unlike GetCreationStats, which walks every pipeline.
+  CreationStats GetCreationQueueStats();
   // Logs what the live pipeline set is actually made of: how many distinct
   // shader programs it represents, and which PipelineDescription state fields
   // are multiplying those programs into separate pipelines. Gated on the
@@ -629,6 +633,14 @@ class VulkanPipelineCache {
 
   // VkPipelineCache persistence path.
   std::filesystem::path vk_pipeline_cache_path_;
+  // Android apps are rarely shut down cleanly, so the driver cache is also
+  // saved periodically (in the background) once pipeline creation is idle.
+  void SaveVkPipelineCache();
+  void MaybeSaveVkPipelineCacheInBackground();
+  void JoinVkPipelineCacheSaveThread();
+  std::atomic<uint32_t> pipelines_created_since_cache_save_{0};
+  uint64_t last_vk_pipeline_cache_save_ms_ = 0;
+  std::thread vk_pipeline_cache_save_thread_;
 };
 
 }  // namespace vulkan

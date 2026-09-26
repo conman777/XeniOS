@@ -4026,6 +4026,8 @@ bool VulkanTextureCache::Initialize() {
     load_pipelines_[i] = ui::vulkan::util::CreateComputePipeline(
         vulkan_device, load_pipeline_layout_, current_load_shader_code.first,
         current_load_shader_code.second);
+    DeferredCommandBuffer::NameComputePipeline(load_pipelines_[i],
+                                               fmt::format("texload{}", i));
     if (load_pipelines_[i] == VK_NULL_HANDLE) {
       XELOGE(
           "VulkanTextureCache: Failed to create the texture loading pipeline "

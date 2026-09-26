@@ -844,6 +844,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
         draw_resolution_scaled ? resolve_copy_shader_code.scaled_size_bytes
                                : resolve_copy_shader_code.unscaled_size_bytes,
         nullptr, "main", 64);
+    DeferredCommandBuffer::NameComputePipeline(
+        resolve_copy_pipeline, fmt::format("resolve_copy{}", i));
     if (resolve_copy_pipeline == VK_NULL_HANDLE) {
       XELOGE(
           "VulkanRenderTargetCache: Failed to create the resolve copy "
@@ -919,6 +921,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
               vulkan_device, host_depth_store_pipeline_layout_,
               host_depth_store_shader.first, host_depth_store_shader.second,
               nullptr, "main", 64);
+      DeferredCommandBuffer::NameComputePipeline(
+          host_depth_store_pipeline, fmt::format("host_depth_store{}", i));
       if (host_depth_store_pipeline == VK_NULL_HANDLE) {
         XELOGE(
             "VulkanRenderTargetCache: Failed to create the {}-sample host "
@@ -3242,6 +3246,15 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(
     return VK_NULL_HANDLE;
   }
   render_passes_.emplace(key, render_pass);
+  DeferredCommandBuffer::NameRenderPass(
+      render_pass,
+      fmt::format("msaa{}_used{:02X}_d{}_c{}.{}.{}.{}",
+                  uint32_t(1) << uint32_t(key.msaa_samples),
+                  uint32_t(key.depth_and_color_used),
+                  uint32_t(key.depth_format), uint32_t(key.color_0_view_format),
+                  uint32_t(key.color_1_view_format),
+                  uint32_t(key.color_2_view_format),
+                  uint32_t(key.color_3_view_format)));
   return render_pass;
 }
 
@@ -10050,6 +10063,11 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       key.is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_,
       reinterpret_cast<const uint32_t*>(shader_code.data()),
       sizeof(uint32_t) * shader_code.size());
+  DeferredCommandBuffer::NameComputePipeline(
+      pipeline, fmt::format("dump_{}_fmt{}_msaa{}", key.is_depth ? "depth"
+                                                                 : "color",
+                            uint32_t(key.resource_format),
+                            uint32_t(key.msaa_samples)));
   if (pipeline == VK_NULL_HANDLE) {
     XELOGE(
         "VulkanRenderTargetCache: Failed to create a render target dumping "

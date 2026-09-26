@@ -16,14 +16,27 @@
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/math.h"
+#include "xenia/base/cvar.h"
 #include "xenia/gpu/spirv_compatibility.h"
+
+DECLARE_bool(spirv_guest_zero_multiply);
+DECLARE_bool(spirv_guest_zero_multiply_vs);
+DECLARE_bool(spirv_guest_zero_multiply_fast);
 
 namespace xe {
 namespace gpu {
 
+bool SpirvShaderTranslator::IsGuestZeroMultiplyEnabled() const {
+  return cvars::spirv_guest_zero_multiply &&
+         (!is_vertex_shader() || cvars::spirv_guest_zero_multiply_vs);
+}
+
 spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value,
                                                       spv::Id operand_0_abs,
                                                       spv::Id operand_1_abs) {
+  if (!IsGuestZeroMultiplyEnabled()) {
+    return value;
+  }
   EnsureBuildPointAvailable();
   int num_components = builder_->getNumComponents(value);
   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
@@ -560,31 +573,50 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
       uint32_t different =
           component_mask & ~instr.vector_operands[0].GetIdenticalComponents(
                                instr.vector_operands[1]);
-      spv::Id result = spv::NoResult;
-      for (uint32_t i = 0; i < component_count; ++i) {
-        spv::Id operand_components[2];
-        for (unsigned int j = 0; j < 2; ++j) {
-          operand_components[j] =
-              builder_->createCompositeExtract(operands[j], type_float_, i);
+      auto compute_dot = [&](bool zero_rule) {
+        spv::Id dot = spv::NoResult;
+        for (uint32_t i = 0; i < component_count; ++i) {
+          spv::Id operand_components[2];
+          for (unsigned int j = 0; j < 2; ++j) {
+            operand_components[j] =
+                builder_->createCompositeExtract(operands[j], type_float_, i);
+          }
+          spv::Id product = builder_->createNoContractionBinOp(
+              spv::OpFMul, type_float_, operand_components[0],
+              operand_components[1]);
+          if (zero_rule && (different & (1 << i))) {
+            // Shader Model 3: +0 or denormal * anything = +-0.
+            product = ZeroIfAnyOperandIsZero(
+                product,
+                GetAbsoluteOperand(operand_components[0],
+                                   instr.vector_operands[0]),
+                GetAbsoluteOperand(operand_components[1],
+                                   instr.vector_operands[1]));
+          }
+          if (!i) {
+            dot = product;
+            continue;
+          }
+          dot = builder_->createNoContractionBinOp(spv::OpFAdd, type_float_,
+                                                   dot, product);
         }
-        spv::Id product = builder_->createNoContractionBinOp(
-            spv::OpFMul, type_float_, operand_components[0],
-            operand_components[1]);
-        if (different & (1 << i)) {
-          // Shader Model 3: +0 or denormal * anything = +-0.
-          product = ZeroIfAnyOperandIsZero(
-              product,
-              GetAbsoluteOperand(operand_components[0],
-                                 instr.vector_operands[0]),
-              GetAbsoluteOperand(operand_components[1],
-                                 instr.vector_operands[1]));
-        }
-        if (!i) {
-          result = product;
-          continue;
-        }
-        result = builder_->createNoContractionBinOp(spv::OpFAdd, type_float_,
-                                                    result, product);
+        return dot;
+      };
+      spv::Id result;
+      if (different && cvars::spirv_guest_zero_multiply_fast &&
+          IsGuestZeroMultiplyEnabled()) {
+        // The zero rule only changes the result (other than the sign of an
+        // exact zero) when a product is 0 * infinity or NaN, which makes the
+        // plain dot product NaN - only then redo it with the rule.
+        spv::Id fast = compute_dot(false);
+        SpirvBuilder::IfBuilder nan_if(
+            builder_->createUnaryOp(spv::OpIsNan, type_bool_, fast),
+            spv::SelectionControlDontFlattenMask, *builder_);
+        spv::Id exact = compute_dot(true);
+        nan_if.makeEndIf();
+        result = nan_if.createMergePhi(exact, fast);
+      } else {
+        result = compute_dot(true);
       }
       if (instr.vector_opcode == ucode::AluVectorOpcode::kDp2Add) {
         result = builder_->createNoContractionBinOp(

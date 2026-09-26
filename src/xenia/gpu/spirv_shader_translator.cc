@@ -39,6 +39,38 @@ DEFINE_bool(spirv_host_color_clamp, true,
             "format range (and fixed-point alpha to 0...1) in the shader. "
             "Not done by upstream Xenia.",
             "GPU");
+DECLARE_bool(vulkan_shared_memory_texel_buffer);
+DEFINE_bool(spirv_shared_memory_nonuniform_indexing, false,
+            "When shared memory is split into several storage buffers (Adreno "
+            "allows 128 MB each), index the binding array directly (non-uniform "
+            "descriptor indexing) instead of a switch per memory access.",
+            "GPU");
+DEFINE_bool(spirv_no_contraction, true,
+            "Mark guest float math NoContraction, preventing the host compiler "
+            "from fusing multiplies and adds (closer to Xenos rounding, but "
+            "more instructions).",
+            "GPU");
+DEFINE_uint32(spirv_debug_shared_memory_address_mask, 0,
+            "Diagnostic: AND every shader shared memory load address (in "
+            "dwords) with this mask, to measure memory latency cost.",
+            "GPU");
+DEFINE_int32(spirv_debug_null_vs, 0,
+            "Diagnostic: make every vertex shader output a clipped position and "
+            "return, to measure per-draw overhead without vertex work.",
+            "GPU");
+DEFINE_bool(spirv_guest_zero_multiply_fast, false,
+            "Compute guest dot products without the zero multiplication rule "
+            "first, and redo them with it only when the result is NaN (the "
+            "only case the rule changes, besides the sign of zero).",
+            "GPU");
+DEFINE_bool(spirv_guest_zero_multiply_vs, true,
+            "Diagnostic: apply spirv_guest_zero_multiply in vertex shaders.",
+            "GPU");
+DEFINE_bool(spirv_guest_zero_multiply, true,
+            "Emulate the Shader Model 3 rule that 0 (or a denormal) times "
+            "anything, including infinity and NaN, is 0 in guest "
+            "multiplications. Costs a compare and select per product.",
+            "GPU");
 DEFINE_bool(spirv_adreno_float_controls_workaround, true,
             "On Qualcomm GPUs, don't declare the DenormFlushToZero and "
             "SignedZeroInfNanPreserve execution modes: Adreno drivers return 0 "
@@ -86,9 +118,12 @@ namespace xe {
 namespace gpu {
 
 bool SpirvShaderTranslator::IsDebugPsTarget() const {
+  // "all" applies the replacement to every pixel shader (for measuring how
+  // much of the frame time is pixel shading).
   return is_pixel_shader() && !cvars::spirv_debug_ps_hash.empty() &&
-         std::strtoull(cvars::spirv_debug_ps_hash.c_str(), nullptr, 16) ==
-             current_shader().ucode_data_hash();
+         (cvars::spirv_debug_ps_hash == "all" ||
+          std::strtoull(cvars::spirv_debug_ps_hash.c_str(), nullptr, 16) ==
+              current_shader().ucode_data_hash());
 }
 
 namespace {
@@ -170,7 +205,9 @@ SpirvShaderTranslator::Features::Features(bool all)
       fragment_shader_sample_interlock(all),
       fragment_shader_interlock(all),
       demote_to_helper_invocation(all),
-      fragment_shader_barycentric(all) {}
+      fragment_shader_barycentric(all),
+      storage_buffer_array_nonuniform_indexing(all),
+      shared_memory_texel_buffer(false) {}
 
 #if !XE_PLATFORM_APPLE
 namespace {
@@ -215,7 +252,12 @@ SpirvShaderTranslator::Features::Features(
       demote_to_helper_invocation(
           vulkan_device->properties().shaderDemoteToHelperInvocation),
       fragment_shader_barycentric(
-          vulkan_device->properties().fragmentShaderBarycentric) {
+          vulkan_device->properties().fragmentShaderBarycentric),
+      storage_buffer_array_nonuniform_indexing(
+          vulkan_device->properties()
+              .shaderStorageBufferArrayNonUniformIndexing &&
+          cvars::spirv_shared_memory_nonuniform_indexing),
+      shared_memory_texel_buffer(cvars::vulkan_shared_memory_texel_buffer) {
   // Check for SPIR-V version override from CVAR.
   const std::string& override_version = cvars::spirv_version_override;
   if (override_version == "1.0") {
@@ -292,6 +334,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader() {
 
 void SpirvShaderTranslator::Reset() {
   ShaderTranslator::Reset();
+  texel_buffer_shared_memory_ = spv::NoResult;
 
   builder_.reset();
 
@@ -692,6 +735,23 @@ void SpirvShaderTranslator::StartTranslation() {
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(buffers_shared_memory_);
     }
+    if (features_.shared_memory_texel_buffer) {
+      builder_->addCapability(spv::Capability::SampledBuffer);
+      spv::Id type_texel_buffer = builder_->makeImageType(
+          type_uint_, spv::Dim::Buffer, false, false, false, 1,
+          spv::ImageFormatUnknown);
+      texel_buffer_shared_memory_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassUniformConstant,
+          type_texel_buffer, "xe_shared_memory_texel");
+      builder_->addDecoration(texel_buffer_shared_memory_,
+                              spv::DecorationDescriptorSet,
+                              int(kDescriptorSetSharedMemoryAndEdram));
+      builder_->addDecoration(texel_buffer_shared_memory_,
+                              spv::DecorationBinding, 2);
+      if (features_.spirv_version >= spv::Spv_1_4) {
+        main_interface_.push_back(texel_buffer_shared_memory_);
+      }
+    }
   }
 
   if (is_vertex_shader()) {
@@ -787,6 +847,37 @@ void SpirvShaderTranslator::StartTranslation() {
   // main function.
   if (is_vertex_shader()) {
     StartVertexOrTessEvalShaderInMain();
+    // 1: all, 2: only memexporting shaders, 3: only non-memexporting.
+    const bool debug_null_vs_memexport =
+        current_shader().memexport_eM_written() != 0;
+    if (cvars::spirv_debug_null_vs == 1 ||
+        (cvars::spirv_debug_null_vs == 2 && debug_null_vs_memexport) ||
+        (cvars::spirv_debug_null_vs == 3 && !debug_null_vs_memexport)) {
+      // Diagnostic: output a clipped position and return immediately, so the
+      // host compiler removes the whole guest shader, leaving only per-draw
+      // overhead.
+      spv::Block& null_block = builder_->makeNewBlock();
+      spv::Block& continue_block = builder_->makeNewBlock();
+      builder_->createSelectionMerge(&continue_block,
+                                     spv::SelectionControlMaskNone);
+      builder_->createConditionalBranch(builder_->makeBoolConstant(true),
+                                        &null_block, &continue_block);
+      builder_->setBuildPoint(&null_block);
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(
+          builder_->makeIntConstant(kOutputPerVertexMemberPosition));
+      std::vector<spv::Id> null_position_components;
+      null_position_components.push_back(builder_->makeFloatConstant(2.0f));
+      null_position_components.push_back(builder_->makeFloatConstant(2.0f));
+      null_position_components.push_back(builder_->makeFloatConstant(2.0f));
+      null_position_components.push_back(builder_->makeFloatConstant(1.0f));
+      builder_->createStore(
+          builder_->makeCompositeConstant(type_float4_, null_position_components),
+          builder_->createAccessChain(spv::StorageClassOutput,
+                                      output_per_vertex_, id_vector_temp_));
+      builder_->makeReturn(false);
+      builder_->setBuildPoint(&continue_block);
+    }
   } else if (is_pixel_shader()) {
     StartFragmentShaderInMain();
   }
@@ -4617,6 +4708,25 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(
 
   uint32_t binding_count_log2 = GetSharedMemoryStorageBufferCountLog2();
 
+  if (texel_buffer_shared_memory_ != spv::NoResult) {
+    // One texel buffer covers all of the memory, and reads go through the
+    // texture path, which handles scattered vertex fetches better on mobile.
+    spv::Id texel_buffer = builder_->createLoad(texel_buffer_shared_memory_,
+                                                spv::NoPrecision);
+    spv::Id texel = builder_->createBinOp(spv::OpImageFetch, type_uint4_,
+                                          texel_buffer, address_dwords_int);
+    return builder_->createCompositeExtract(texel, type_uint_, 0);
+  }
+
+  if (cvars::spirv_debug_shared_memory_address_mask && is_vertex_shader() &&
+      !current_shader().memexport_eM_written()) {
+    // Diagnostic: confine loads to a small, always cached region.
+    address_dwords_int = builder_->createBinOp(
+        spv::OpBitwiseAnd, type_int_, address_dwords_int,
+        builder_->makeIntConstant(
+            int(cvars::spirv_debug_shared_memory_address_mask)));
+  }
+
   if (!binding_count_log2) {
     // Single binding - load directly.
     id_vector_temp_.clear();
@@ -4630,9 +4740,8 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(
   }
 
   // The memory is split into multiple bindings - check which binding to load
-  // from. 29 is log2(512 MB), but addressing in dwords (4 B). Not indexing the
-  // array with the variable itself because it needs non-uniform storage buffer
-  // indexing.
+  // from. 29 is log2(512 MB), but addressing in dwords (4 B). Without
+  // non-uniform storage buffer indexing, a switch selects the binding.
 
   uint32_t binding_address_bits = (29 - 2) - binding_count_log2;
   spv::Id binding_index = builder_->createBinOp(
@@ -4643,6 +4752,36 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(
       spv::OpBitwiseAnd, type_int_, address_dwords_int,
       builder_->makeIntConstant(
           int((uint32_t(1) << binding_address_bits) - 1)));
+
+  if (features_.storage_buffer_array_nonuniform_indexing) {
+    builder_->addCapability(spv::Capability::ShaderNonUniform);
+    builder_->addCapability(
+        spv::Capability::StorageBufferArrayNonUniformIndexing);
+    if (features_.spirv_version < spv::Spv_1_5) {
+      builder_->addExtension("SPV_EXT_descriptor_indexing");
+    }
+    uint32_t binding_count = uint32_t(1) << binding_count_log2;
+    // Zero if out of bounds, like the switch default.
+    spv::Id in_bounds = builder_->createBinOp(
+        spv::OpULessThan, type_bool_, binding_index,
+        builder_->makeUintConstant(binding_count));
+    spv::Id binding_index_clamped = builder_->createBinBuiltinCall(
+        type_uint_, ext_inst_glsl_std_450_, GLSLstd450UMin, binding_index,
+        builder_->makeUintConstant(binding_count - 1));
+    builder_->addDecoration(binding_index_clamped, spv::Decoration::NonUniform);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(binding_index_clamped);
+    // The only SSBO struct member.
+    id_vector_temp_.push_back(const_int_0_);
+    id_vector_temp_.push_back(binding_address);
+    spv::Id pointer = builder_->createAccessChain(
+        storage_class, buffers_shared_memory_, id_vector_temp_);
+    builder_->addDecoration(pointer, spv::Decoration::NonUniform);
+    spv::Id value = builder_->createLoad(pointer, spv::NoPrecision);
+    builder_->addDecoration(value, spv::Decoration::NonUniform);
+    return builder_->createTriOp(spv::OpSelect, type_uint_, in_bounds, value,
+                                 const_uint_0_);
+  }
 
   auto value_phi_op = std::make_unique<spv::Instruction>(
       builder_->getUniqueId(), type_uint_, spv::OpPhi);

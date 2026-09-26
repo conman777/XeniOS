@@ -10,7 +10,10 @@
 #include "xenia/gpu/spirv_builder.h"
 
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/gpu/spirv_compatibility.h"
+
+DECLARE_bool(spirv_no_contraction);
 
 namespace xe {
 namespace gpu {
@@ -42,7 +45,9 @@ spv::Id SpirvBuilder::createNoContractionUnaryOp(spv::Op op_code,
                                                  spv::Id type_id,
                                                  spv::Id operand) {
   spv::Id result = createUnaryOp(op_code, type_id, operand);
-  addDecoration(result, spv::DecorationNoContraction);
+  if (cvars::spirv_no_contraction) {
+    addDecoration(result, spv::DecorationNoContraction);
+  }
   return result;
 }
 
@@ -50,7 +55,9 @@ spv::Id SpirvBuilder::createNoContractionBinOp(spv::Op op_code, spv::Id type_id,
                                                spv::Id operand1,
                                                spv::Id operand2) {
   spv::Id result = createBinOp(op_code, type_id, operand1, operand2);
-  addDecoration(result, spv::DecorationNoContraction);
+  if (cvars::spirv_no_contraction) {
+    addDecoration(result, spv::DecorationNoContraction);
+  }
   return result;
 }
 

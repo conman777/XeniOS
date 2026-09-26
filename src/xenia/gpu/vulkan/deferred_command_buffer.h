@@ -10,9 +10,12 @@
 #ifndef XENIA_GPU_VULKAN_DEFERRED_COMMAND_BUFFER_H_
 #define XENIA_GPU_VULKAN_DEFERRED_COMMAND_BUFFER_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "xenia/base/assert.h"
@@ -27,11 +30,115 @@ class VulkanCommandProcessor;
 
 class DeferredCommandBuffer {
  public:
+  // Cumulative host GPU work recorded by Execute, for performance summaries
+  // (command processor thread only).
+  struct WorkStats {
+    uint64_t render_passes = 0;
+    uint64_t render_pass_pixels = 0;
+    uint64_t draws = 0;
+    uint64_t dispatches = 0;
+    uint64_t barriers = 0;
+    uint64_t copies = 0;
+    uint64_t clears = 0;
+    uint64_t hoisted_uploads = 0;
+    // Shared memory Use() from draws: barrier skipped, read-after-write or
+    // write-after-write hazard, write-after-read hazard, not eligible.
+    uint64_t draw_use_skipped = 0;
+    uint64_t draw_use_raw = 0;
+    uint64_t draw_use_war = 0;
+    uint64_t draw_use_ineligible = 0;
+    // Resolve readback to guest memory: copies, bytes, and GPU waits.
+    uint64_t readback_copies = 0;
+    uint64_t readback_bytes = 0;
+    uint64_t readback_waits = 0;
+  };
+  static WorkStats& work_stats() {
+    static WorkStats stats;
+    return stats;
+  }
+  // GPU time from timestamps around every render pass (vulkan_gpu_timing),
+  // cumulative. Passes are bucketed by draw count: 0, 1, 2-5, 6-20, 21-100,
+  // >100. Glue is everything between passes (barriers, copies, dispatches).
+  static constexpr size_t kGpuTimingBuckets = 6;
+  struct GpuTiming {
+    double total_ms = 0.0;
+    double glue_ms = 0.0;
+    uint64_t submissions = 0;
+    double bucket_ms[kGpuTimingBuckets] = {};
+    uint64_t bucket_passes[kGpuTimingBuckets] = {};
+    double dispatch_ms = 0.0;
+    uint64_t dispatches = 0;
+    double copy_ms = 0.0;
+    uint64_t copies = 0;
+  };
+  static GpuTiming& gpu_timing() {
+    static GpuTiming timing;
+    return timing;
+  }
+  // Compute pipeline names for per-pipeline dispatch timing.
+  static std::unordered_map<VkPipeline, std::string>& compute_pipeline_names() {
+    static std::unordered_map<VkPipeline, std::string> names;
+    return names;
+  }
+  static void NameComputePipeline(VkPipeline pipeline, std::string name) {
+    if (pipeline != VK_NULL_HANDLE) {
+      compute_pipeline_names()[pipeline] = std::move(name);
+    }
+  }
+  struct DispatchTiming {
+    double ms = 0.0;
+    uint64_t count = 0;
+    uint64_t draws = 0;
+  };
+  static std::unordered_map<VkRenderPass, std::string>& render_pass_names() {
+    static std::unordered_map<VkRenderPass, std::string> names;
+    return names;
+  }
+  static void NameRenderPass(VkRenderPass render_pass, std::string name) {
+    if (render_pass != VK_NULL_HANDLE) {
+      render_pass_names()[render_pass] = std::move(name);
+    }
+  }
+  // Cumulative GPU time per render pass object and render area size
+  // (vulkan_gpu_timing), keyed by a description string.
+  static std::unordered_map<std::string, DispatchTiming>& pass_timing() {
+    static std::unordered_map<std::string, DispatchTiming> timing;
+    return timing;
+  }
+  // Cumulative GPU time per compute pipeline (vulkan_gpu_timing).
+  static std::unordered_map<VkPipeline, DispatchTiming>& dispatch_timing() {
+    static std::unordered_map<VkPipeline, DispatchTiming> timing;
+    return timing;
+  }
+
   DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                         size_t initial_size_bytes = 1024 * 1024);
 
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
+
+  // Changes whenever a render pass begins or the buffer is reset.
+  uint64_t render_pass_serial() const { return render_pass_serial_; }
+  // Commands recorded between Begin/EndHoistBeforeRenderPass are inserted
+  // before the currently open render pass instead of at the end, so work that
+  // can't be done inside a render pass (copies, barriers) doesn't split it.
+  // The caller must ensure the commands don't conflict with anything already
+  // recorded in the pass.
+  bool can_hoist_before_render_pass() const {
+    return render_pass_args_offset_ != SIZE_MAX && !hoisting_;
+  }
+  // Queues a buffer copy to be done before the currently open render pass.
+  // All copies queued for a pass are recorded when it ends, as one copy
+  // command per source buffer between one pair of whole-buffer barriers on
+  // dst_buffer: [before_stage_mask/access -> transfer write] and
+  // [transfer write -> after_stage_mask/access]. The caller must ensure the
+  // copies don't conflict with anything already recorded in the pass.
+  void HoistBufferCopyBeforeRenderPass(VkBuffer src_buffer, VkBuffer dst_buffer,
+                                       const VkBufferCopy& region,
+                                       VkPipelineStageFlags before_stage_mask,
+                                       VkAccessFlags before_access_mask,
+                                       VkPipelineStageFlags after_stage_mask,
+                                       VkAccessFlags after_access_mask);
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
@@ -58,6 +165,12 @@ class DeferredCommandBuffer {
                   render_pass_begin->pClearValues,
                   sizeof(VkClearValue) * clear_value_count);
     }
+    render_pass_args_offset_ =
+        size_t(reinterpret_cast<uintmax_t*>(args_ptr) - command_stream_.data());
+    ++render_pass_serial_;
+    // Clear load ops act on the whole render area, so keep it.
+    render_pass_unbounded_ = clear_value_count != 0;
+    render_pass_has_bounds_ = false;
   }
 
   void CmdVkBindDescriptorSets(VkPipelineBindPoint pipeline_bind_point,
@@ -183,6 +296,8 @@ class DeferredCommandBuffer {
                   alignof(VkClearRect));
     size_t rects_offset = arguments_size;
     arguments_size += sizeof(VkClearRect) * rect_count;
+    // Rects are filled in by the caller later, so keep the full area.
+    render_pass_unbounded_ = true;
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
         WriteCommand(Command::kVkClearAttachments, arguments_size));
     auto& args = *reinterpret_cast<ArgsVkClearAttachments*>(args_ptr);
@@ -334,6 +449,7 @@ class DeferredCommandBuffer {
 
   void CmdVkDraw(uint32_t vertex_count, uint32_t instance_count,
                  uint32_t first_vertex, uint32_t first_instance) {
+    AddDrawToRenderPassBounds();
     auto& args = *reinterpret_cast<ArgsVkDraw*>(
         WriteCommand(Command::kVkDraw, sizeof(ArgsVkDraw)));
     args.vertex_count = vertex_count;
@@ -345,6 +461,7 @@ class DeferredCommandBuffer {
   void CmdVkDrawIndexed(uint32_t index_count, uint32_t instance_count,
                         uint32_t first_index, int32_t vertex_offset,
                         uint32_t first_instance) {
+    AddDrawToRenderPassBounds();
     auto& args = *reinterpret_cast<ArgsVkDrawIndexed*>(
         WriteCommand(Command::kVkDrawIndexed, sizeof(ArgsVkDrawIndexed)));
     args.index_count = index_count;
@@ -354,7 +471,11 @@ class DeferredCommandBuffer {
     args.first_instance = first_instance;
   }
 
-  void CmdVkEndRenderPass() { WriteCommand(Command::kVkEndRenderPass, 0); }
+  void CmdVkEndRenderPass() {
+    FlushHoistedBufferCopies();
+    ShrinkRenderPassArea();
+    WriteCommand(Command::kVkEndRenderPass, 0);
+  }
 
   // Dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3)
   // Simpler than CmdVkBeginRenderPass - doesn't need
@@ -412,6 +533,10 @@ class DeferredCommandBuffer {
     auto& args = *reinterpret_cast<ArgsVkSetScissor*>(args_ptr);
     args.first_scissor = first_scissor;
     args.scissor_count = scissor_count;
+    if (first_scissor == 0 && scissor_count) {
+      current_scissor_ = scissors[0];
+      current_scissor_valid_ = true;
+    }
     std::memcpy(args_ptr + header_size, scissors,
                 sizeof(VkRect2D) * scissor_count);
   }
@@ -483,6 +608,57 @@ class DeferredCommandBuffer {
   }
 
  private:
+  // Render area shrinking (vulkan_shrink_render_area): all host render passes
+  // load and store their attachments, so the render area can be reduced to
+  // the union of the draw scissors without changing results. On tiled GPUs
+  // this skips loading and storing the unused part of each render target.
+  void AddDrawToRenderPassBounds() {
+    if (render_pass_args_offset_ == SIZE_MAX || render_pass_unbounded_) {
+      return;
+    }
+    if (!current_scissor_valid_) {
+      render_pass_unbounded_ = true;
+      return;
+    }
+    int32_t x0 = current_scissor_.offset.x, y0 = current_scissor_.offset.y;
+    int32_t x1 = x0 + int32_t(current_scissor_.extent.width);
+    int32_t y1 = y0 + int32_t(current_scissor_.extent.height);
+    if (!render_pass_has_bounds_) {
+      render_pass_bounds_[0] = x0;
+      render_pass_bounds_[1] = y0;
+      render_pass_bounds_[2] = x1;
+      render_pass_bounds_[3] = y1;
+      render_pass_has_bounds_ = true;
+    } else {
+      render_pass_bounds_[0] = std::min(render_pass_bounds_[0], x0);
+      render_pass_bounds_[1] = std::min(render_pass_bounds_[1], y0);
+      render_pass_bounds_[2] = std::max(render_pass_bounds_[2], x1);
+      render_pass_bounds_[3] = std::max(render_pass_bounds_[3], y1);
+    }
+  }
+  void ShrinkRenderPassArea();
+  size_t render_pass_args_offset_ = SIZE_MAX;
+  uint64_t render_pass_serial_ = 0;
+  bool hoisting_ = false;
+  std::vector<uintmax_t> hoist_saved_stream_;
+  struct HoistedBufferCopy {
+    VkBuffer src_buffer;
+    VkBufferCopy region;
+  };
+  std::vector<HoistedBufferCopy> hoisted_copies_;
+  std::vector<VkBufferCopy> hoisted_copy_regions_;
+  VkBuffer hoisted_copies_dst_buffer_ = VK_NULL_HANDLE;
+  VkPipelineStageFlags hoisted_before_stage_mask_ = 0;
+  VkAccessFlags hoisted_before_access_mask_ = 0;
+  VkPipelineStageFlags hoisted_after_stage_mask_ = 0;
+  VkAccessFlags hoisted_after_access_mask_ = 0;
+  void FlushHoistedBufferCopies();
+  bool render_pass_unbounded_ = false;
+  bool render_pass_has_bounds_ = false;
+  int32_t render_pass_bounds_[4] = {};
+  VkRect2D current_scissor_ = {};
+  bool current_scissor_valid_ = false;
+
   enum class Command {
     kVkBeginRenderPass,
     kVkBindDescriptorSets,
@@ -742,6 +918,26 @@ class DeferredCommandBuffer {
   void* WriteCommand(Command command, size_t arguments_size_bytes);
 
   const VulkanCommandProcessor& command_processor_;
+
+  static constexpr uint32_t kGpuTimingRing = 4;
+  static constexpr uint32_t kGpuTimingMaxQueries = 4096;
+  VkQueryPool gpu_timing_pools_[kGpuTimingRing] = {};
+  uint32_t gpu_timing_query_counts_[kGpuTimingRing] = {};
+  // Timed segments in query order: draw count for render passes, or
+  // kGpuTimingSegmentDispatch / kGpuTimingSegmentCopy.
+  static constexpr uint32_t kGpuTimingSegmentDispatch = UINT32_MAX;
+  static constexpr uint32_t kGpuTimingSegmentCopy = UINT32_MAX - 1;
+  std::vector<uint32_t> gpu_timing_pass_draws_[kGpuTimingRing];
+  // Compute pipeline of each dispatch segment, in order.
+  std::vector<VkPipeline> gpu_timing_dispatch_pipelines_[kGpuTimingRing];
+  struct TimedPass {
+    VkRenderPass render_pass;
+    uint32_t width, height;
+  };
+  std::vector<TimedPass> gpu_timing_passes_[kGpuTimingRing];
+  uint32_t gpu_timing_ring_index_ = 0;
+  double gpu_timing_period_ns_ = 0.0;
+  void CollectGpuTiming(uint32_t slot);
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
