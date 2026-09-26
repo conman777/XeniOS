@@ -12,6 +12,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
@@ -22,6 +23,8 @@
 DECLARE_bool(spirv_guest_zero_multiply);
 DECLARE_bool(spirv_guest_zero_multiply_vs);
 DECLARE_bool(spirv_guest_zero_multiply_fast);
+DECLARE_bool(spirv_guest_zero_multiply_vector_mul);
+DECLARE_bool(spirv_guest_zero_multiply_nan_to_zero);
 
 namespace xe {
 namespace gpu {
@@ -290,7 +293,26 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
           used_result_components &
           ~instr.vector_operands[0].GetIdenticalComponents(
               instr.vector_operands[1]);
-      if (multiplicands_different) {
+      // Cheaper approximation of the zero rule (spirv_guest_zero_multiply_nan_
+      // to_zero): a NaN product becomes +0. Matches the rule for 0 * infinity
+      // and 0 * NaN, differs only for NaN from NaN operands and the sign of
+      // zero.
+      bool zero_rule_nan_to_zero =
+          multiplicands_different &&
+          cvars::spirv_guest_zero_multiply_vector_mul &&
+          cvars::spirv_guest_zero_multiply_nan_to_zero;
+      if (zero_rule_nan_to_zero) {
+        spv::Id bool_type =
+            used_result_component_count > 1
+                ? type_bool_vectors_[used_result_component_count - 1]
+                : type_bool_;
+        result = builder_->createTriOp(
+            spv::OpSelect, result_type,
+            builder_->createUnaryOp(spv::OpIsNan, bool_type, result),
+            const_float_vectors_0_[used_result_component_count - 1], result);
+      }
+      if (multiplicands_different && !zero_rule_nan_to_zero &&
+          cvars::spirv_guest_zero_multiply_vector_mul) {
         // Shader Model 3: +0 or denormal * anything = +-0.
         spv::Id different_operands[2] = {multiplicands[0], multiplicands[1]};
         spv::Id different_result = result;

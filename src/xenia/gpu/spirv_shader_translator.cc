@@ -58,6 +58,22 @@ DEFINE_int32(spirv_debug_null_vs, 0,
             "Diagnostic: make every vertex shader output a clipped position and "
             "return, to measure per-draw overhead without vertex work.",
             "GPU");
+#if XE_PLATFORM_ANDROID
+// Measured on Adreno 740 (Halo Reach): the exact rule in vector mul/mad costs
+// ~10% of the frame; replacing NaN products with 0 recovers most of it with no
+// visible difference.
+static constexpr bool kZeroMultiplyNanToZeroDefault = true;
+#else
+static constexpr bool kZeroMultiplyNanToZeroDefault = false;
+#endif
+DEFINE_bool(spirv_guest_zero_multiply_nan_to_zero, kZeroMultiplyNanToZeroDefault,
+            "In vector mul/mad, approximate the zero multiplication rule by "
+            "replacing NaN products with +0 (cheaper; differs only for NaN "
+            "operands and the sign of zero).",
+            "GPU");
+DEFINE_bool(spirv_guest_zero_multiply_vector_mul, true,
+            "Diagnostic: apply the zero multiplication rule to vector mul/mad.",
+            "GPU");
 DEFINE_bool(spirv_guest_zero_multiply_fast, false,
             "Compute guest dot products without the zero multiplication rule "
             "first, and redo them with it only when the result is NaN (the "
