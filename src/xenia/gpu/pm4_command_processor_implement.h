@@ -846,6 +846,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
         is_memory ? "mem" : "reg", poll_reg_addr, ref, mask);
   }
   assert_true(is_memory || poll_reg_addr < RegisterFile::kRegisterCount);
+  if (is_memory) {
+    // Host reads of guest memory need any deferred (readback) data first.
+    memory_->ProvideDeferredPhysicalMemoryWrites(poll_reg_addr & 0x1FFFFFFC, 4);
+  }
   const volatile uint32_t& value_ref =
       is_memory ? *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(
                       poll_reg_addr & ~uint32_t(0x3)))
@@ -956,6 +960,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_REG_TO_MEM(
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
+  memory_->ProvideDeferredPhysicalMemoryWrites(mem_addr & 0x1FFFFFFF, 4);
   xe::store(memory_->TranslatePhysical(mem_addr), reg_val);
   trace_writer_.WriteMemoryWrite(CpuToGpu(mem_addr), 4);
 
@@ -977,6 +982,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_MEM_WRITE(
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
+    memory_->ProvideDeferredPhysicalMemoryWrites(addr & 0x1FFFFFFF, 4);
     xe::store(memory_->TranslatePhysical(addr), write_data);
     trace_writer_.WriteMemoryWrite(CpuToGpu(addr), 4);
     write_addr += 4;
@@ -1010,6 +1016,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
     trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr), 4);
+    memory_->ProvideDeferredPhysicalMemoryWrites(poll_reg_addr & 0x1FFFFFFF, 4);
     value = xe::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
   } else {
@@ -1026,6 +1033,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
+      memory_->ProvideDeferredPhysicalMemoryWrites(write_reg_addr & 0x1FFFFFFF, 4);
       xe::store(memory_->TranslatePhysical(write_reg_addr), write_data);
       trace_writer_.WriteMemoryWrite(CpuToGpu(write_reg_addr), 4);
     } else {
@@ -1088,6 +1096,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
+  memory_->ProvideDeferredPhysicalMemoryWrites(address & 0x1FFFFFFF, 4);
   uint8_t* write_destination = memory_->TranslatePhysical(address);
   if (address > 0x1FFFFFFF) {
     uint32_t writeback_base =
@@ -1139,6 +1148,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
   };
   assert_true(endianness == xenos::Endian::k8in16);
 
+  memory_->ProvideDeferredPhysicalMemoryWrites(address & 0x1FFFFFFF, 6 * sizeof(uint16_t));
   uint16_t* destination = (uint16_t*)memory_->TranslatePhysical(address);
 
   for (unsigned i = 0; i < 6; ++i) {
@@ -1440,6 +1450,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_LOAD_ALU_CONSTANT(
         index, size_dwords, address);
   }
 
+  memory_->ProvideDeferredPhysicalMemoryWrites(address & 0x1FFFFFFF, size_dwords * 4);
   auto xlat_address = (uint32_t*)memory_->TranslatePhysical(address);
 
   switch (type) {
@@ -1519,6 +1530,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_IM_LOAD(uint32_t packet,
   }
 
   trace_writer_.WriteMemoryRead(CpuToGpu(addr), size_dwords * 4);
+  memory_->ProvideDeferredPhysicalMemoryWrites(addr & 0x1FFFFFFF, size_dwords * 4);
   auto shader = COMMAND_PROCESSOR::LoadShader(
       shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr),
       size_dwords);

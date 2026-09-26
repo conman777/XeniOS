@@ -673,6 +673,7 @@ bool Memory::AccessViolationCallback(
     return false;
   }
   uint32_t virtual_address = HostToGuestVirtual(host_address);
+  ++(is_write ? access_violation_writes : access_violation_reads);
   BaseHeap* heap = LookupHeap(virtual_address);
   if (heap->heap_type() != HeapType::kGuestPhysical) {
     return false;
@@ -732,6 +733,113 @@ void Memory::UnregisterPhysicalMemoryInvalidationCallback(
     }
   }
   delete entry;
+}
+
+void Memory::TakeDeferredPhysicalWritesLocked(uint32_t start, uint32_t end,
+                                              bool copy) {
+  if (start >= end || deferred_physical_writes_.empty()) {
+    return;
+  }
+  auto it = deferred_physical_writes_.upper_bound(start);
+  if (it != deferred_physical_writes_.begin()) {
+    --it;
+  }
+  while (it != deferred_physical_writes_.end() && it->first < end) {
+    uint32_t entry_start = it->first;
+    uint32_t entry_end = entry_start + it->second.length;
+    if (entry_end <= start) {
+      ++it;
+      continue;
+    }
+    DeferredPhysicalWrite entry = it->second;
+    it = deferred_physical_writes_.erase(it);
+    uint32_t take_start = std::max(entry_start, start);
+    uint32_t take_end = std::min(entry_end, end);
+    if (copy) {
+      ++deferred_provide_calls;
+      deferred_bytes_provided += take_end - take_start;
+      std::memcpy(TranslatePhysical(take_start),
+                  entry.src + (take_start - entry_start),
+                  take_end - take_start);
+    }
+    // Keep the parts outside the range.
+    if (entry_start < take_start) {
+      deferred_physical_writes_.emplace(
+          entry_start, DeferredPhysicalWrite{take_start - entry_start,
+                                             entry.src});
+    }
+    if (take_end < entry_end) {
+      it = deferred_physical_writes_
+               .emplace(take_end,
+                        DeferredPhysicalWrite{
+                            entry_end - take_end,
+                            entry.src + (take_end - entry_start)})
+               .first;
+      ++it;
+    }
+  }
+}
+
+void Memory::DeferPhysicalMemoryWrite(uint32_t physical_address,
+                                      uint32_t length, const void* src) {
+  if (!length) {
+    return;
+  }
+  bool already_armed = false;
+  {
+    std::lock_guard<std::mutex> lock(deferred_physical_writes_mutex_);
+    // Older deferred bytes in the range are superseded, not copied.
+    TakeDeferredPhysicalWritesLocked(physical_address,
+                                     physical_address + length, false);
+    deferred_physical_writes_.emplace(
+        physical_address,
+        DeferredPhysicalWrite{length, static_cast<const uint8_t*>(src)});
+    deferred_bytes_registered += length;
+    if (deferred_armed_ranges_stale_.exchange(false,
+                                              std::memory_order_acq_rel)) {
+      deferred_armed_ranges_.clear();
+    }
+    auto armed_it = deferred_armed_ranges_.upper_bound(physical_address);
+    if (armed_it != deferred_armed_ranges_.begin()) {
+      --armed_it;
+      already_armed = armed_it->second >= physical_address + length;
+    }
+    if (!already_armed) {
+      deferred_armed_ranges_[physical_address] = physical_address + length;
+    }
+  }
+  if (already_armed) {
+    return;
+  }
+  // Protect after the entry exists, so a fault always finds it. Never done
+  // while holding the deferred write mutex (faults take the global lock
+  // first, then that mutex).
+  heaps_.vA0000000.ArmDataProvider(physical_address, length);
+  heaps_.vC0000000.ArmDataProvider(physical_address, length);
+  heaps_.vE0000000.ArmDataProvider(physical_address, length);
+}
+
+void Memory::FlushDeferredPhysicalMemoryWrites(uint32_t physical_address,
+                                               uint32_t length) {
+  std::lock_guard<std::mutex> lock(deferred_physical_writes_mutex_);
+  TakeDeferredPhysicalWritesLocked(
+      physical_address, uint32_t(std::min(uint64_t(physical_address) + length,
+                                          uint64_t(UINT32_MAX))),
+      true);
+}
+
+void Memory::DropDeferredPhysicalMemoryWrites() {
+  std::lock_guard<std::mutex> lock(deferred_physical_writes_mutex_);
+  deferred_physical_writes_.clear();
+  // Protection may have been reset with the memory image.
+  deferred_armed_ranges_.clear();
+}
+
+void Memory::ProvideDeferredPhysicalMemoryWrites(uint32_t physical_address,
+                                                 uint32_t length) {
+  std::lock_guard<std::mutex> lock(deferred_physical_writes_mutex_);
+  TakeDeferredPhysicalWritesLocked(physical_address, physical_address + length,
+                                   true);
 }
 
 void Memory::EnablePhysicalMemoryAccessCallbacks(
@@ -2250,6 +2358,65 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   return BaseHeap::Protect(address, size, protect);
 }
 
+void PhysicalHeap::ArmDataProvider(uint32_t physical_address,
+                                   uint32_t length) {
+  uint32_t physical_address_offset = GetPhysicalAddress(heap_base_);
+  if (physical_address < physical_address_offset) {
+    if (physical_address_offset - physical_address >= length) {
+      return;
+    }
+    length -= physical_address_offset - physical_address;
+    physical_address = physical_address_offset;
+  }
+  uint32_t heap_relative_address = physical_address - physical_address_offset;
+  if (heap_relative_address >= heap_size_) {
+    return;
+  }
+  length = std::min(length, heap_size_ - heap_relative_address);
+  if (!length) {
+    return;
+  }
+  uint32_t system_page_first =
+      (heap_relative_address + host_address_offset()) >> system_page_shift_;
+  uint32_t system_page_last =
+      std::min((heap_relative_address + length - 1 + host_address_offset()) >>
+                   system_page_shift_,
+               system_page_count_ - 1);
+  uint8_t* protect_base = membase_ + heap_base_;
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t protect_first = UINT32_MAX;
+  for (uint32_t i = system_page_first; i <= system_page_last + 1; ++i) {
+    bool protect_page = false;
+    if (i <= system_page_last) {
+      uint32_t guest_page = SystemPagenumToGuestPagenum(i);
+      uint64_t page_bit = uint64_t(1) << (i & 63);
+      SystemPageFlagsBlock& flags = system_page_flags_[i >> 6];
+      // Leave inaccessible pages alone (real access violations there), and
+      // pages already armed.
+      if (guest_page < page_table_.size() &&
+          ToPageAccess(page_table_[guest_page].current_protect) !=
+              xe::memory::PageAccess::kNoAccess &&
+          !(flags.provide_data & page_bit)) {
+        flags.provide_data |= page_bit;
+        protect_page = true;
+        ++memory_->deferred_pages_armed;
+      } else {
+        ++memory_->deferred_pages_skipped;
+      }
+    }
+    if (protect_page) {
+      if (protect_first == UINT32_MAX) {
+        protect_first = i;
+      }
+    } else if (protect_first != UINT32_MAX) {
+      xe::memory::Protect(protect_base + (protect_first << system_page_shift_),
+                          (i - protect_first) << system_page_shift_,
+                          xe::memory::PageAccess::kNoAccess);
+      protect_first = UINT32_MAX;
+    }
+  }
+}
+
 void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address,
                                          uint32_t length,
                                          bool enable_invalidation_notifications,
@@ -2371,7 +2538,11 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
     if (current_page_access != xe::memory::PageAccess::kNoAccess) {
       // TODO(Triang3l): Enable data providers.
       if constexpr (enable_invalidation_notifications) {
-        if (current_page_access != xe::memory::PageAccess::kReadOnly &&
+        if ((page_flags_block.provide_data & page_flags_bit) != 0) {
+          // Already inaccessible until its data is provided - stricter than
+          // needed, so only enable the notifications.
+          page_flags_block.notify_on_invalidation |= page_flags_bit;
+        } else if (current_page_access != xe::memory::PageAccess::kReadOnly &&
             (page_flags_block.notify_on_invalidation & page_flags_bit) == 0) {
           // TODO(Triang3l): Check if data providers are already enabled.
           // If data providers are already enabled for the page, it has even
@@ -2407,12 +2578,6 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
 bool PhysicalHeap::TriggerCallbacks(
     global_unique_lock_type global_lock_locked_once, uint32_t virtual_address,
     uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect) {
-  // TODO(Triang3l): Support read watches.
-  assert_true(is_write);
-  if (!is_write) {
-    return false;
-  }
-
   if (virtual_address < heap_base_) {
     if (heap_base_ - virtual_address >= length) {
       return false;
@@ -2439,6 +2604,49 @@ bool PhysicalHeap::TriggerCallbacks(
   uint32_t block_index_first = system_page_first >> 6;
   uint32_t block_index_last = system_page_last >> 6;
 
+  // Deferred data first, so writes to these pages merge with it and reads see
+  // it.
+  bool any_provided = false;
+  for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
+    uint64_t page_bit = uint64_t(1) << (i & 63);
+    SystemPageFlagsBlock& flags = system_page_flags_[i >> 6];
+    if (!(flags.provide_data & page_bit)) {
+      continue;
+    }
+    any_provided = true;
+    flags.provide_data &= ~page_bit;
+    memory_->OnDeferredPagesDisarmed();
+    uint32_t page_heap_relative =
+        xe::sat_sub(i << system_page_shift_, host_address_offset());
+    uint32_t page_length =
+        std::min(system_page_size_ -
+                     std::min(system_page_size_,
+                              xe::sat_sub(host_address_offset(),
+                                          i << system_page_shift_)),
+                 heap_size_ - std::min(heap_size_, page_heap_relative));
+    if (page_length) {
+      memory_->ProvideDeferredPhysicalMemoryWrites(
+          GetPhysicalAddress(heap_base_) + page_heap_relative, page_length);
+    }
+    // Back to what the page needs without deferred data: read-only if still
+    // watched for invalidation (a write continues below), otherwise the
+    // guest-requested access.
+    uint32_t guest_page = SystemPagenumToGuestPagenum(i);
+    xe::memory::PageAccess access =
+        guest_page < page_table_.size()
+            ? ToPageAccess(page_table_[guest_page].current_protect)
+            : xe::memory::PageAccess::kNoAccess;
+    if (access == xe::memory::PageAccess::kReadWrite &&
+        (flags.notify_on_invalidation & page_bit)) {
+      access = xe::memory::PageAccess::kReadOnly;
+    }
+    xe::memory::Protect(membase_ + heap_base_ + (i << system_page_shift_),
+                        system_page_size_, access);
+  }
+  if (!is_write) {
+    return any_provided;
+  }
+
   // Check if watching any page, whether need to call the callback at all.
   bool any_watched = false;
   for (uint32_t i = block_index_first; i <= block_index_last; ++i) {
@@ -2455,7 +2663,7 @@ bool PhysicalHeap::TriggerCallbacks(
     }
   }
   if (!any_watched) {
-    return false;
+    return any_provided;
   }
 
   // Trigger callbacks.
@@ -2527,7 +2735,9 @@ bool PhysicalHeap::TriggerCallbacks(
     for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
       // Check if need to allow writing to this page.
       bool unprotect_page = (system_page_flags_[i >> 6].notify_on_invalidation &
-                             (uint64_t(1) << (i & 63))) != 0;
+                             (uint64_t(1) << (i & 63))) != 0 &&
+                            (system_page_flags_[i >> 6].provide_data &
+                             (uint64_t(1) << (i & 63))) == 0;
       if (unprotect_page) {
         uint32_t guest_page_first = SystemPagenumToGuestPagenum(i);
         if (guest_page_first >= page_table_.size()) {

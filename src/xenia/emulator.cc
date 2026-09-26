@@ -1695,7 +1695,11 @@ bool Emulator::SaveToFile(const std::filesystem::path& path,
       save_phase("graphics", [&] { return graphics_system_->Save(&stream); }) &&
       save_phase("audio", [&] { return audio_system_->Save(&stream); }) &&
       save_phase("kernel", [&] { return kernel_state_->Save(&stream); }) &&
-      save_phase("memory", [&] { return memory_->Save(&stream); });
+      save_phase("memory", [&] {
+        // Deferred host writes (resolve readback) belong in the image.
+        memory_->FlushDeferredPhysicalMemoryWrites();
+        return memory_->Save(&stream);
+      });
   if (!saved) {
     map.reset();
     std::filesystem::remove(temporary_path, file_error);
@@ -1884,6 +1888,8 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path,
   if (!memory_->Restore(&stream)) {
     return restore_failed("Memory");
   }
+  // Deferred host writes are from the replaced timeline.
+  memory_->DropDeferredPhysicalMemoryWrites();
   // Memory::Restore replaces guest RAM after the backend has restored EDRAM.
   // Host GPU caches may therefore still contain data from the pre-restore
   // timeline. Queue invalidation before the command processor is resumed so

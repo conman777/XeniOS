@@ -10,7 +10,9 @@
 #ifndef XENIA_MEMORY_H_
 #define XENIA_MEMORY_H_
 
+#include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -285,6 +287,8 @@ class PhysicalHeap : public BaseHeap {
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                              bool enable_invalidation_notifications,
                              bool enable_data_providers);
+  // Makes the pages inaccessible until their deferred data is provided.
+  void ArmDataProvider(uint32_t physical_address, uint32_t length);
   template <bool enable_invalidation_notifications>
   XE_NOINLINE void EnableAccessCallbacksInner(
       const uint32_t system_page_first, const uint32_t system_page_last,
@@ -326,6 +330,10 @@ class PhysicalHeap : public BaseHeap {
     // Whether writing to each page should result trigger invalidation
     // callbacks.
     uint64_t notify_on_invalidation;
+    // Whether the page has deferred host-produced contents (see
+    // Memory::DeferPhysicalMemoryWrite) and is inaccessible until they're
+    // copied in on the first guest access.
+    uint64_t provide_data;
   };
   // Protected by global_critical_region. Flags for each 64 system pages,
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.
@@ -505,6 +513,33 @@ class Memory {
   // RegisterPhysicalMemoryInvalidationCallback.
   void UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle);
 
+  // Deferred host writes to guest physical memory: length bytes at src (which
+  // must stay valid until the range is provided, flushed or dropped) are
+  // copied to the physical address only when the guest first accesses one of
+  // the pages, instead of eagerly. For large GPU results the CPU rarely reads,
+  // such as resolve readback. Overlapping older deferred bytes are replaced.
+  void DeferPhysicalMemoryWrite(uint32_t physical_address, uint32_t length,
+                                const void* src);
+  // Copies deferred bytes overlapping the range into guest memory now (the
+  // pages stay protected until the next access, which then finds nothing).
+  void FlushDeferredPhysicalMemoryWrites(uint32_t physical_address = 0,
+                                         uint32_t length = UINT32_MAX);
+  // Forgets all deferred bytes without copying (guest memory was replaced).
+  void DropDeferredPhysicalMemoryWrites();
+  // Copies deferred bytes overlapping the range and forgets them. Called on
+  // guest access to a provided page.
+  void ProvideDeferredPhysicalMemoryWrites(uint32_t physical_address,
+                                           uint32_t length);
+  // Diagnostics: deferred bytes registered, provided on access, and flushed.
+  std::atomic<uint64_t> deferred_bytes_registered{0};
+  std::atomic<uint64_t> deferred_bytes_provided{0};
+  std::atomic<uint64_t> deferred_provide_calls{0};
+  std::atomic<uint64_t> deferred_bytes_flushed{0};
+  std::atomic<uint64_t> deferred_pages_armed{0};
+  std::atomic<uint64_t> deferred_pages_skipped{0};
+  std::atomic<uint64_t> access_violation_reads{0};
+  std::atomic<uint64_t> access_violation_writes{0};
+
   // Enables physical memory access callbacks for the specified memory range,
   // snapped to system page boundaries.
   void EnablePhysicalMemoryAccessCallbacks(
@@ -629,6 +664,28 @@ class Memory {
   xe::global_critical_region global_critical_region_;
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+
+  struct DeferredPhysicalWrite {
+    uint32_t length;
+    const uint8_t* src;
+  };
+  // Non-overlapping, keyed by the physical start address.
+  std::map<uint32_t, DeferredPhysicalWrite> deferred_physical_writes_;
+  // Physical ranges (start -> end) known to be armed in all views, so
+  // repeated deferrals of the same resolve don't walk the pages under the
+  // global lock. Cleared whenever a guest access disarms any page.
+  std::map<uint32_t, uint32_t> deferred_armed_ranges_;
+  std::atomic<bool> deferred_armed_ranges_stale_{false};
+ public:
+  void OnDeferredPagesDisarmed() {
+    deferred_armed_ranges_stale_.store(true, std::memory_order_release);
+  }
+ private:
+  std::mutex deferred_physical_writes_mutex_;
+  // Removes deferred bytes overlapping [start, end), copying them to guest
+  // memory if copy is true. Requires deferred_physical_writes_mutex_.
+  void TakeDeferredPhysicalWritesLocked(uint32_t start, uint32_t end,
+                                        bool copy);
 };
 
 }  // namespace xe

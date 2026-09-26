@@ -108,6 +108,17 @@ DEFINE_int32(trace_dump_texture_slot, -1,
              "With trace_dump_edram_draws: also dump the host texture bound "
              "to this fetch constant slot after each dumped draw.",
              "GPU");
+DEFINE_bool(readback_resolve_deferred, true,
+            "Copy fast/some-mode resolve readback into guest memory only when "
+            "the guest first accesses those pages (via page protection), "
+            "instead of every resolve.",
+            "GPU");
+DEFINE_uint32(readback_resolve_defer_min_kb, 256,
+            "With readback_resolve_deferred, only defer resolves larger than "
+            "this (KB); smaller ones (such as exposure luminance, which is "
+            "consumed through a path not covered by page protection) are copied "
+            "eagerly.",
+            "GPU");
 DEFINE_uint32(readback_resolve_max_kb, 0,
             "Only copy resolves up to this size (KB) back to guest memory for "
             "the CPU (0 = all). Games read back small results such as exposure "
@@ -751,6 +762,8 @@ void VulkanCommandProcessor::ClearReadbackBuffers() {
            "buffers");
     return;
   }
+  // Deferred guest memory writes point into the readback buffers.
+  memory_->FlushDeferredPhysicalMemoryWrites();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -2272,6 +2285,8 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          gamma_ramp_buffer_memory_);
 
   // Clean up all readback buffers.
+  // Deferred guest memory writes point into the readback buffers.
+  memory_->FlushDeferredPhysicalMemoryWrites();
   for (auto& pair : readback_buffers_) {
     for (int i = 0; i < 2; i++) {
       if (pair.second.mapped_data[i] != nullptr) {
@@ -3153,6 +3168,27 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         const DeferredCommandBuffer::WorkStats& work =
             DeferredCommandBuffer::work_stats();
         double per_swap = delta_swaps ? 1.0 / delta_swaps : 0.0;
+        {
+          static uint64_t last_registered = 0, last_provided = 0,
+                          last_calls = 0;
+          uint64_t registered = memory_->deferred_bytes_registered.load();
+          uint64_t provided = memory_->deferred_bytes_provided.load();
+          uint64_t calls = memory_->deferred_provide_calls.load();
+          XELOGI(
+              "HaloReach DeferredReadback per_swap registered_kb={:.0f} "
+              "provided_kb={:.0f} provide_faults={:.1f} armed_pages={} "
+              "skipped_pages={} av_reads={} av_writes={}",
+              (registered - last_registered) * per_swap / 1024.0,
+              (provided - last_provided) * per_swap / 1024.0,
+              (calls - last_calls) * per_swap,
+              memory_->deferred_pages_armed.load(),
+              memory_->deferred_pages_skipped.load(),
+              memory_->access_violation_reads.load(),
+              memory_->access_violation_writes.load());
+          last_registered = registered;
+          last_provided = provided;
+          last_calls = calls;
+        }
         XELOGI(
             "HaloReach GpuWork per_swap render_passes={:.1f} rp_mpix={:.1f} "
             "draws={:.1f} dispatches={:.1f} barriers={:.1f} copies={:.1f} "
@@ -5946,6 +5982,9 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
   for (auto it = buffer_map.begin(); it != buffer_map.end();) {
     if (it->second.last_used_frame <
         frame_current_ - kReadbackBufferEvictionAgeFrames) {
+      // Deferred guest memory writes may point into these buffers.
+      memory_->FlushDeferredPhysicalMemoryWrites(uint32_t(it->first >> 32),
+                                                 uint32_t(it->first));
       // Unmap and release both buffers
       for (int i = 0; i < 2; i++) {
         if (it->second.mapped_data[i] != nullptr) {
@@ -6149,6 +6188,10 @@ bool VulkanCommandProcessor::IssueCopy() {
         return true;
       }
 
+      // Deferred guest memory writes may point into the buffer being
+      // replaced.
+      memory_->FlushDeferredPhysicalMemoryWrites(written_address,
+                                                 written_length);
       // Clean up old buffer if exists
       // Must wait for GPU to finish using the buffer before destroying it
       if (rb.buffers[write_index] != VK_NULL_HANDLE) {
@@ -6255,7 +6298,15 @@ bool VulkanCommandProcessor::IssueCopy() {
                                      readback_ptr);
       }
 #endif  // XE_PLATFORM_ANDROID
-      memory::vastcpy(dest_ptr, readback_ptr, written_length);
+      if (cvars::readback_resolve_deferred && read_index != write_index &&
+          written_length > cvars::readback_resolve_defer_min_kb * 1024) {
+        // The previous resolve's data (already complete, as with the eager
+        // copy) goes to guest memory on first CPU access.
+        memory_->DeferPhysicalMemoryWrite(written_address, written_length,
+                                          readback_ptr);
+      } else {
+        memory::vastcpy(dest_ptr, readback_ptr, written_length);
+      }
       ++DeferredCommandBuffer::work_stats().readback_copies;
       DeferredCommandBuffer::work_stats().readback_bytes += written_length;
 #if XE_PLATFORM_ANDROID
