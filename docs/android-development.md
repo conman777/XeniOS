@@ -446,6 +446,59 @@ fresh pre-test backups. The final build restored the gameplay scene, logged
 129 passes per frame with batching disabled, and accepted START to open and
 close the pause menu.
 
+### SPIR-V optimization investigation (2026-09-30)
+
+Enabling the existing `vulkan_spirv_optimization` option did not produce a
+useful gameplay speedup. Current code optimizes translated shaders before
+creating their Vulkan modules, including synchronous creation; the cvar's
+async-only help text is stale. Restart the process when changing this option.
+
+The same Odin2 Portal and `gameplay_hud.xes` were measured with GPU timing
+enabled, pass-break logging disabled and the guest arithmetic flags unchanged.
+All measured intervals had zero pending shader compilation. The GPU samples
+reported 99% busy at 680 MHz.
+
+| APK / optimizer | Measured time | Refreshed-output fps | Reported GPU ms/swap |
+| --- | --- | --- | --- |
+| Committed APK, off | 120.50 s | 16.33 | 57.33 |
+| Committed APK, on | 115.81 s | 16.16 | 57.47 |
+| Committed APK, on, longer startup warmup | 115.83 s | 16.24 | 57.45 |
+| Temporary filter APK, off | 120.55 s | 16.27 | 57.51 |
+| Temporary filter APK, 12 pixel shaders only | 120.54 s | 16.34 | 57.43 |
+
+The first enabled launch's restore timed out during startup compilation. Its
+successful retry was warmed before measurement; the longer-warmup repeat
+restored normally and also showed no gain. The two temporary-filter rows use
+the same APK, SHA-256
+`E8AD3B8F40AE43B7CD28127F06E0D95B34D15A6E084E663751EBD9EDFE96EA43`.
+Their 0.07 fps difference (0.4%) does not justify retaining the filter.
+
+Matching headless replays confirmed that all 305 guest SPIR-V modules changed
+with global optimization, reducing their total size from 18,600,472 to
+15,019,208 bytes. Adreno instruction counts did not improve consistently;
+the large vertex shader grew from 43,355 to 43,947 instructions. A temporary
+filter isolated 12 pixel shaders with reduced driver-reported scratch usage.
+Exactly those 12 modules changed, matched their globally optimized versions,
+and the other 293 remained byte-identical to baseline. A new-build disabled
+control matched all 305 original modules. Early live startup capture also
+confirmed both filter flags were applied and 12 optimizations succeeded.
+
+The 38-resolve optimized and filtered replays matched each other exactly.
+They did not consistently match the disabled control: final RGB output
+differed in 109 of 829,440 pixels, maximum channel delta 12, while repeating
+the disabled control differed in 102 pixels with the same maximum delta.
+This small replay variability remains unexplained and does not establish
+image equivalence. Host SPIR-V validation rejected 208 modules in both the
+disabled and globally optimized dumps with existing `OpSelect` and
+`OpLoopMerge` errors; no previously valid module became invalid.
+
+The temporary filter was removed, the original committed APK was restored,
+and global optimization remains disabled. Evidence is retained in the
+artifacts workspace's `diagnostics-spirv-opt-20260930` directory. After the
+probe, all 32 protected private files and both external configuration files
+were restored or verified against fresh backups, and all seven diagnostic
+slot hashes were verified unchanged.
+
 ### Repeatable gameplay measurement
 
 The bundled profile uses `readback_resolve=fast` and asynchronous shader
