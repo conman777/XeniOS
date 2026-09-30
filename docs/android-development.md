@@ -346,12 +346,32 @@ to `PerformTransfersAndResolveClears` (about 35 breaks/frame) and
 These are measured targets for further investigation; data redundancy must
 be proven before removing an ownership transfer or dump.
 
+Two colour-conversion probes, using the same scene with GPU timing enabled,
+did not produce a useful speedup:
+
+| Conversion | Measured time | Refreshed-output fps | GPU ms/swap |
+| --- | --- | --- | --- |
+| Committed implementation, control | 120.73 s | 16.30 | 60.24 |
+| Existing `arithmetic_7e3_conversion=1` experiment | 115.90 s | 16.27 | 59.97 |
+| Exact unpack without a bit scan or variable shift | 115.62 s | 16.29 | 59.92 |
+
+The arithmetic pack probe disagreed with the existing integer conversion
+near rounding boundaries; it remains disabled. The narrower unpack candidate
+passed 141,312 host checks across all 1024 encodings, all legal source bit
+offsets, unrelated surrounding bits and float/uint return modes. Its Android
+build restored and rendered the scene, but the measured difference was too
+small to justify retaining a renderer change for this performance task. The
+candidate was discarded, and the committed optimized APK was reinstalled.
+Neither probe had pending shader compilation. Probe sources and results are
+retained with the local evidence bundle.
+
 Evidence bundles and pre-test APK/profile/ordinary-save/diagnostic-slot backups
 are in the artifacts workspace's `diagnostics-perf-20260930` directory.
-After testing, both profiles were restored byte-for-byte and all 29 checked
-ordinary save/profile files were preserved, including recovery of two files
-Halo updated during the runs. The `current.xes` and `gameplay_hud.xes` slot
-hashes match the pre-test backups. The optimized APK remains installed.
+After testing, both profiles were restored byte-for-byte. All 32 checked
+private save, configuration and launcher-preference files match the original
+backup, including recovery of two save/profile files Halo updated during the
+runs. The `current.xes` and `gameplay_hud.xes` slot hashes match the pre-test
+backups. The committed optimized APK remains installed.
 
 ### Repeatable gameplay measurement
 
