@@ -318,6 +318,80 @@ Profile gotchas:
   changed code default doesn't apply to an install that already saved the
   old value. Delete the line to get the new default.
 
+### Device recheck (2026-09-30)
+
+On the same Odin2 Portal and `gameplay_hud.xes`, after shader warmup:
+
+| APK / profile | Measured time | Refreshed-output fps |
+| --- | --- | --- |
+| Installed September 26 APK, existing profiles | 115.84 s | 16.45 |
+| Rebuilt optimized APK, existing profiles | 120.89 s | 16.38 |
+| Rebuilt optimized APK, bundled profile in both locations | 120.98 s | 16.45 |
+
+No run had pending shader compilation. The installed APK SHA-256 was
+`F89CE4D75CFAF947EF8C177E624AE96A0C17A551B3807E84F195F3DD1C8B7395`;
+the rebuilt APK was
+`BA1AD000923328B50D627D5E3738AFEFF582F65EBDD94F2EDD8942A54FD3CB36`.
+Their packaged ARM64 native library bytes are identical. The existing device
+profiles already set fast readback and the tested memory budgets, so this
+packaging correction does not claim a gameplay speedup on that install.
+The bundled-profile test selected a 3595 MiB device-sized KGSL limit.
+The updated APK restored the scene and accepted START to open the pause menu.
+
+With GPU timestamps and render-pass break logging enabled, a separate
+120.73-second run gave 16.30 fps and 60.24 ms GPU time per swap. The baseline
+GPU samples reported 99% busy at 680 MHz. Symbolized pass-break stacks point
+to `PerformTransfersAndResolveClears` (about 35 breaks/frame) and
+`ExecutePendingDumpRectanglesToEdram` (about 33), followed by texture loading.
+These are measured targets for further investigation; data redundancy must
+be proven before removing an ownership transfer or dump.
+
+Evidence bundles and pre-test APK/profile/ordinary-save/diagnostic-slot backups
+are in the artifacts workspace's `diagnostics-perf-20260930` directory.
+After testing, both profiles were restored byte-for-byte and all 29 checked
+ordinary save/profile files were preserved, including recovery of two files
+Halo updated during the runs. The `current.xes` and `gameplay_hud.xes` slot
+hashes match the pre-test backups. The optimized APK remains installed.
+
+### Repeatable gameplay measurement
+
+The bundled profile uses `readback_resolve=fast` and asynchronous shader
+compilation, and leaves memory budgets to the native Android defaults. It is
+copied only on first launch. Updating the APK preserves existing internal and
+external profiles; it does not migrate their settings. Back up both profiles
+and `xenios.config.toml` before adjusting an existing install. The September 26
+Odin tests already used fast readback, so the bundled-profile correction is
+not a newly measured speedup on that device.
+
+`tools/android/Measure-AndroidGameplay.ps1` measures an already-running scene
+without installing, launching, restoring, clearing logs or writing device
+configuration. Restore the same diagnostic scene, let shaders finish compiling,
+confirm input and new game frames, then collect at least two minutes:
+
+```powershell
+.\tools\android\Measure-AndroidGameplay.ps1 -Serial adf63ecd -Seconds 120 -OutputRoot C:\captures\xenios-perf
+```
+
+Each unique bundle contains the installed APK(s) and SHA-256 hashes, both
+profile locations, saved config, startup and continuous logs, GPU clock/busy
+samples, memory information and a final screenshot. `summary.json` reports
+elapsed-time-weighted swap and refreshed-output FPS, frame-weighted GPU time
+when timestamps are enabled, and intervals with pending shader compilation.
+The first summary interval is discarded because it may precede collection.
+A process change or guest frame-counter reset rejects the measurement.
+A refreshed output and screenshot still need a visual/input check; they do
+not establish image accuracy or general game compatibility.
+
+Enable `vulkan_gpu_timing=true` in a backed-up profile for a profiling run;
+it remains off in the bundled gameplay profile. Use the same diagnostics in
+both sides of an A/B comparison. The collector can summarize an existing log
+without a device, and has a host-only accounting check:
+
+```powershell
+.\tools\android\Measure-AndroidGameplay.ps1 -LogPath C:\captures\run\logcat.txt
+.\tools\android\Measure-AndroidGameplay.ps1 -SelfTest
+```
+
 ## Trace diff: finding rendering bugs
 
 Don't tune workarounds by eye. Record the bad frame on the phone, replay the

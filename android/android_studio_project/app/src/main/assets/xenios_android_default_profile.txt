@@ -1,24 +1,18 @@
 # Bundled XeniOS Android presentation profile.
 # Copied into app storage on first launch; edit storage copy to override.
+# Memory budgets come from the native Android defaults (including the
+# device-sized KGSL limit); explicit storage-profile values still override them.
 render_target_path=performance
 render_target_path_vulkan=
 mount_cache=false
-readback_resolve=full
+readback_resolve=fast
 readback_memexport=false
 readback_memexport_fast=false
 vulkan_dynamic_rendering=false
 vulkan_sparse_shared_memory=true
 tiled_shared_memory=true
-vulkan_render_target_memory_limit_mb=384
-vulkan_memory_limit_mb=2048
-vulkan_kgsl_memory_limit_mb=2048
-vulkan_texture_memory_limit_mb=768
-texture_cache_memory_limit_soft=96
-texture_cache_memory_limit_soft_lifetime=5
-texture_cache_memory_limit_hard=160
-texture_cache_memory_limit_render_to_texture=24
 framerate_limit=30
-async_shader_compilation=false
+async_shader_compilation=true
 vulkan_pipeline_creation_threads=1
 xma_decoder=old
 halo_android_compat_presentable_color_shadow=false
