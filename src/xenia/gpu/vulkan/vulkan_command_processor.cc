@@ -7725,6 +7725,12 @@ bool VulkanCommandProcessor::CanEndSubmissionImmediately() {
 }
 
 bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+  // Queued transfers must stay in this submission even when their guest draw
+  // was skipped. Finish them before ending the pass or reclaiming resources.
+  if (submission_open_ &&
+      !render_target_cache_->FlushPendingDrawPassTransfers()) {
+    return false;
+  }
   ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();

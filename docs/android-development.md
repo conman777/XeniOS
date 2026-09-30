@@ -373,6 +373,79 @@ backup, including recovery of two save/profile files Halo updated during the
 runs. The `current.xes` and `gameplay_hud.xes` slot hashes match the pre-test
 backups. The committed optimized APK remains installed.
 
+### Transfer batching investigation (2026-09-30)
+
+The target is 30 fps, requiring at most 33.33 ms per frame. The tested native
+resolution gameplay scene remains around 16.5 fps. Combining compatible
+ownership transfers with the following guest draw pass removes about 18
+render passes per frame, but the measured improvement is only about 1%.
+
+`vulkan_transfer_in_draw_pass` exposes this path as an **opt-in experiment**
+(default false). It accepts color targets whose native draw format and transfer
+format/image view agree, including Reach's 7e3 targets. Depth, integer transfer
+views, active attachment sources and dependencies between transfers retain
+the standalone path. The legacy `menu_transfer_in_draw_pass` experiment can
+still independently queue RGBA8 transfers. Both must be off for a control.
+Queued transfers now finish before resolve, EDRAM save capture and submission
+completion, including after a skipped draw. Shutdown clears their references;
+cache reclamation requires the queue to have been drained.
+
+Same device and `gameplay_hud.xes`, with zero pending shader compilation:
+
+| Batching / diagnostics | Measured time | Refreshed-output fps | GPU ms/swap | Passes/frame |
+| --- | --- | --- | --- | --- |
+| Off, GPU timing and pass-break logging | 120.65 s | 16.31 | 59.57 | 129.1 |
+| On, GPU timing and pass-break logging | 120.80 s | 16.48 | 58.92 | 110.8 |
+| On, diagnostics off | 120.90 s | 16.62 | not recorded | 110.9 |
+
+An earlier on/off pair measured 16.47/16.30 fps and 59.03/59.96 ms GPU time.
+The gain is small across both comparisons. The earlier unprofiled baseline
+was 16.45 fps; it was a separate run, rather than a paired control for the
+16.62 fps experiment. Lighting, world geometry and HUD were inspected on the
+device. These observations do not establish accuracy in other scenes/games.
+
+The same freshly captured 38-resolve gameplay trace was replayed with a
+matching optimized headless binary and the app's configuration. One early
+batched/control-repeat pair matched all resolve bytes. Further final-build
+replays did not consistently match: repeating the **disabled** control also
+changed tiny pixel patches. In the final RGBA8 resolve, one enabled run
+differed from its control in 48 of 829,440 pixels (maximum channel delta 12);
+a repeated disabled control differed in 42 pixels (maximum delta 4).
+These variations are not yet fully explained or attributed, so batching is
+kept disabled by default. A visually plausible frame and a small speedup do
+not resolve that accuracy question.
+
+Current code and logs also confirm that deferred CPU readback is already on
+(`readback_resolve_deferred=true`). It avoids copying most large resolves into
+guest CPU memory, but GPU-to-staging copies still run for roughly 38 resolves,
+47 MiB per frame. The seven large draw passes still cost about 27 ms and GPU
+dispatch/copy work about 12.5 ms. These remain substantially larger targets
+than this batching gain. Safely reducing staging work must preserve delayed
+readback data, exposure reads and staging-buffer lifetimes; disabling readback
+or limiting it by size alone previously broke the image.
+
+Run the scheduling and skipped-draw boundary regressions with:
+
+```powershell
+.\tools\android\Test-DrawPassTransfers.ps1 -Compiler C:\Strawberry\c\bin\g++.exe
+```
+
+These execute actual source functions/prefixes with small GPU substitutes;
+they do not execute Vulkan or prove image equivalence. The existing renderer
+cleanup checks and optimized Android build also passed.
+
+Evidence is retained in the artifacts workspace's
+`diagnostics-perf-30fps-20260930` directory, including APK/config hashes, paired
+measurements, trace replays and pre-test save backups. The final installed
+APK SHA-256 is
+`D88803B32D6CED03EB5809A2714707FADDF475A5866EA5756B83DE539629BFC9`;
+it keeps batching disabled. After testing, all 32 protected private save,
+configuration and preference files, both external configuration files and the
+`current.xes`/`gameplay_hud.xes` hashes were restored or verified against the
+fresh pre-test backups. The final build restored the gameplay scene, logged
+129 passes per frame with batching disabled, and accepted START to open and
+close the pause menu.
+
 ### Repeatable gameplay measurement
 
 The bundled profile uses `readback_resolve=fast` and asynchronous shader

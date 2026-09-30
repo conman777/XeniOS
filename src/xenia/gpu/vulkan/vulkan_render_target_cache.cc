@@ -38,6 +38,12 @@
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
+DEFINE_bool(vulkan_transfer_in_draw_pass, false,
+            "Perform compatible color ownership transfers in the following "
+            "guest draw pass, retaining standalone passes for dependencies "
+            "and incompatible attachment views.",
+            "Vulkan");
+
 DEFINE_string(
     render_target_path_vulkan, "",
     "Render target emulation path to use on Vulkan.\n"
@@ -1235,6 +1241,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
 }
 
 void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
+  ClearPendingDrawPassTransfers();
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1391,6 +1398,11 @@ bool VulkanRenderTargetCache::SaveStateSubmitEdramDownload(
   if (destination == VK_NULL_HANDLE || IsDrawResolutionScaled()) {
     return false;
   }
+  // A skipped guest draw may have claimed ownership without encoding its
+  // queued transfers. Save the completed contents of those targets.
+  if (!FlushPendingDrawPassTransfers()) {
+    return false;
+  }
   if (GetPath() == Path::kHostRenderTargets) {
     DumpRenderTargets(0, xenos::kEdramTileCount, 1,
                       xenos::kEdramTileCount);
@@ -1479,6 +1491,9 @@ void VulkanRenderTargetCache::SaveStateSubmitEdramUpload(VkBuffer source) {
 }
 
 void VulkanRenderTargetCache::ClearCache(const char* reason) {
+  // EndSubmission completes queued transfers before any referenced resources
+  // can be reclaimed. Clearing an in-flight queue would lose EDRAM ownership.
+  assert_false(HasPendingDrawPassTransfers());
   // Queued pipeline creation requests hold the render pass they were recorded
   // with as a raw VkRenderPass, so any pass destroyed below may still be about
   // to be handed to vkCreateGraphicsPipelines by an async creation thread.
@@ -1662,6 +1677,11 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
                                       uint32_t& written_length_out) {
   written_address_out = 0;
   written_length_out = 0;
+
+  // Resolve can follow a skipped draw, before the next render-target Update.
+  if (!FlushPendingDrawPassTransfers()) {
+    return false;
+  }
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -2693,9 +2713,10 @@ bool VulkanRenderTargetCache::Update(
       }
 
       const std::vector<Transfer>* update_transfers = last_update_transfers();
-      bool use_draw_pass_transfers = false;
+      bool use_draw_pass_transfers = cvars::vulkan_transfer_in_draw_pass;
 #if XE_PLATFORM_ANDROID
       use_draw_pass_transfers =
+          use_draw_pass_transfers ||
           GetAndroidHaloExperiment().menu_transfer_in_draw_pass;
 #endif
       if (use_draw_pass_transfers) {
@@ -2880,8 +2901,8 @@ bool VulkanRenderTargetCache::BuildTransferRectanglePlans(
 bool VulkanRenderTargetCache::CanQueueDrawPassTransfers(
     uint32_t render_target_index, RenderTarget* const* render_targets,
     const std::vector<Transfer>& transfers) const {
-  // Keep this first backport intentionally narrow: native RGBA8 color
-  // attachments only. All other ownership changes retain the existing path.
+  // The legacy menu experiment only queues RGBA8. The general path also
+  // accepts other color formats when their draw and transfer views match.
   if (!render_targets || transfers.empty() || render_target_index == 0 ||
       render_target_index > xenos::kMaxColorRenderTargets) {
     return false;
@@ -2912,7 +2933,8 @@ bool VulkanRenderTargetCache::CanQueueDrawPassTransfers(
     return false;
   };
   if (dest_key.is_depth ||
-      (dest_key.GetColorFormat() !=
+      (!cvars::vulkan_transfer_in_draw_pass &&
+       dest_key.GetColorFormat() !=
            xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
        dest_key.GetColorFormat() !=
            xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
@@ -2927,6 +2949,22 @@ bool VulkanRenderTargetCache::CanQueueDrawPassTransfers(
       dest_vulkan_rt->view_color_transfer() !=
           dest_vulkan_rt->view_depth_color()) {
     return reject("dest_view");
+  }
+
+  // Standalone transfers run before the queued ones. If another destination
+  // reads this target, keep its transfer in the original order so that reader
+  // does not see the contents from before this ownership change.
+  const std::vector<Transfer>* all_transfers = last_update_transfers();
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (i == render_target_index) {
+      continue;
+    }
+    for (const Transfer& transfer : all_transfers[i]) {
+      if (transfer.source == dest_vulkan_rt ||
+          transfer.host_depth_source == dest_vulkan_rt) {
+        return reject("dest_read_by_other_transfer");
+      }
+    }
   }
 
   auto is_active_draw_pass_rt = [&](const RenderTarget* rt) {
